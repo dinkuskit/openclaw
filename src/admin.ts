@@ -162,10 +162,26 @@ async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
   return raw as ActiveTurn;
 }
 
+export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string): string {
+  const pairEndpoint = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
+  const mcpEndpoint = `${siteOrigin}/_emdash/mcp`;
+  return [
+    `Connect yourself to my EmDash CMS site (${siteOrigin}):`,
+    `1. Register the EmDash MCP server at ${mcpEndpoint} in your OpenClaw config.`,
+    `2. Complete the 1-step pairing handshake by POSTing JSON to ${pairEndpoint}:`,
+    `   curl -X POST "${pairEndpoint}" -H "content-type: application/json" \\`,
+    `     -d '{"pairingCode":"${pairingCode}","gatewayUrl":"<YOUR_GATEWAY_HTTPS_URL>","agentId":"<YOUR_AGENT_ID>","gatewayToken":"<YOUR_GATEWAY_BEARER_TOKEN>","authorityMode":"propose_with_approval"}'`,
+    `3. Reply here once paired so I can click "Check pairing status" in EmDash.`,
+  ].join("\n");
+}
+
 export function setupPage(
   isAdmin: boolean,
   collections: Array<{ slug: string; label: string }>,
+  siteOrigin = "https://your-site.example.com",
+  pairingCode = "oc_pair_ready",
   failure?: string,
+  toast?: BlockResponse["toast"],
 ): BlockResponse {
   const blocks: Block[] = [
     header("OpenClaw"),
@@ -173,7 +189,7 @@ export function setupPage(
       failure ? "error" : "default",
       failure ? "Could not save OpenClaw connection" : "Connect Your OpenClaw Gateway",
       failure ??
-        "Plug your custom OpenClaw gateway directly into EmDash CMS. Works standalone on any EmDash site (blogs, marketing sites, or stores) with no Commerce dependency.",
+        "Let your OpenClaw agent configure this connection automatically with the prompt below, or open Advanced Settings to enter your Gateway URL and Bearer Token manually.",
     ),
   ];
 
@@ -184,6 +200,40 @@ export function setupPage(
     return { blocks };
   }
 
+  blocks.push(
+    header("Option 1 (Recommended): Paste This Prompt Into Your OpenClaw Agent"),
+    context(
+      "Copy the prompt below and send it to your OpenClaw agent in Signal, Discord, Telegram, or Web Chat. Your agent will register this site's MCP tools and push its gateway credentials back automatically.",
+    ),
+    {
+      type: "code",
+      language: "bash",
+      code: buildAgentPairingPrompt(siteOrigin, pairingCode),
+    },
+    fields(
+      ["One-Time Pairing Code", pairingCode],
+      ["Pairing Webhook", `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`],
+      ["Site Native MCP Server", `${siteOrigin}/_emdash/mcp`],
+    ),
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          label: "Check pairing status",
+          action_id: "check_pairing",
+          style: "primary",
+        },
+        {
+          type: "button",
+          label: "Rotate pairing code",
+          action_id: "rotate_pairing_code",
+          style: "secondary",
+        },
+      ],
+    },
+  );
+
   const collectionToggles: FormField[] = collections.map(col => ({
     type: "toggle",
     action_id: `col_${col.slug}`,
@@ -192,47 +242,54 @@ export function setupPage(
   }));
 
   blocks.push({
-    type: "form",
-    block_id: "openclaw-connect-form",
-    fields: [
+    type: "accordion",
+    label: "Option 2 (Advanced Fallback): Enter Gateway URL & Bearer Token Manually",
+    default_open: Boolean(failure),
+    blocks: [
       {
-        type: "text_input",
-        action_id: "gatewayUrl",
-        label: "OpenClaw Gateway HTTPS URL",
-        placeholder: "https://gateway.example.com",
-      },
-      {
-        type: "text_input",
-        action_id: "agentId",
-        label: "Default Agent ID",
-        initial_value: "blaze",
-        placeholder: "blaze",
-      },
-      {
-        type: "text_input",
-        action_id: "gatewayToken",
-        label: "Gateway Bearer Token",
-        placeholder: "oc_live_...",
-      },
-      {
-        type: "select",
-        action_id: "authorityMode",
-        label: "Starting Authority Mode",
-        initial_value: "read_only",
-        options: [
-          { label: "Read-only (inspect & answer only)", value: "read_only" },
+        type: "form",
+        block_id: "openclaw-connect-form",
+        fields: [
           {
-            label: "Propose with WAITING_FOR_HUMAN approval cards",
-            value: "propose_with_approval",
+            type: "text_input",
+            action_id: "gatewayUrl",
+            label: "OpenClaw Gateway HTTPS URL",
+            placeholder: "https://gateway.example.com",
           },
+          {
+            type: "text_input",
+            action_id: "agentId",
+            label: "Default Agent ID",
+            initial_value: "blaze",
+            placeholder: "blaze",
+          },
+          {
+            type: "text_input",
+            action_id: "gatewayToken",
+            label: "Gateway Bearer Token",
+            placeholder: "oc_live_...",
+          },
+          {
+            type: "select",
+            action_id: "authorityMode",
+            label: "Starting Authority Mode",
+            initial_value: "read_only",
+            options: [
+              { label: "Read-only (inspect & answer only)", value: "read_only" },
+              {
+                label: "Propose with WAITING_FOR_HUMAN approval cards",
+                value: "propose_with_approval",
+              },
+            ],
+          },
+          ...collectionToggles,
         ],
+        submit: { label: "Save connection manually", action_id: "save_connection" },
       },
-      ...collectionToggles,
     ],
-    submit: { label: "Save connection", action_id: "save_connection" },
   });
 
-  return { blocks };
+  return { blocks, ...(toast ? { toast } : {}) };
 }
 
 export function workspacePage(
@@ -390,6 +447,42 @@ export function workspacePage(
   return { blocks, ...(toast ? { toast } : {}) };
 }
 
+function resolveSiteOrigin(route: SandboxedRouteContext): string {
+  try {
+    if (route.request?.url) {
+      return new URL(route.request.url).origin;
+    }
+  } catch {
+    // Fall back to localhost when request URL is not a full origin.
+  }
+  return "http://localhost:4321";
+}
+
+function generatePairingCode(): string {
+  return `oc_pair_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+}
+
+async function loadOrCreatePairingCode(ctx: PluginContext): Promise<string> {
+  if (ctx.kv) {
+    const existing = await ctx.kv.get("pairing_code");
+    if (typeof existing === "string" && existing.startsWith("oc_pair_")) {
+      return existing;
+    }
+    const fresh = generatePairingCode();
+    await ctx.kv.set("pairing_code", fresh);
+    return fresh;
+  }
+  return "oc_pair_ready";
+}
+
+async function rotatePairingCode(ctx: PluginContext): Promise<string> {
+  const fresh = generatePairingCode();
+  if (ctx.kv) {
+    await ctx.kv.set("pairing_code", fresh);
+  }
+  return fresh;
+}
+
 export async function openclawAdmin(
   route: SandboxedRouteContext,
   ctx: PluginContext,
@@ -406,6 +499,8 @@ export async function openclawAdmin(
 
   const isAdmin = role >= ADMIN;
   const collections = await discoverSiteCollections(ctx);
+  const siteOrigin = resolveSiteOrigin(route);
+  const pairingCode = await loadOrCreatePairingCode(ctx);
   const event = parseInteraction(route.input);
   if (!event) {
     return {
@@ -416,9 +511,23 @@ export async function openclawAdmin(
     };
   }
 
+  if (event.type === "block_action" && event.action_id === "rotate_pairing_code" && isAdmin) {
+    const rotated = await rotatePairingCode(ctx);
+    return setupPage(true, collections, siteOrigin, rotated, undefined, {
+      type: "info",
+      message: "Generated a fresh one-time OpenClaw pairing code.",
+    });
+  }
+
   if (event.type === "form_submit" && event.action_id === "save_connection") {
     if (!isAdmin) {
-      return setupPage(false, collections, "Only an Administrator can configure OpenClaw.");
+      return setupPage(
+        false,
+        collections,
+        siteOrigin,
+        pairingCode,
+        "Only an Administrator can configure OpenClaw.",
+      );
     }
     const gatewayUrl = cleanText(event.values.gatewayUrl, 300);
     const agentId = cleanText(event.values.agentId, 80);
@@ -429,13 +538,31 @@ export async function openclawAdmin(
         : "read_only";
 
     if (!gatewayUrl || !gatewayUrl.startsWith("https://")) {
-      return setupPage(true, collections, "Enter an HTTPS OpenClaw gateway URL.");
+      return setupPage(
+        true,
+        collections,
+        siteOrigin,
+        pairingCode,
+        "Enter an HTTPS OpenClaw gateway URL.",
+      );
     }
     if (!agentId) {
-      return setupPage(true, collections, "Enter the default OpenClaw agent ID.");
+      return setupPage(
+        true,
+        collections,
+        siteOrigin,
+        pairingCode,
+        "Enter the default OpenClaw agent ID.",
+      );
     }
     if (!gatewayToken) {
-      return setupPage(true, collections, "Enter your OpenClaw gateway bearer token.");
+      return setupPage(
+        true,
+        collections,
+        siteOrigin,
+        pairingCode,
+        "Enter your OpenClaw gateway bearer token.",
+      );
     }
 
     const enabledCollections = collections
@@ -473,12 +600,19 @@ export async function openclawAdmin(
 
   const connection = await loadConnection(ctx);
   if (!connection) {
-    return setupPage(isAdmin, collections);
+    if (event.type === "block_action" && event.action_id === "check_pairing") {
+      return setupPage(true, collections, siteOrigin, pairingCode, undefined, {
+        type: "info",
+        message: "Waiting for your OpenClaw agent to complete the pairing POST.",
+      });
+    }
+    return setupPage(isAdmin, collections, siteOrigin, pairingCode);
   }
 
   if (event.type === "block_action" && event.action_id === "disconnect" && isAdmin) {
     await ctx.settings.delete("connection");
-    return setupPage(true, collections);
+    const freshCode = await rotatePairingCode(ctx);
+    return setupPage(true, collections, siteOrigin, freshCode);
   }
 
   const proposals = await loadProposals(ctx);
@@ -683,5 +817,68 @@ export async function openclawEditorPanel(
         submit: { label: "Ask OpenClaw", action_id: "collaborate_entry" },
       },
     ],
+  };
+}
+
+/**
+ * Public 1-step pairing route (`POST /_emdash/api/plugins/dinkus-openclaw/pair`).
+ * Allows an OpenClaw agent to pair itself using the one-time `pairingCode` shown
+ * in the EmDash admin prompt.
+ */
+export async function openclawPairRoute(
+  route: SandboxedRouteContext,
+  ctx: PluginContext,
+): Promise<Record<string, unknown>> {
+  const input =
+    typeof route.input === "object" && route.input !== null
+      ? (route.input as Record<string, unknown>)
+      : {};
+  const pairingCode = cleanText(input.pairingCode, 120);
+  const expectedCode = await loadOrCreatePairingCode(ctx);
+  if (!pairingCode || pairingCode !== expectedCode) {
+    return {
+      ok: false,
+      error: "INVALID_PAIRING_CODE",
+      message: "The pairing code is invalid or expired. Generate a fresh code on the OpenClaw page.",
+    };
+  }
+
+  const gatewayUrl = cleanText(input.gatewayUrl, 300);
+  const agentId = cleanText(input.agentId, 80) ?? "blaze";
+  const gatewayToken = cleanText(input.gatewayToken, 300);
+  const authorityMode =
+    input.authorityMode === "propose_with_approval" ? "propose_with_approval" : "read_only";
+
+  if (!gatewayUrl || !gatewayUrl.startsWith("https://") || !gatewayToken) {
+    return {
+      ok: false,
+      error: "INVALID_GATEWAY_CREDENTIALS",
+      message: "Provide an HTTPS gatewayUrl and non-empty gatewayToken.",
+    };
+  }
+
+  const collections = await discoverSiteCollections(ctx);
+  const nextConnection: OpenClawConnection = {
+    gatewayUrl,
+    agentId,
+    gatewayToken,
+    authorityMode,
+    enabledCollections: collections.map(col => col.slug),
+  };
+
+  const existing = await ctx.settings.getVersioned("connection");
+  await ctx.settings.compareAndSet(
+    "connection",
+    existing?.revision ?? null,
+    JSON.stringify(nextConnection),
+  );
+  await rotatePairingCode(ctx);
+
+  const siteOrigin = resolveSiteOrigin(route);
+  return {
+    ok: true,
+    agentId,
+    authorityMode,
+    mcpEndpoint: `${siteOrigin}/_emdash/mcp`,
   };
 }

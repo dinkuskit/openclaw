@@ -16,8 +16,8 @@ const manifest = JSON.parse(await readFile(resolve(extracted, "manifest.json"), 
 if (manifest.id !== "dinkus-openclaw") {
   throw new Error(`unexpected plugin id ${manifest.id}`);
 }
-if (manifest.routes.some(route => route.public)) {
-  throw new Error("the OpenClaw plugin must not expose unauthenticated public routes by default");
+if (manifest.routes.some(route => route.public && route.name !== "pair")) {
+  throw new Error("only the one-time 'pair' route may be public on the OpenClaw plugin");
 }
 console.log([
   "registry_bundle=pass",

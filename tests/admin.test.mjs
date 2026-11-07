@@ -5,6 +5,7 @@ import { validateBlockResponse } from "@emdash-cms/blocks/server";
 
 const admin = plugin.routes.admin.handler;
 const editorPanel = plugin.routes["editor/assistant"].handler;
+const pairRoute = plugin.routes.pair.handler;
 
 function createHost({
   role = 50,
@@ -80,9 +81,28 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   });
   const initial = await admin(route({ type: "page_load" }), ctx);
   assert.doesNotThrow(() => validateBlockResponse(initial));
-  const form = initial.blocks.find(b => b.type === "form" && b.block_id === "openclaw-connect-form");
+  const codeBlock = initial.blocks.find(b => b.type === "code");
+  assert.ok(codeBlock);
+  assert.match(codeBlock.code, /\/_emdash\/api\/plugins\/dinkus-openclaw\/pair/);
+  const accordion = initial.blocks.find(b => b.type === "accordion");
+  assert.ok(accordion);
+  const form = accordion.blocks.find(b => b.type === "form" && b.block_id === "openclaw-connect-form");
   assert.ok(form);
   assert.equal(form.fields.some(f => f.action_id === "col_articles"), true);
+
+  // Also verify 1-step agent pairing via the public pair route
+  const pairingCode = await ctx.kv.get("pairing_code");
+  const pairResp = await pairRoute(
+    route({
+      pairingCode,
+      gatewayUrl: "https://gateway.example.com",
+      agentId: "blaze",
+      gatewayToken: "oc_paired_token_123",
+      authorityMode: "propose_with_approval",
+    }),
+    ctx,
+  );
+  assert.equal(pairResp.ok, true);
 
   const connected = await admin(
     route({

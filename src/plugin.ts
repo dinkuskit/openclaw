@@ -1,5 +1,5 @@
 import type { SandboxedPlugin } from "emdash/plugin";
-import { openclawAdmin, openclawEditorPanel } from "./admin.js";
+import { openclawAdmin, openclawEditorPanel, openclawPairRoute } from "./admin.js";
 
 /**
  * Standalone OpenClaw Registry plugin for any EmDash CMS site: connects a
@@ -19,6 +19,11 @@ const plugin: SandboxedPlugin = {
       permission: "content:edit_any",
       methods: ["POST"],
       handler: openclawEditorPanel,
+    },
+    pair: {
+      public: true,
+      methods: ["POST"],
+      handler: openclawPairRoute,
     },
   },
 };
