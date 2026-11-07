@@ -166,12 +166,17 @@ export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string)
   const pairEndpoint = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
   const mcpEndpoint = `${siteOrigin}/_emdash/mcp`;
   return [
-    `Connect yourself to my EmDash CMS site (${siteOrigin}):`,
-    `1. Register the EmDash MCP server at ${mcpEndpoint} in your OpenClaw config.`,
-    `2. Complete the 1-step pairing handshake by POSTing JSON to ${pairEndpoint}:`,
-    `   curl -X POST "${pairEndpoint}" -H "content-type: application/json" \\`,
-    `     -d '{"pairingCode":"${pairingCode}","gatewayUrl":"<YOUR_GATEWAY_HTTPS_URL>","agentId":"<YOUR_AGENT_ID>","gatewayToken":"<YOUR_GATEWAY_BEARER_TOKEN>","authorityMode":"propose_with_approval"}'`,
-    `3. Reply here once paired so I can click "Check pairing status" in EmDash.`,
+    `Connect yourself to my EmDash CMS site (${siteOrigin}) with pairing code ${pairingCode}:`,
+    ``,
+    `Option A (Fastest — npx helper):`,
+    `  npx --yes @dinkuskit/openclaw pair "${siteOrigin}" "${pairingCode}"`,
+    ``,
+    `Option B (Fallback — direct curl + MCP registration):`,
+    `  1. Register the EmDash MCP server at ${mcpEndpoint} in your OpenClaw config.`,
+    `  2. POST your gateway credentials to ${pairEndpoint}:`,
+    `     curl -X POST "${pairEndpoint}" -H "content-type: application/json" \\`,
+    `       -d '{"pairingCode":"${pairingCode}","gatewayUrl":"<YOUR_GATEWAY_HTTPS_URL>","agentId":"<YOUR_AGENT_ID>","gatewayToken":"<YOUR_GATEWAY_BEARER_TOKEN>","authorityMode":"propose_with_approval"}'`,
+    `  3. Reply once paired so I can click "Check pairing status" in EmDash.`,
   ].join("\n");
 }
 
