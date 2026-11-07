@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(dirname -- "$script_dir")
+cd "$repo_root"
+mode="${1:-quick}"
+
+case "$mode" in
+  quick|full)
+    npm run typecheck
+    npm test
+    ;;
+  *)
+    echo "Usage: bin/verify-openclaw [quick|full]" >&2
+    exit 64
+    ;;
+esac
+
+printf 'verify-openclaw: %s passed\n' "$mode"

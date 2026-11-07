@@ -1,0 +1,46 @@
+{
+  "name": "@dinkuskit/openclaw",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Connect custom OpenClaw agents and gateways to the EmDash CMS admin with Block Kit approval cards and MCP tools",
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
+  "files": [
+    "dist",
+    "emdash-plugin.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "emdash-plugin validate && emdash-plugin build && node scripts/check-registry-bundle.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "verify:quick": "bin/verify-openclaw quick",
+    "verify:full": "bin/verify-openclaw full"
+  },
+  "devDependencies": {
+    "@emdash-cms/blocks": "1.4.0",
+    "@emdash-cms/plugin-cli": "0.13.5",
+    "@emdash-cms/plugin-types": "0.6.0",
+    "emdash": "1.4.0",
+    "typescript": "6.0.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dinkuskit/openclaw.git"
+  },
+  "main": "./dist/index.mjs",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./sandbox": "./dist/plugin.mjs"
+  },
+  "peerDependencies": {
+    "emdash": "1.4.0"
+  }
+}
