@@ -188,15 +188,34 @@ export function setupPage(
   failure?: string,
   toast?: BlockResponse["toast"],
 ): BlockResponse {
-  const blocks: Block[] = [
-    header("OpenClaw"),
-    banner(
-      failure ? "error" : "default",
-      failure ? "Could not save OpenClaw connection" : "Connect Your OpenClaw Gateway",
-      failure ??
-        "Let your OpenClaw agent configure this connection automatically with the prompt below, or open Advanced Settings to enter your Gateway URL and Bearer Token manually.",
-    ),
-  ];
+  const blocks: Block[] = [header("OpenClaw")];
+
+  if (failure) {
+    blocks.push(banner("error", "Could not save OpenClaw connection", failure));
+  }
+
+  blocks.push({
+    type: "stats",
+    items: [
+      {
+        label: "Connection Status",
+        value: "Awaiting Agent",
+        description: "Paste the prompt below into your OpenClaw chat",
+        trend: "neutral",
+      },
+      {
+        label: "One-Time Pairing Code",
+        value: pairingCode,
+        description: `POST ${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`,
+      },
+      {
+        label: "Site Native MCP",
+        value: "/_emdash/mcp",
+        description: "Zero OpenClaw daemon plugins required",
+        trend: "up",
+      },
+    ],
+  });
 
   if (!isAdmin) {
     blocks.push(
@@ -205,21 +224,16 @@ export function setupPage(
     return { blocks };
   }
 
-  blocks.push(
-    header("Option 1 (Recommended): Paste This Prompt Into Your OpenClaw Agent"),
+  const leftColumn: Block[] = [
+    header("Option 1 (Recommended) — Drop Prompt Into Your OpenClaw Chat"),
     context(
-      "Copy the prompt below and send it to your OpenClaw agent in Signal, Discord, Telegram, or Web Chat. Your agent will register this site's MCP tools and push its gateway credentials back automatically.",
+      "Copy and send this block to your OpenClaw agent in Signal, Discord, Telegram, or Web. It uses npx (with a curl fallback) to pair automatically.",
     ),
     {
       type: "code",
       language: "bash",
       code: buildAgentPairingPrompt(siteOrigin, pairingCode),
     },
-    fields(
-      ["One-Time Pairing Code", pairingCode],
-      ["Pairing Webhook", `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`],
-      ["Site Native MCP Server", `${siteOrigin}/_emdash/mcp`],
-    ),
     {
       type: "actions",
       elements: [
@@ -237,61 +251,97 @@ export function setupPage(
         },
       ],
     },
-  );
+  ];
 
-  const collectionToggles: FormField[] = collections.map(col => ({
-    type: "toggle",
-    action_id: `col_${col.slug}`,
-    label: `Enable Editor Side-Panel on "${col.label}" (${col.slug})`,
-    initial_value: true,
-  }));
+  const rightColumn: Block[] = [
+    header("How 1-Step Agent Pairing Works"),
+    {
+      type: "table",
+      page_action_id: "pairing_steps_noop",
+      columns: [
+        { key: "step", label: "Step", format: "badge" },
+        { key: "surface", label: "Where" },
+        { key: "detail", label: "Action", format: "code" },
+      ],
+      rows: [
+        {
+          step: "1. Copy",
+          surface: "Left panel",
+          detail: "Copy the pairing prompt block",
+        },
+        {
+          step: "2. Send",
+          surface: "Signal / Discord / Web",
+          detail: "npx @dinkuskit/openclaw pair ...",
+        },
+        {
+          step: "3. Verify",
+          surface: "EmDash",
+          detail: "Click 'Check pairing status'",
+        },
+      ],
+    },
+    {
+      type: "accordion",
+      label: "Option 2 (Advanced Fallback): Enter Gateway URL & Bearer Token Manually",
+      default_open: Boolean(failure),
+      blocks: [
+        {
+          type: "form",
+          block_id: "openclaw-connect-form",
+          fields: [
+            {
+              type: "text_input",
+              action_id: "gatewayUrl",
+              label: "OpenClaw Gateway HTTPS URL",
+              placeholder: "https://gateway.example.com",
+            },
+            {
+              type: "text_input",
+              action_id: "agentId",
+              label: "Default Agent ID",
+              initial_value: "blaze",
+              placeholder: "blaze",
+            },
+            {
+              type: "secret_input",
+              action_id: "gatewayToken",
+              label: "Gateway Bearer Token",
+              placeholder: "oc_live_...",
+            },
+            {
+              type: "select",
+              action_id: "authorityMode",
+              label: "Starting Authority Mode",
+              initial_value: "read_only",
+              options: [
+                { label: "Read-only (inspect & answer only)", value: "read_only" },
+                {
+                  label: "Propose with WAITING_FOR_HUMAN approval cards",
+                  value: "propose_with_approval",
+                },
+              ],
+            },
+            {
+              type: "checkbox",
+              action_id: "enabledCollections",
+              label: "Enable Editor Side-Panel on Collections",
+              initial_value: collections.map(col => col.slug),
+              options: collections.map(col => ({
+                label: `${col.label} (${col.slug})`,
+                value: col.slug,
+              })),
+            },
+          ],
+          submit: { label: "Save connection manually", action_id: "save_connection" },
+        },
+      ],
+    },
+  ];
 
   blocks.push({
-    type: "accordion",
-    label: "Option 2 (Advanced Fallback): Enter Gateway URL & Bearer Token Manually",
-    default_open: Boolean(failure),
-    blocks: [
-      {
-        type: "form",
-        block_id: "openclaw-connect-form",
-        fields: [
-          {
-            type: "text_input",
-            action_id: "gatewayUrl",
-            label: "OpenClaw Gateway HTTPS URL",
-            placeholder: "https://gateway.example.com",
-          },
-          {
-            type: "text_input",
-            action_id: "agentId",
-            label: "Default Agent ID",
-            initial_value: "blaze",
-            placeholder: "blaze",
-          },
-          {
-            type: "text_input",
-            action_id: "gatewayToken",
-            label: "Gateway Bearer Token",
-            placeholder: "oc_live_...",
-          },
-          {
-            type: "select",
-            action_id: "authorityMode",
-            label: "Starting Authority Mode",
-            initial_value: "read_only",
-            options: [
-              { label: "Read-only (inspect & answer only)", value: "read_only" },
-              {
-                label: "Propose with WAITING_FOR_HUMAN approval cards",
-                value: "propose_with_approval",
-              },
-            ],
-          },
-          ...collectionToggles,
-        ],
-        submit: { label: "Save connection manually", action_id: "save_connection" },
-      },
-    ],
+    type: "columns",
+    columns: [leftColumn, rightColumn],
   });
 
   return { blocks, ...(toast ? { toast } : {}) };
@@ -306,33 +356,63 @@ export function workspacePage(
   replyText?: string,
   toast?: BlockResponse["toast"],
 ): BlockResponse {
-  const blocks: Block[] = [
-    header("OpenClaw"),
-    fields(
-      ["Gateway", connection.gatewayUrl],
-      ["Active Agent", `@${connection.agentId}`],
-      [
-        "Enabled Content Panels",
-        connection.enabledCollections.length > 0
-          ? connection.enabledCollections.join(", ")
-          : "None (Sidebar only)",
-      ],
-      [
-        "Authority Posture",
-        connection.authorityMode === "read_only"
-          ? "Read-only (no site mutations)"
-          : "WAITING_FOR_HUMAN approval required before mutations",
-      ],
-    ),
-  ];
-
-  if (replyText) {
-    blocks.push(banner("default", `Response from @${connection.agentId}`, replyText));
+  let gatewayHost = connection.gatewayUrl;
+  try {
+    gatewayHost = new URL(connection.gatewayUrl).host;
+  } catch {
+    // Keep full URL if parsing fails.
   }
 
+  const blocks: Block[] = [
+    header("OpenClaw"),
+    {
+      type: "stats",
+      items: [
+        {
+          label: "Active OpenClaw Agent",
+          value: `@${connection.agentId}`,
+          description: gatewayHost,
+          trend: "up",
+        },
+        {
+          label: "Task Status",
+          value: activeTurn ? activeTurn.status : "Idle",
+          description: activeTurn ? activeTurn.prompt : "Ready for instructions",
+        },
+        {
+          label: "Approval Queue",
+          value: proposals.length,
+          description:
+            proposals.length === 0 ? "No pending mutations" : "Awaiting WAITING_FOR_HUMAN review",
+          trend: proposals.length > 0 ? "up" : "neutral",
+        },
+      ],
+    },
+  ];
+
+  const assistantLeft: Block[] = [
+    {
+      type: "form",
+      block_id: "openclaw-prompt-form",
+      fields: [
+        {
+          type: "text_input",
+          action_id: "prompt",
+          label: `Ask @${connection.agentId}`,
+          placeholder: "Audit draft pages, suggest headlines, or summarize content...",
+          multiline: true,
+        },
+      ],
+      submit: { label: "Send to OpenClaw", action_id: "ask_agent" },
+    },
+  ];
+
+  const assistantRight: Block[] = [];
+  if (replyText) {
+    assistantRight.push(banner("default", `Response from @${connection.agentId}`, replyText));
+  }
   if (activeTurn && activeTurn.status !== "completed") {
-    blocks.push(
-      header("Active Task — Live Steer"),
+    assistantRight.push(
       banner(
         "alert",
         `@${connection.agentId} is working (${activeTurn.status})`,
@@ -363,91 +443,132 @@ export function workspacePage(
         ],
       },
     );
+  } else if (!replyText) {
+    assistantRight.push({
+      type: "empty",
+      size: "sm",
+      title: `Connected to @${connection.agentId}`,
+      description:
+        "Send a task on the left or open any enabled collection entry to collaborate in the Editor Side-Panel.",
+    });
   }
 
-  blocks.push({
-    type: "form",
-    block_id: "openclaw-prompt-form",
-    fields: [
-      {
-        type: "text_input",
-        action_id: "prompt",
-        label: `Ask @${connection.agentId}`,
-        placeholder: "Audit draft pages, suggest headlines, or summarize content...",
-      },
-    ],
-    submit: { label: "Send to OpenClaw", action_id: "ask_agent" },
-  });
+  const approvalBlocks: Block[] =
+    proposals.length === 0
+      ? [
+          {
+            type: "empty",
+            size: "base",
+            title: "No Pending Approval Cards",
+            description:
+              "When your OpenClaw agent proposes content edits or site actions, WAITING_FOR_HUMAN cards appear here.",
+          },
+        ]
+      : proposals.flatMap(proposal => [
+          fields(
+            ["Proposal", proposal.summary],
+            ["Tool / Action", proposal.targetTool],
+            ["Agent", `@${proposal.agentId}`],
+            ...(proposal.collection
+              ? [
+                  [
+                    "Target Entry",
+                    `${proposal.collection}/${proposal.entryId ?? ""}`,
+                  ] as [string, string],
+                ]
+              : []),
+          ),
+          {
+            type: "actions" as const,
+            elements: [
+              {
+                type: "button" as const,
+                label: "Approve action",
+                action_id: "approve_proposal",
+                value: proposal.proposalId,
+                style: "primary" as const,
+              },
+              {
+                type: "button" as const,
+                label: "Reject",
+                action_id: "reject_proposal",
+                value: proposal.proposalId,
+                style: "danger" as const,
+              },
+            ],
+          },
+          { type: "divider" as const },
+        ]);
 
-  if (proposals.length > 0) {
-    blocks.push(
-      header("Pending Approval Cards (WAITING_FOR_HUMAN)"),
-      banner(
-        "alert",
-        "Human approval required",
-        "OpenClaw proposed the following content or site actions. Review each card before approving or rejecting.",
-      ),
-    );
-    for (const proposal of proposals) {
-      blocks.push(
-        fields(
-          ["Proposal", proposal.summary],
-          ["Tool / Action", proposal.targetTool],
-          ["Agent", `@${proposal.agentId}`],
-          ...(proposal.collection
-            ? [["Target Entry", `${proposal.collection}/${proposal.entryId ?? ""}`] as [string, string]]
-            : []),
-        ),
+  const settingsBlocks: Block[] = isAdmin
+    ? [
         {
-          type: "actions",
-          elements: [
-            {
-              type: "button",
-              label: "Approve action",
-              action_id: "approve_proposal",
-              value: proposal.proposalId,
-              style: "primary",
-            },
-            {
-              type: "button",
-              label: "Reject",
-              action_id: "reject_proposal",
-              value: proposal.proposalId,
-              style: "danger",
-            },
+          type: "columns",
+          columns: [
+            [
+              {
+                type: "form",
+                block_id: "openclaw-collections-form",
+                fields: [
+                  {
+                    type: "checkbox",
+                    action_id: "enabledCollections",
+                    label: "Enabled Editor Side-Panel Collections",
+                    initial_value: connection.enabledCollections,
+                    options: collections.map(col => ({
+                      label: `${col.label} (${col.slug})`,
+                      value: col.slug,
+                    })),
+                  },
+                ],
+                submit: { label: "Update enabled collections", action_id: "save_collections" },
+              },
+            ],
+            [
+              fields(
+                ["Gateway", connection.gatewayUrl],
+                ["Agent ID", `@${connection.agentId}`],
+                [
+                  "Authority Mode",
+                  connection.authorityMode === "read_only"
+                    ? "Read-only"
+                    : "Propose with WAITING_FOR_HUMAN cards",
+                ],
+              ),
+              {
+                type: "actions",
+                elements: [
+                  {
+                    type: "button",
+                    label: "Disconnect gateway",
+                    action_id: "disconnect",
+                    style: "secondary",
+                  },
+                ],
+              },
+            ],
           ],
         },
-      );
-    }
-  }
+      ]
+    : [context("Only an Administrator can modify enabled collections or disconnect the gateway.")];
 
-  if (isAdmin && collections.length > 0) {
-    blocks.push(
-      header("Configure Content Editor Side-Panels"),
+  blocks.push({
+    type: "tab",
+    panels: [
       {
-        type: "form",
-        block_id: "openclaw-collections-form",
-        fields: collections.map(col => ({
-          type: "toggle",
-          action_id: `col_${col.slug}`,
-          label: `${col.label} (${col.slug})`,
-          initial_value: connection.enabledCollections.includes(col.slug),
-        })),
-        submit: { label: "Update enabled collections", action_id: "save_collections" },
+        label: "Assistant & Live Steer",
+        blocks: [{ type: "columns", columns: [assistantLeft, assistantRight] }],
       },
       {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            label: "Disconnect gateway",
-            action_id: "disconnect",
-            style: "secondary",
-          },
-        ],
+        label: `Approval Queue (${proposals.length})`,
+        blocks: approvalBlocks,
       },
-    );
-  }
+      {
+        label: "Collections & Connection",
+        blocks: settingsBlocks,
+      },
+    ],
+  });
 
   return { blocks, ...(toast ? { toast } : {}) };
 }
@@ -570,9 +691,9 @@ export async function openclawAdmin(
       );
     }
 
-    const enabledCollections = collections
-      .filter(col => event.values[`col_${col.slug}`] !== false)
-      .map(col => col.slug);
+    const enabledCollections = Array.isArray(event.values.enabledCollections)
+      ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
+      : collections.filter(col => event.values[`col_${col.slug}`] !== false).map(col => col.slug);
 
     const nextConnection: OpenClawConnection = {
       gatewayUrl,
@@ -624,9 +745,9 @@ export async function openclawAdmin(
   let activeTurn = await loadActiveTurn(ctx);
 
   if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
-    const enabledCollections = collections
-      .filter(col => event.values[`col_${col.slug}`] === true)
-      .map(col => col.slug);
+    const enabledCollections = Array.isArray(event.values.enabledCollections)
+      ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
+      : collections.filter(col => event.values[`col_${col.slug}`] === true).map(col => col.slug);
     const updated: OpenClawConnection = { ...connection, enabledCollections };
     const existing = await ctx.settings.getVersioned("connection");
     await ctx.settings.compareAndSet(

@@ -81,14 +81,18 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   });
   const initial = await admin(route({ type: "page_load" }), ctx);
   assert.doesNotThrow(() => validateBlockResponse(initial));
-  const codeBlock = initial.blocks.find(b => b.type === "code");
+  const colsBlock = initial.blocks.find(b => b.type === "columns");
+  assert.ok(colsBlock);
+  const codeBlock = colsBlock.columns[0].find(b => b.type === "code");
   assert.ok(codeBlock);
   assert.match(codeBlock.code, /\/_emdash\/api\/plugins\/dinkus-openclaw\/pair/);
-  const accordion = initial.blocks.find(b => b.type === "accordion");
+  const accordion = colsBlock.columns[1].find(b => b.type === "accordion");
   assert.ok(accordion);
   const form = accordion.blocks.find(b => b.type === "form" && b.block_id === "openclaw-connect-form");
   assert.ok(form);
-  assert.equal(form.fields.some(f => f.action_id === "col_articles"), true);
+  const checkboxField = form.fields.find(f => f.action_id === "enabledCollections");
+  assert.ok(checkboxField);
+  assert.equal(checkboxField.options.some(o => o.value === "articles"), true);
 
   // Also verify 1-step agent pairing via the public pair route
   const pairingCode = await ctx.kv.get("pairing_code");
@@ -113,8 +117,7 @@ test("discovers dynamic site collections without requiring Commerce and saves co
         agentId: "blaze",
         gatewayToken: "oc_test_token_123",
         authorityMode: "propose_with_approval",
-        col_pages: true,
-        col_articles: false,
+        enabledCollections: ["pages"],
       },
     }),
     ctx,
@@ -144,8 +147,12 @@ test("supports live mid-task steer and configurable editor side-panel collaborat
     ctx,
   );
   assert.doesNotThrow(() => validateBlockResponse(started));
+  const tabBlock = started.blocks.find(b => b.type === "tab");
+  assert.ok(tabBlock);
+  const assistantCols = tabBlock.panels[0].blocks.find(b => b.type === "columns");
+  assert.ok(assistantCols);
   assert.equal(
-    started.blocks.some(b => b.type === "form" && b.block_id === "openclaw-steer-form"),
+    assistantCols.columns[1].some(b => b.type === "form" && b.block_id === "openclaw-steer-form"),
     true,
   );
 
