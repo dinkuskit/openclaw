@@ -162,21 +162,38 @@ async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
   return raw as ActiveTurn;
 }
 
+export function buildAgentPairingCommand(siteOrigin: string, pairingCode: string): string {
+  return `npx --yes @dinkuskit/openclaw pair "${siteOrigin}" "${pairingCode}"`;
+}
+
 export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string): string {
   const pairEndpoint = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
   const mcpEndpoint = `${siteOrigin}/_emdash/mcp`;
   return [
-    `Connect yourself to my EmDash CMS site (${siteOrigin}) with pairing code ${pairingCode}:`,
+    `Connect yourself to my EmDash CMS site (${siteOrigin})`,
+    `with pairing code: ${pairingCode}`,
     ``,
     `Option A (Fastest — npx helper):`,
-    `  npx --yes @dinkuskit/openclaw pair "${siteOrigin}" "${pairingCode}"`,
+    `  npx --yes @dinkuskit/openclaw pair \\`,
+    `    "${siteOrigin}" \\`,
+    `    "${pairingCode}"`,
     ``,
-    `Option B (Fallback — direct curl + MCP registration):`,
-    `  1. Register the EmDash MCP server at ${mcpEndpoint} in your OpenClaw config.`,
-    `  2. POST your gateway credentials to ${pairEndpoint}:`,
-    `     curl -X POST "${pairEndpoint}" -H "content-type: application/json" \\`,
-    `       -d '{"pairingCode":"${pairingCode}","gatewayUrl":"<YOUR_GATEWAY_HTTPS_URL>","agentId":"<YOUR_AGENT_ID>","gatewayToken":"<YOUR_GATEWAY_BEARER_TOKEN>","authorityMode":"propose_with_approval"}'`,
-    `  3. Reply once paired so I can click "Check pairing status" in EmDash.`,
+    `Option B (Fallback — curl + MCP registration):`,
+    `  1. Register MCP server in OpenClaw config:`,
+    `     ${mcpEndpoint}`,
+    `  2. POST gateway credentials to:`,
+    `     ${pairEndpoint}`,
+    `     curl -X POST "${pairEndpoint}" \\`,
+    `       -H "content-type: application/json" \\`,
+    `       -d '{`,
+    `         "pairingCode": "${pairingCode}",`,
+    `         "gatewayUrl": "<YOUR_GATEWAY_HTTPS_URL>",`,
+    `         "agentId": "<YOUR_AGENT_ID>",`,
+    `         "gatewayToken": "<YOUR_GATEWAY_BEARER_TOKEN>",`,
+    `         "authorityMode": "propose_with_approval"`,
+    `       }'`,
+    `  3. Reply once paired so I can click`,
+    `     "Check pairing status" in EmDash.`,
   ].join("\n");
 }
 
@@ -225,18 +242,14 @@ export function setupPage(
   }
 
   const leftColumn: Block[] = [
-    header("Option 1 (Recommended) — Drop Prompt Into Your OpenClaw Chat"),
-    context(
-      "Copy and send this block to your OpenClaw agent in Signal, Discord, Telegram, or Web. It uses npx (with a curl fallback) to pair automatically.",
-    ),
     {
-      type: "code",
-      language: "bash",
-      code: buildAgentPairingPrompt(siteOrigin, pairingCode),
-    },
-    {
-      type: "actions",
-      elements: [
+      type: "empty",
+      size: "sm",
+      title: "Option 1 — 1-Click Copy Command for Your OpenClaw Agent",
+      description:
+        "Click the copy icon on the right of the command pill and drop it into your OpenClaw chat (Signal, Discord, Telegram, or Web).",
+      command_line: buildAgentPairingCommand(siteOrigin, pairingCode),
+      actions: [
         {
           type: "button",
           label: "Check pairing status",
@@ -250,6 +263,11 @@ export function setupPage(
           style: "secondary",
         },
       ],
+    },
+    {
+      type: "code",
+      language: "bash",
+      code: buildAgentPairingPrompt(siteOrigin, pairingCode),
     },
   ];
 
