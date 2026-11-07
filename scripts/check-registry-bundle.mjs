@@ -24,5 +24,5 @@ console.log([
   `backend_bytes=${backend.byteLength}`,
   `headroom_bytes=${REGISTRY_FILE_LIMIT_BYTES - backend.byteLength}`,
   `backend_sha256=${createHash("sha256").update(backend).digest("hex")}`,
-  `hosts=${manifest.allowedHosts.join(",")}`,
+  `capabilities=${manifest.capabilities.join(",")}`,
 ].join(" "));

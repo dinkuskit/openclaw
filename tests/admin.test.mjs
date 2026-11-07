@@ -4,8 +4,18 @@ import plugin from "../dist/plugin.mjs";
 import { validateBlockResponse } from "@emdash-cms/blocks/server";
 
 const admin = plugin.routes.admin.handler;
+const editorPanel = plugin.routes["editor/assistant"].handler;
 
-function createHost({ role = 50, initialConnection = null, initialProposals = [] } = {}) {
+function createHost({
+  role = 50,
+  initialConnection = null,
+  initialProposals = [],
+  collections = [
+    { slug: "pages", label: "Pages" },
+    { slug: "posts", label: "Blog Posts" },
+    { slug: "products", label: "Products" },
+  ],
+} = {}) {
   const stored = new Map();
   if (initialConnection) {
     stored.set("connection", { value: JSON.stringify(initialConnection), revision: "1" });
@@ -17,7 +27,10 @@ function createHost({ role = 50, initialConnection = null, initialProposals = []
   let revisions = 1;
   const ctx = {
     plugin: { id: "dinkus-openclaw", version: "0.0.0" },
-    site: { url: "https://shop.example.test", name: "Shop", locale: "en" },
+    site: { url: "https://site.example.test", name: "Example Site", locale: "en" },
+    schema: {
+      listCollections: async () => collections,
+    },
     settings: {
       get: async name => stored.get(name)?.value ?? null,
       delete: async name => stored.delete(name),
@@ -40,11 +53,11 @@ function createHost({ role = 50, initialConnection = null, initialProposals = []
     },
     log: { error() {}, info() {}, warn() {}, debug() {} },
   };
-  const route = input => ({
+  const route = (input, entry = undefined) => ({
     input,
-    ui: { surface: "admin-page", locale: "en", direction: "ltr" },
+    ui: { surface: entry ? "editor-panel" : "admin-page", locale: "en", direction: "ltr", ...(entry ? { entry } : {}) },
     user: { id: "u1", email: "owner@example.test", name: "Owner", role, createdAt: "" },
-    request: { url: "https://shop.example.test/_emdash/api/plugins/dinkus-openclaw/admin", method: "POST", headers: {} },
+    request: { url: "https://site.example.test/_emdash/api/plugins/dinkus-openclaw/admin", method: "POST", headers: {} },
   });
   return { ctx, route, stored, kv };
 }
@@ -57,65 +70,89 @@ test("refuses callers below Editor role with valid Block Kit", async () => {
   assert.equal(response.blocks[1].title, "Permission denied");
 });
 
-test("renders OpenClaw setup form on unconfigured load and saves connection", async () => {
-  const { ctx, route } = createHost({ role: 50 });
+test("discovers dynamic site collections without requiring Commerce and saves connection", async () => {
+  const { ctx, route } = createHost({
+    role: 50,
+    collections: [
+      { slug: "pages", label: "Pages" },
+      { slug: "articles", label: "Articles" },
+    ],
+  });
   const initial = await admin(route({ type: "page_load" }), ctx);
   assert.doesNotThrow(() => validateBlockResponse(initial));
-  assert.equal(initial.blocks.some(b => b.type === "form" && b.block_id === "openclaw-connect-form"), true);
+  const form = initial.blocks.find(b => b.type === "form" && b.block_id === "openclaw-connect-form");
+  assert.ok(form);
+  assert.equal(form.fields.some(f => f.action_id === "col_articles"), true);
 
   const connected = await admin(
     route({
       type: "form_submit",
       action_id: "save_connection",
       values: {
-        gatewayUrl: "https://dinkuskit.com/api/openclaw",
+        gatewayUrl: "https://gateway.example.com",
         agentId: "blaze",
         gatewayToken: "oc_test_token_123",
         authorityMode: "propose_with_approval",
+        col_pages: true,
+        col_articles: false,
       },
     }),
     ctx,
   );
   assert.doesNotThrow(() => validateBlockResponse(connected));
   assert.equal(connected.toast?.type, "success");
-  assert.equal(connected.blocks.some(b => b.type === "form" && b.block_id === "openclaw-prompt-form"), true);
 });
 
-test("renders WAITING_FOR_HUMAN approval cards and resolves approval", async () => {
+test("supports live mid-task steer and configurable editor side-panel collaboration", async () => {
   const { ctx, route } = createHost({
     role: 50,
     initialConnection: {
-      gatewayUrl: "https://dinkuskit.com/api/openclaw",
+      gatewayUrl: "https://gateway.example.com",
       agentId: "blaze",
       gatewayToken: "oc_test_token_123",
       authorityMode: "propose_with_approval",
+      enabledCollections: ["pages"],
     },
-    initialProposals: [
-      {
-        proposalId: "prop_1",
-        agentId: "blaze",
-        summary: "Update homepage hero draft headline",
-        targetTool: "admin.editor-draft:patch",
-        createdAt: "2026-11-07T15:00:00Z",
-      },
-    ],
   });
 
-  const page = await admin(route({ type: "page_load" }), ctx);
-  assert.doesNotThrow(() => validateBlockResponse(page));
-  assert.equal(
-    page.blocks.some(b => b.type === "header" && b.text.includes("WAITING_FOR_HUMAN")),
-    true,
-  );
-
-  const approved = await admin(
+  const started = await admin(
     route({
-      type: "block_action",
-      action_id: "approve_proposal",
-      value: "prop_1",
+      type: "form_submit",
+      action_id: "ask_agent",
+      values: { prompt: "Audit all landing pages for broken CTAs" },
     }),
     ctx,
   );
-  assert.doesNotThrow(() => validateBlockResponse(approved));
-  assert.equal(approved.toast?.message, "Approved proposal prop_1.");
+  assert.doesNotThrow(() => validateBlockResponse(started));
+  assert.equal(
+    started.blocks.some(b => b.type === "form" && b.block_id === "openclaw-steer-form"),
+    true,
+  );
+
+  const steered = await admin(
+    route({
+      type: "form_submit",
+      action_id: "steer_agent",
+      values: { steerMessage: "Focus on the pricing page first" },
+    }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(steered));
+  assert.equal(steered.toast?.type, "info");
+
+  // Enabled collection ("pages") renders collaboration form in editor panel
+  const pagesPanel = await editorPanel(
+    route({ type: "panel_load" }, { collection: "pages", id: "home", locale: "en", version: 1 }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(pagesPanel));
+  assert.equal(pagesPanel.blocks.some(b => b.type === "form" && b.block_id === "openclaw-entry-form"), true);
+
+  // Disabled collection ("posts") respects collection filter
+  const postsPanel = await editorPanel(
+    route({ type: "panel_load" }, { collection: "posts", id: "post-1", locale: "en", version: 1 }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(postsPanel));
+  assert.equal(postsPanel.blocks.some(b => b.type === "form"), false);
 });

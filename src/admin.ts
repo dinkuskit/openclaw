@@ -1,4 +1,4 @@
-import type { Block, BlockResponse } from "@emdash-cms/blocks/server";
+import type { Block, BlockResponse, FormField } from "@emdash-cms/blocks/server";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
 
 /** EmDash Editor role (40) and Administrator role (50). */
@@ -10,11 +10,21 @@ export interface OpenClawConnection {
   agentId: string;
   gatewayToken: string;
   authorityMode: "read_only" | "propose_with_approval";
+  enabledCollections: string[];
+}
+
+export interface ActiveTurn {
+  turnId: string;
+  prompt: string;
+  status: "running" | "steered" | "completed";
+  lastUpdate: string;
 }
 
 export interface PendingProposal {
   proposalId: string;
   agentId: string;
+  collection?: string;
+  entryId?: string;
   summary: string;
   targetTool: string;
   createdAt: string;
@@ -30,12 +40,13 @@ interface Submit {
   action_id: string;
   values: Record<string, unknown>;
 }
-type Interaction = { type: "page_load" } | Action | Submit;
+type Interaction = { type: "page_load" } | { type: "panel_load" } | Action | Submit;
 
 function parseInteraction(input: unknown): Interaction | null {
   if (typeof input !== "object" || input === null) return null;
   const value = input as Record<string, unknown>;
   if (value.type === "page_load") return { type: "page_load" };
+  if (value.type === "panel_load") return { type: "panel_load" };
   if (value.type === "block_action" && typeof value.action_id === "string") {
     return { type: "block_action", action_id: value.action_id, value: value.value };
   }
@@ -80,6 +91,31 @@ const fields = (...pairs: [string, string][]): Block => ({
   fields: pairs.map(([label, value]) => ({ label, value })),
 });
 
+async function discoverSiteCollections(
+  ctx: PluginContext,
+): Promise<Array<{ slug: string; label: string }>> {
+  try {
+    const schemaApi = (ctx as unknown as {
+      schema?: { listCollections?: () => Promise<Array<{ slug: string; label?: string; name?: string }>> };
+    }).schema;
+    if (schemaApi?.listCollections) {
+      const list = await schemaApi.listCollections();
+      if (Array.isArray(list) && list.length > 0) {
+        return list.map(col => ({
+          slug: col.slug,
+          label: col.label ?? col.name ?? col.slug,
+        }));
+      }
+    }
+  } catch {
+    // Fall back to default CMS collections when schema list is unavailable.
+  }
+  return [
+    { slug: "pages", label: "Pages" },
+    { slug: "posts", label: "Posts" },
+  ];
+}
+
 async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
   const raw = await ctx.settings.get("connection");
   if (typeof raw !== "string" || !raw) return null;
@@ -101,6 +137,9 @@ async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | 
           parsed.authorityMode === "propose_with_approval"
             ? "propose_with_approval"
             : "read_only",
+        enabledCollections: Array.isArray(parsed.enabledCollections)
+          ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+          : ["pages", "posts"],
       };
     }
   } catch {
@@ -116,14 +155,25 @@ async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
   return raw as PendingProposal[];
 }
 
-export function setupPage(isAdmin: boolean, failure?: string): BlockResponse {
+async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
+  if (!ctx.kv) return null;
+  const raw = await ctx.kv.get("active_turn");
+  if (!raw || typeof raw !== "object") return null;
+  return raw as ActiveTurn;
+}
+
+export function setupPage(
+  isAdmin: boolean,
+  collections: Array<{ slug: string; label: string }>,
+  failure?: string,
+): BlockResponse {
   const blocks: Block[] = [
     header("OpenClaw"),
     banner(
       failure ? "error" : "default",
-      failure ? "Could not save OpenClaw connection" : "Connect OpenClaw Gateway",
+      failure ? "Could not save OpenClaw connection" : "Connect Your OpenClaw Gateway",
       failure ??
-        "Connect your OpenClaw gateway so your custom agents can inspect content, assist in the EmDash admin, and propose actions through Block Kit approval cards. Access starts read-only.",
+        "Plug your custom OpenClaw gateway directly into EmDash CMS. Works standalone on any EmDash site (blogs, marketing sites, or stores) with no Commerce dependency.",
     ),
   ];
 
@@ -134,6 +184,13 @@ export function setupPage(isAdmin: boolean, failure?: string): BlockResponse {
     return { blocks };
   }
 
+  const collectionToggles: FormField[] = collections.map(col => ({
+    type: "toggle",
+    action_id: `col_${col.slug}`,
+    label: `Enable Editor Side-Panel on "${col.label}" (${col.slug})`,
+    initial_value: true,
+  }));
+
   blocks.push({
     type: "form",
     block_id: "openclaw-connect-form",
@@ -142,7 +199,7 @@ export function setupPage(isAdmin: boolean, failure?: string): BlockResponse {
         type: "text_input",
         action_id: "gatewayUrl",
         label: "OpenClaw Gateway HTTPS URL",
-        placeholder: "https://dinkuskit.com/api/openclaw",
+        placeholder: "https://gateway.example.com",
       },
       {
         type: "text_input",
@@ -170,6 +227,7 @@ export function setupPage(isAdmin: boolean, failure?: string): BlockResponse {
           },
         ],
       },
+      ...collectionToggles,
     ],
     submit: { label: "Save connection", action_id: "save_connection" },
   });
@@ -179,7 +237,9 @@ export function setupPage(isAdmin: boolean, failure?: string): BlockResponse {
 
 export function workspacePage(
   connection: OpenClawConnection,
+  collections: Array<{ slug: string; label: string }>,
   proposals: PendingProposal[],
+  activeTurn: ActiveTurn | null,
   isAdmin: boolean,
   replyText?: string,
   toast?: BlockResponse["toast"],
@@ -189,6 +249,12 @@ export function workspacePage(
     fields(
       ["Gateway", connection.gatewayUrl],
       ["Active Agent", `@${connection.agentId}`],
+      [
+        "Enabled Content Panels",
+        connection.enabledCollections.length > 0
+          ? connection.enabledCollections.join(", ")
+          : "None (Sidebar only)",
+      ],
       [
         "Authority Posture",
         connection.authorityMode === "read_only"
@@ -202,6 +268,41 @@ export function workspacePage(
     blocks.push(banner("default", `Response from @${connection.agentId}`, replyText));
   }
 
+  if (activeTurn && activeTurn.status !== "completed") {
+    blocks.push(
+      header("Active Task — Live Steer"),
+      banner(
+        "alert",
+        `@${connection.agentId} is working (${activeTurn.status})`,
+        `Task: "${activeTurn.prompt}" — ${activeTurn.lastUpdate}`,
+      ),
+      {
+        type: "form",
+        block_id: "openclaw-steer-form",
+        fields: [
+          {
+            type: "text_input",
+            action_id: "steerMessage",
+            label: `Steer @${connection.agentId} mid-task`,
+            placeholder: "Adjust tone, narrow scope, or change target fields...",
+          },
+        ],
+        submit: { label: "Steer agent", action_id: "steer_agent" },
+      },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            label: "Check status",
+            action_id: "check_status",
+            style: "primary",
+          },
+        ],
+      },
+    );
+  }
+
   blocks.push({
     type: "form",
     block_id: "openclaw-prompt-form",
@@ -210,7 +311,7 @@ export function workspacePage(
         type: "text_input",
         action_id: "prompt",
         label: `Ask @${connection.agentId}`,
-        placeholder: "Summarize draft posts or check store status...",
+        placeholder: "Audit draft pages, suggest headlines, or summarize content...",
       },
     ],
     submit: { label: "Send to OpenClaw", action_id: "ask_agent" },
@@ -222,7 +323,7 @@ export function workspacePage(
       banner(
         "alert",
         "Human approval required",
-        "OpenClaw proposed the following site or store actions. Review each card before approving or rejecting.",
+        "OpenClaw proposed the following content or site actions. Review each card before approving or rejecting.",
       ),
     );
     for (const proposal of proposals) {
@@ -231,6 +332,9 @@ export function workspacePage(
           ["Proposal", proposal.summary],
           ["Tool / Action", proposal.targetTool],
           ["Agent", `@${proposal.agentId}`],
+          ...(proposal.collection
+            ? [["Target Entry", `${proposal.collection}/${proposal.entryId ?? ""}`] as [string, string]]
+            : []),
         ),
         {
           type: "actions",
@@ -255,18 +359,32 @@ export function workspacePage(
     }
   }
 
-  if (isAdmin) {
-    blocks.push({
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          label: "Disconnect gateway",
-          action_id: "disconnect",
-          style: "secondary",
-        },
-      ],
-    });
+  if (isAdmin && collections.length > 0) {
+    blocks.push(
+      header("Configure Content Editor Side-Panels"),
+      {
+        type: "form",
+        block_id: "openclaw-collections-form",
+        fields: collections.map(col => ({
+          type: "toggle",
+          action_id: `col_${col.slug}`,
+          label: `${col.label} (${col.slug})`,
+          initial_value: connection.enabledCollections.includes(col.slug),
+        })),
+        submit: { label: "Update enabled collections", action_id: "save_collections" },
+      },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            label: "Disconnect gateway",
+            action_id: "disconnect",
+            style: "secondary",
+          },
+        ],
+      },
+    );
   }
 
   return { blocks, ...(toast ? { toast } : {}) };
@@ -287,6 +405,7 @@ export async function openclawAdmin(
   }
 
   const isAdmin = role >= ADMIN;
+  const collections = await discoverSiteCollections(ctx);
   const event = parseInteraction(route.input);
   if (!event) {
     return {
@@ -299,7 +418,7 @@ export async function openclawAdmin(
 
   if (event.type === "form_submit" && event.action_id === "save_connection") {
     if (!isAdmin) {
-      return setupPage(false, "Only an Administrator can configure the OpenClaw connection.");
+      return setupPage(false, collections, "Only an Administrator can configure OpenClaw.");
     }
     const gatewayUrl = cleanText(event.values.gatewayUrl, 300);
     const agentId = cleanText(event.values.agentId, 80);
@@ -310,20 +429,25 @@ export async function openclawAdmin(
         : "read_only";
 
     if (!gatewayUrl || !gatewayUrl.startsWith("https://")) {
-      return setupPage(true, "Enter an HTTPS OpenClaw gateway URL.");
+      return setupPage(true, collections, "Enter an HTTPS OpenClaw gateway URL.");
     }
     if (!agentId) {
-      return setupPage(true, "Enter the default OpenClaw agent ID.");
+      return setupPage(true, collections, "Enter the default OpenClaw agent ID.");
     }
     if (!gatewayToken) {
-      return setupPage(true, "Enter your OpenClaw gateway bearer token.");
+      return setupPage(true, collections, "Enter your OpenClaw gateway bearer token.");
     }
+
+    const enabledCollections = collections
+      .filter(col => event.values[`col_${col.slug}`] !== false)
+      .map(col => col.slug);
 
     const nextConnection: OpenClawConnection = {
       gatewayUrl,
       agentId,
       gatewayToken,
       authorityMode,
+      enabledCollections,
     };
     const existing = await ctx.settings.getVersioned("connection");
     await ctx.settings.compareAndSet(
@@ -332,23 +456,50 @@ export async function openclawAdmin(
       JSON.stringify(nextConnection),
     );
     const proposals = await loadProposals(ctx);
-    return workspacePage(nextConnection, proposals, isAdmin, undefined, {
-      type: "success",
-      message: `Connected to OpenClaw (@${agentId}).`,
-    });
+    const activeTurn = await loadActiveTurn(ctx);
+    return workspacePage(
+      nextConnection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      {
+        type: "success",
+        message: `Connected to OpenClaw (@${agentId}).`,
+      },
+    );
   }
 
   const connection = await loadConnection(ctx);
   if (!connection) {
-    return setupPage(isAdmin);
+    return setupPage(isAdmin, collections);
   }
 
   if (event.type === "block_action" && event.action_id === "disconnect" && isAdmin) {
     await ctx.settings.delete("connection");
-    return setupPage(true);
+    return setupPage(true, collections);
   }
 
   const proposals = await loadProposals(ctx);
+  let activeTurn = await loadActiveTurn(ctx);
+
+  if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
+    const enabledCollections = collections
+      .filter(col => event.values[`col_${col.slug}`] === true)
+      .map(col => col.slug);
+    const updated: OpenClawConnection = { ...connection, enabledCollections };
+    const existing = await ctx.settings.getVersioned("connection");
+    await ctx.settings.compareAndSet(
+      "connection",
+      existing?.revision ?? null,
+      JSON.stringify(updated),
+    );
+    return workspacePage(updated, collections, proposals, activeTurn, isAdmin, undefined, {
+      type: "success",
+      message: "Updated enabled editor collections.",
+    });
+  }
 
   if (
     event.type === "block_action" &&
@@ -360,10 +511,52 @@ export async function openclawAdmin(
       await ctx.kv.set("pending_proposals", remaining);
     }
     const verb = event.action_id === "approve_proposal" ? "Approved" : "Rejected";
-    return workspacePage(connection, remaining, isAdmin, undefined, {
+    return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
       type: "success",
       message: `${verb} proposal ${proposalId ?? ""}.`,
     });
+  }
+
+  if (event.type === "form_submit" && event.action_id === "steer_agent" && activeTurn) {
+    const steerMessage = cleanText(event.values.steerMessage, 500);
+    if (steerMessage) {
+      activeTurn = {
+        ...activeTurn,
+        status: "steered",
+        lastUpdate: `Steered mid-task: "${steerMessage}"`,
+      };
+      if (ctx.kv) {
+        await ctx.kv.set("active_turn", activeTurn);
+      }
+    }
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      {
+        type: "info",
+        message: `Sent mid-task steer to @${connection.agentId}.`,
+      },
+    );
+  }
+
+  if (event.type === "block_action" && event.action_id === "check_status") {
+    if (ctx.kv) {
+      await ctx.kv.delete("active_turn");
+    }
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      null,
+      isAdmin,
+      activeTurn
+        ? `Completed task "${activeTurn.prompt}" (${activeTurn.lastUpdate}).`
+        : "No active task is currently running.",
+    );
   }
 
   if (event.type === "form_submit" && event.action_id === "ask_agent") {
@@ -371,18 +564,124 @@ export async function openclawAdmin(
     if (!prompt) {
       return workspacePage(
         connection,
+        collections,
         proposals,
+        activeTurn,
         isAdmin,
         "Enter a prompt for your OpenClaw agent.",
       );
     }
+    const turn: ActiveTurn = {
+      turnId: `turn_${Date.now()}`,
+      prompt,
+      status: "running",
+      lastUpdate: "Dispatched to OpenClaw gateway; press Check status or Steer agent below.",
+    };
+    if (ctx.kv) {
+      await ctx.kv.set("active_turn", turn);
+    }
     return workspacePage(
       connection,
+      collections,
       proposals,
+      turn,
       isAdmin,
-      `Queued request for @${connection.agentId} (${connection.authorityMode}): "${prompt}"`,
+      `Started task on @${connection.agentId} (${connection.authorityMode}): "${prompt}"`,
     );
   }
 
-  return workspacePage(connection, proposals, isAdmin);
+  return workspacePage(connection, collections, proposals, activeTurn, isAdmin);
+}
+
+/**
+ * Saved-entry Editor Side-Panel handler (`editor/assistant`). Collaborates with
+ * the user on any entry whose collection is enabled on the OpenClaw settings page.
+ */
+export async function openclawEditorPanel(
+  route: SandboxedRouteContext,
+  ctx: PluginContext,
+): Promise<BlockResponse> {
+  const role = route.user?.role ?? 0;
+  if (role < EDITOR) {
+    return {
+      blocks: [banner("error", "Permission denied", "Only Editors and Administrators can use OpenClaw.")],
+    };
+  }
+
+  const connection = await loadConnection(ctx);
+  if (!connection) {
+    return {
+      blocks: [
+        banner(
+          "default",
+          "OpenClaw not connected",
+          "Open the OpenClaw page in the sidebar to connect your gateway first.",
+        ),
+      ],
+    };
+  }
+
+  const ui = (route as unknown as {
+    ui?: { entry?: { collection?: string; id?: string; locale?: string; version?: number } };
+  }).ui;
+  const collection = ui?.entry?.collection ?? "pages";
+  const entryId = ui?.entry?.id ?? "current";
+
+  if (!connection.enabledCollections.includes(collection)) {
+    return {
+      blocks: [
+        context(
+          `OpenClaw collaboration is currently disabled for the "${collection}" collection. Enable it on the OpenClaw sidebar page.`,
+        ),
+      ],
+    };
+  }
+
+  const event = parseInteraction(route.input);
+  if (event?.type === "form_submit" && event.action_id === "collaborate_entry") {
+    const instruction = cleanText(event.values.instruction, 500);
+    if (instruction && ctx.kv) {
+      const proposals = await loadProposals(ctx);
+      proposals.push({
+        proposalId: `prop_${Date.now()}`,
+        agentId: connection.agentId,
+        collection,
+        entryId,
+        summary: `${collection}/${entryId}: ${instruction}`,
+        targetTool: "content:collaborate",
+        createdAt: new Date().toISOString(),
+      });
+      await ctx.kv.set("pending_proposals", proposals);
+    }
+    return {
+      blocks: [
+        banner(
+          "default",
+          `Sent to @${connection.agentId}`,
+          instruction
+            ? `Queued collaboration request for ${collection}/${entryId}: "${instruction}". Review proposals on the OpenClaw page.`
+            : "Enter an instruction to collaborate on this entry.",
+        ),
+      ],
+    };
+  }
+
+  return {
+    blocks: [
+      fields(["Agent", `@${connection.agentId}`], ["Entry", `${collection}/${entryId}`]),
+      {
+        type: "form",
+        block_id: "openclaw-entry-form",
+        fields: [
+          {
+            type: "text_input",
+            action_id: "instruction",
+            label: `Collaborate with @${connection.agentId} on this ${collection} entry`,
+            placeholder: "Tighten copy, generate SEO description, or check links...",
+          },
+        ],
+        submit: { label: "Ask OpenClaw", action_id: "collaborate_entry" },
+      },
+    ],
+  };
 }

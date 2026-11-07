@@ -1,10 +1,10 @@
 import type { SandboxedPlugin } from "emdash/plugin";
-import { openclawAdmin } from "./admin.js";
+import { openclawAdmin, openclawEditorPanel } from "./admin.js";
 
 /**
- * DinkusKit OpenClaw for the EmDash admin: connects an OpenClaw gateway and
- * custom agents to the site's MCP tools and Block Kit approval cards, starting
- * read-only with explicit WAITING_FOR_HUMAN approval before any mutation.
+ * Standalone OpenClaw Registry plugin for any EmDash CMS site: connects a
+ * user's custom OpenClaw gateway to a sidebar admin page and a configurable
+ * saved-entry editor panel across the site's content collections.
  */
 const plugin: SandboxedPlugin = {
   routes: {
@@ -13,6 +13,12 @@ const plugin: SandboxedPlugin = {
       permission: "content:edit_any",
       methods: ["POST"],
       handler: openclawAdmin,
+    },
+    "editor/assistant": {
+      public: false,
+      permission: "content:edit_any",
+      methods: ["POST"],
+      handler: openclawEditorPanel,
     },
   },
 };

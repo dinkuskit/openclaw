@@ -3,7 +3,7 @@
   "slug": "dinkus-openclaw",
   "publisher": "did:plc:ekk4pjmkh3k3ql2kfoex3qt4",
   "name": "OpenClaw",
-  "description": "Connect custom OpenClaw agents and gateways to the EmDash CMS admin with Block Kit approval cards and MCP tools.",
+  "description": "Connect custom OpenClaw agents and gateways to any EmDash CMS site with configurable editor panels and approval cards.",
   "license": "MIT",
   "author": {
     "name": "DinkusKit",
@@ -14,14 +14,9 @@
   },
   "repo": "https://github.com/dinkuskit/openclaw",
   "capabilities": [
-    "network:request",
+    "network:request:unrestricted",
     "schema:read",
-    "content:read",
-    "admin.editor-draft:read",
-    "admin.editor-draft:patch"
-  ],
-  "allowedHosts": [
-    "dinkuskit.com"
+    "content:read"
   ],
   "storage": {},
   "admin": {
@@ -29,7 +24,7 @@
       "connection": {
         "type": "secret",
         "label": "OpenClaw gateway connection",
-        "description": "Encrypted OpenClaw gateway endpoint, agent ID, and bearer token. Managed on the OpenClaw page; do not edit raw JSON here."
+        "description": "Encrypted OpenClaw gateway endpoint, agent ID, bearer token, and enabled content collections. Managed on the OpenClaw page."
       }
     },
     "pages": [
@@ -37,7 +32,14 @@
         "path": "/openclaw",
         "label": "OpenClaw",
         "icon": "bot",
-        "group": "Dinkus OpenClaw"
+        "group": "OpenClaw"
+      }
+    ],
+    "editorPanels": [
+      {
+        "id": "openclaw-assistant",
+        "title": "OpenClaw Assistant",
+        "route": "editor/assistant"
       }
     ]
   }
