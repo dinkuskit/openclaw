@@ -765,22 +765,27 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
 
     if (req.steer) {
       const activeCollector = this.#activeCollectors.get(req.sessionKey);
-      const expectedRunId = req.expectedRunId ?? activeCollector?.runId;
+      const originatingRunId = req.expectedRunId ?? activeCollector?.runId;
       try {
+        // Published 2026.11.1 ChatSendParamsSchema has additionalProperties: false and does NOT accept expectedRunId.
         const ack = await this.#client.request<{ runId?: string }>("chat.send", {
           sessionKey: req.sessionKey,
           agentId: req.connection.agentId,
           message: req.prompt,
           queueMode: "steer",
-          ...(expectedRunId ? { expectedRunId } : {}),
           idempotencyKey: `emdash_steer_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         });
-        if (ack && typeof ack.runId === "string" && ack.runId !== activeCollector?.runId) {
+        if (
+          ack &&
+          typeof ack.runId === "string" &&
+          ack.runId !== activeCollector?.runId &&
+          ack.runId !== originatingRunId
+        ) {
           this.#steerRunIds.add(ack.runId);
         }
         return {
           ok: true,
-          runId: ack?.runId ?? expectedRunId,
+          runId: originatingRunId ?? ack?.runId,
           replyText: "",
           status: "completed",
           toolCalls: [],

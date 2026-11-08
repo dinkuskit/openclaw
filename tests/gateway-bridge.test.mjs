@@ -88,6 +88,11 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
       }
 
       if (frame.method === "chat.send") {
+        assert.equal(
+          "expectedRunId" in frame.params,
+          false,
+          "2026.11.1 ChatSendParamsSchema forbids expectedRunId",
+        );
         if (frame.params.queueMode === "steer") {
           steerSendPayload = frame.params;
           ws.send(
@@ -95,7 +100,7 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
               type: "res",
               id: frame.id,
               ok: true,
-              payload: { runId: frame.params.expectedRunId ?? "run_steered_1", status: "started" },
+              payload: { runId: "run_steered_1", status: "started" },
             }),
           );
           return;
