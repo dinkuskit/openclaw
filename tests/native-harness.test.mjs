@@ -426,3 +426,217 @@ test("published entries with staged draft revisions reconcile via content:revisi
   assert.equal(reconciled.proposals[0].status, "applied");
   assert.equal(reconciled.proposals[0].reconciledServerSide, true);
 });
+
+test("enforces admin-only pairing codes, private proposal SSE, base-rev conflict guard, and concurrent turn merge", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+  const itemsByCollection = createStoreFixtures();
+
+  // 1. Non-admin Editor never mints or receives pairing codes
+  const editorSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.equal(editorSnap.pairingCode, "");
+  assert.equal(editorSnap.pairingCommand, "");
+  assert.equal(sharedKv.has("pairing_code"), false);
+
+  // Admin configures propose_with_approval connection (and mints pairing code)
+  const adminSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "https://agent-session.openclaw.local",
+        authorityMode: "propose_with_approval",
+      },
+    }),
+  );
+  assert.ok(adminSnap.pairingCode.startsWith("oc_pair_"));
+
+  // 2. Private proposal updates stay isolated to u_alice on SSE & route auth
+  const aliceTurn = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "send_message",
+        conversationId: editorSnap.activeConversationId,
+        prompt: 'Propose an updated excerpt for Atelier Field Jacket to "Private Alice Draft."',
+      },
+    }),
+  );
+  const aliceProp = aliceTurn.proposals[0];
+  assert.ok(aliceProp);
+
+  const bobDenied = await chat(
+    createNativeRouteCtx({
+      userId: "u_bob",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "revise_proposal",
+        proposalId: aliceProp.proposalId,
+        proposedFields: { excerpt: "Bob Tamper" },
+      },
+    }),
+  );
+  assert.equal(bobDenied.ok, false);
+  assert.equal(bobDenied.error, "FORBIDDEN");
+
+  const bobAbort = new AbortController();
+  const bobStream = await streamGet({
+    request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+      signal: bobAbort.signal,
+    }),
+    url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+    locals: { user: { id: "u_bob", role: 40 } },
+  });
+  const bobReader = bobStream.body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await bobReader.read()).value), /"type":"connected"/);
+
+  const revisedSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "revise_proposal",
+        conversationId: editorSnap.activeConversationId,
+        proposalId: aliceProp.proposalId,
+        proposedFields: { excerpt: "Private Alice Rev 2" },
+      },
+    }),
+  );
+  const aliceRev2 = revisedSnap.proposals.find(p => p.revisionNumber === 2);
+  assert.ok(aliceRev2);
+
+  // Trigger a shared event afterwards; u_bob must receive ONLY the shared event, never Alice's proposal_updated!
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "configure_connection", gatewayUrl: "https://agent-session.openclaw.local" },
+    }),
+  );
+  const bobFrame1 = decoder.decode((await bobReader.read()).value);
+  const bobFrame2 = bobFrame1.includes('"reason":"connection_updated"')
+    ? ""
+    : decoder.decode((await bobReader.read()).value);
+  const bobCombined = bobFrame1 + bobFrame2;
+  assert.doesNotMatch(bobCombined, /Private Alice Rev 2/);
+  assert.doesNotMatch(bobCombined, /"type":"proposal_updated"/);
+  assert.match(bobCombined, /"reason":"connection_updated"/);
+  bobAbort.abort();
+
+  // 3. Concurrent entry modification before stamp_proposal_rev transitions proposal to conflict instead of stamping newer _rev
+  itemsByCollection.products[0].version = 4;
+  itemsByCollection.products[0].data.excerpt = "Intervening editor edit";
+  const conflictSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "stamp_proposal_rev",
+        conversationId: editorSnap.activeConversationId,
+        proposalId: aliceRev2.proposalId,
+        baseRev: "opaque_rev_v4",
+      },
+    }),
+  );
+  const conflicted = conflictSnap.proposals.find(p => p.proposalId === aliceRev2.proposalId);
+  assert.equal(conflicted.status, "conflict");
+  assert.equal(conflicted.conflictRev, "opaque_rev_v4");
+
+  const rebasedSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "rebase_proposal",
+        conversationId: editorSnap.activeConversationId,
+        proposalId: aliceRev2.proposalId,
+        baseRev: "opaque_rev_v4",
+      },
+    }),
+  );
+  const rebased = rebasedSnap.proposals.find(p => p.proposalId === aliceRev2.proposalId);
+  assert.equal(rebased.status, "pending");
+  assert.equal(rebased.baseRev, "opaque_rev_v4");
+  assert.equal(rebased.diffs[0].before, "Intervening editor edit");
+
+  // 4. Concurrent thread edits during an in-flight turn are preserved on turn completion
+  let releaseTurn;
+  const slowTurnPromise = new Promise(resolve => {
+    releaseTurn = resolve;
+  });
+  const baseCtx = createNativeRouteCtx({
+    userId: "u_alice",
+    role: 40,
+    sharedSettings,
+    sharedKv,
+    itemsByCollection,
+    input: {
+      action: "send_message",
+      conversationId: editorSnap.activeConversationId,
+      prompt: "Show me my products",
+    },
+  });
+  const origList = baseCtx.content.list;
+  baseCtx.content.list = async slug => {
+    await slowTurnPromise;
+    return origList(slug);
+  };
+
+  const inFlightTurn = chat(baseCtx);
+  await new Promise(r => setTimeout(r, 25));
+
+  const createdWhileRunning = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "create_thread", title: "Mid-Run Sibling Thread" },
+    }),
+  );
+  assert.ok(createdWhileRunning.threads.some(t => t.title === "Mid-Run Sibling Thread"));
+
+  releaseTurn();
+  const completedTurn = await inFlightTurn;
+  assert.ok(completedTurn.threads.some(t => t.title === "Mid-Run Sibling Thread"));
+  const finalAliceThread = completedTurn.threads.find(
+    t => t.conversationId === editorSnap.activeConversationId,
+  );
+  assert.ok(finalAliceThread.messages.some(m => /Atelier Field Jacket/.test(m.content)));
+});

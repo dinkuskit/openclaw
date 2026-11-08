@@ -65,14 +65,27 @@ export async function GET(context: {
       });
 
       const unsubscribe = subscribeOpenClawEvents(event => {
-        if (
-          "visibility" in event &&
-          event.visibility === "personal" &&
-          event.ownerUserId &&
-          user.id &&
-          event.ownerUserId !== user.id
-        ) {
-          return;
+        if (event.type !== "gateway_status") {
+          if (event.visibility === "shared") {
+            // Explicitly shared thread or site-wide connection update
+          } else if (
+            event.visibility === "personal" &&
+            Boolean(event.ownerUserId) &&
+            Boolean(user.id) &&
+            event.ownerUserId === user.id
+          ) {
+            // Addressed to the personal conversation owner
+          } else if (
+            event.type === "exec_approval_updated" &&
+            !event.visibility &&
+            !event.ownerUserId &&
+            (user.role ?? 0) >= 50
+          ) {
+            // Unbound Gateway execution approvals are restricted to Site Administrators
+          } else {
+            // Fail closed when audience metadata is missing or belongs to another user
+            return;
+          }
         }
         if (
           filterConversationId &&

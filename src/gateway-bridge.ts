@@ -695,6 +695,13 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     }
 
     const existing = this.#approvals.get(params.approvalId);
+    const existingBinding = existing?.sessionKey
+      ? this.#sessionToConversation.get(existing.sessionKey)
+      : undefined;
+    const approvalAudience = {
+      ownerUserId: existingBinding?.ownerUserId ?? params.resolvedByUserId,
+      visibility: existingBinding?.visibility ?? ("personal" as const),
+    };
     if (existing) {
       if (existing.status !== "pending") {
         return { ok: false, error: `Approval is already ${existing.status}.`, approval: existing };
@@ -717,6 +724,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         type: "exec_approval_updated",
         approval: resolving,
         timestamp: new Date().toISOString(),
+        ...approvalAudience,
       });
     }
 
@@ -747,6 +755,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             type: "exec_approval_updated",
             approval: reverted,
             timestamp: new Date().toISOString(),
+            ...approvalAudience,
           });
         }
         return {
@@ -777,6 +786,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       type: "exec_approval_updated",
       approval: resolved,
       timestamp: new Date().toISOString(),
+      ...approvalAudience,
     });
     return { ok: true, approval: resolved };
   }
@@ -804,7 +814,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       const conversationId = collector?.conversationId ?? binding?.conversationId;
       const audience = {
         ownerUserId: collector?.ownerUserId ?? binding?.ownerUserId,
-        visibility: collector?.visibility ?? binding?.visibility,
+        visibility: collector?.visibility ?? binding?.visibility ?? ("personal" as const),
       };
 
       if (collector && runId) {
@@ -923,7 +933,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           toolCall: trace,
           timestamp: new Date().toISOString(),
           ownerUserId: collector.ownerUserId,
-          visibility: collector.visibility,
+          visibility: collector.visibility ?? "personal",
         });
       }
       return;
@@ -1020,12 +1030,16 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     if (collector && !collector.approvals.some(a => a.approvalId === approvalId)) {
       collector.approvals.push(approval);
     }
+    const ownerUserId = collector?.ownerUserId ?? binding?.ownerUserId;
     publishOpenClawEvent({
       type: "exec_approval_updated",
       approval,
       timestamp: new Date().toISOString(),
-      ownerUserId: collector?.ownerUserId ?? binding?.ownerUserId,
-      visibility: collector?.visibility ?? binding?.visibility,
+      ownerUserId,
+      visibility:
+        collector || binding
+          ? (collector?.visibility ?? binding?.visibility ?? "personal")
+          : undefined,
     });
   }
 }

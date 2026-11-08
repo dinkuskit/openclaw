@@ -702,7 +702,7 @@ export async function openclawAdmin(
   const isAdmin = role >= ADMIN;
   const collections = await discoverSiteCollections(ctx);
   const siteOrigin = resolveSiteOrigin(route);
-  const pairingCode = await loadOrCreatePairingCode(ctx);
+  const pairingCode = isAdmin ? await loadOrCreatePairingCode(ctx) : "";
   const event = parseInteraction(route.input);
   if (!event) {
     return {
@@ -1227,6 +1227,7 @@ export async function openclawPairRoute(
         conversationId: "conv_catalog_overview",
         reason: "external_agent_turn_completed",
         timestamp: new Date().toISOString(),
+        visibility: "shared",
       });
       return { ok: true, status: "completed", reply };
     }
@@ -1248,6 +1249,7 @@ export async function openclawPairRoute(
         conversationId: "conv_catalog_overview",
         reason: "external_agent_proposal",
         timestamp: new Date().toISOString(),
+        visibility: "shared",
       });
       return { ok: true, proposal };
     }
@@ -1305,6 +1307,7 @@ export async function openclawPairRoute(
     conversationId: "conv_catalog_overview",
     reason: "agent_paired",
     timestamp: new Date().toISOString(),
+    visibility: "shared",
   });
 
   return {

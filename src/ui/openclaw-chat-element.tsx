@@ -408,11 +408,20 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     });
   });
 
-  // Re-sync if bound entry changes in Editor Panel
+  // Re-sync only when the bound entry key actually changes after initial mount
+  let lastBoundEntryKey: string | null = null;
   createEffect(() => {
     const bound = effectiveBoundEntry();
-    if (bound && snapshot()) {
+    const key = bound ? `${bound.collection}:${bound.entryId}:${bound.locale ?? ""}` : "";
+    if (lastBoundEntryKey === null) {
+      lastBoundEntryKey = key;
+      return;
+    }
+    if (key && key !== lastBoundEntryKey) {
+      lastBoundEntryKey = key;
       void refreshWorkspace();
+    } else {
+      lastBoundEntryKey = key;
     }
   });
 
@@ -1831,26 +1840,34 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
                 <div class="oc-overview-divider" />
                 <h3>1-Step External Agent / MCP Pairing (Expiring 15m Code)</h3>
-                <div style={{ "font-size": "12px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
-                  Paste into RoboClaw, OpenClaw CLI, Codex, or Claude Code to mint a Bearer session
-                  token for authenticated EmDash MCP inspection & proposal staging:
-                </div>
-                <div class="oc-code-copy">{snapshot()?.pairingCommand}</div>
-                <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
-                  <button type="button" class="oc-btn" onClick={() => void copyPairingCommand()}>
-                    {copiedPairing() ? "✓ Copied curl command" : "Copy Pairing Command"}
-                  </button>
-                  <button
-                    type="button"
-                    class="oc-btn"
-                    disabled={!snapshot()?.isAdmin}
-                    onClick={() =>
-                      void callOpenClawChat({ action: "rotate_pairing_code" }).then(s => setSnapshot(s))
-                    }
-                  >
-                    Rotate Code ({snapshot()?.pairingCode})
-                  </button>
-                </div>
+                <Show
+                  when={snapshot()?.isAdmin}
+                  fallback={
+                    <div style={{ "font-size": "12px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
+                      Site Administrator role is required to view or mint external agent pairing codes.
+                    </div>
+                  }
+                >
+                  <div style={{ "font-size": "12px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
+                    Paste into RoboClaw, OpenClaw CLI, Codex, or Claude Code to mint a Bearer session
+                    token for authenticated EmDash MCP inspection & proposal staging:
+                  </div>
+                  <div class="oc-code-copy">{snapshot()?.pairingCommand}</div>
+                  <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
+                    <button type="button" class="oc-btn" onClick={() => void copyPairingCommand()}>
+                      {copiedPairing() ? "✓ Copied curl command" : "Copy Pairing Command"}
+                    </button>
+                    <button
+                      type="button"
+                      class="oc-btn"
+                      onClick={() =>
+                        void callOpenClawChat({ action: "rotate_pairing_code" }).then(s => setSnapshot(s))
+                      }
+                    >
+                      Rotate Code ({snapshot()?.pairingCode})
+                    </button>
+                  </div>
+                </Show>
               </Show>
 
               <Show when={activeSheet() === "customizations"}>

@@ -43,9 +43,33 @@ export interface LiveEmDashEntry {
     status?: string;
     locale?: string;
     version?: number;
+    draftRevisionId?: string | null;
+    liveRevisionId?: string | null;
     data: Record<string, unknown>;
   };
   _rev: string;
+}
+
+function doesLiveEntryMatchProposalBase(
+  proposal: RevisionProposal,
+  live: LiveEmDashEntry,
+): boolean {
+  if (proposal.baseRev.startsWith("v") && typeof live.item.version === "number") {
+    const liveSynthetic = `v${live.item.version}:${live.item.draftRevisionId ?? live.item.liveRevisionId ?? "head"}`;
+    if (liveSynthetic !== proposal.baseRev) {
+      return false;
+    }
+  }
+  for (const d of proposal.diffs) {
+    if (d.before === "(current saved content)") continue;
+    const rawVal = live.item.data?.[d.field];
+    const liveVal = typeof rawVal === "string" ? rawVal : "";
+    const expectedVal = d.before === "(empty)" ? "" : d.before;
+    if (liveVal !== expectedVal) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export async function fetchLiveEntryWithRev(
@@ -74,7 +98,7 @@ export async function fetchLiveEntryWithRev(
 
 /**
  * Resolves and stamps opaque EmDash `_rev` tokens on newly created proposals
- * so optimistic concurrency compares against the exact revision the reviewer saw.
+ * only after verifying the live entry still matches the pre-turn revision and fields.
  */
 export async function ensureProposalBaseRevs(
   proposals: RevisionProposal[],
@@ -88,10 +112,22 @@ export async function ensureProposalBaseRevs(
     }
     try {
       const live = await fetchLiveEntryWithRev(prop.collection, prop.entryId, prop.locale);
+      if (!doesLiveEntryMatchProposalBase(prop, live)) {
+        latestSnapshot = await callOpenClawChat({
+          action: "record_proposal_receipt",
+          conversationId: prop.conversationId || conversationId,
+          proposalId: prop.proposalId,
+          status: "conflict",
+          conflictRev: live._rev,
+          errorMessage:
+            "Entry changed before revision token was bound. Rebase or regenerate before saving.",
+        });
+        continue;
+      }
       if (live._rev && live._rev !== prop.baseRev) {
         latestSnapshot = await callOpenClawChat({
           action: "stamp_proposal_rev",
-          conversationId,
+          conversationId: prop.conversationId || conversationId,
           proposalId: prop.proposalId,
           baseRev: live._rev,
         });
@@ -136,12 +172,37 @@ export async function applyRevisionProposal(
     activeProposal.locale,
   );
 
-  const expectedRev =
-    activeProposal.baseRev &&
+  const hasOpaqueRev =
+    Boolean(activeProposal.baseRev) &&
     !activeProposal.baseRev.startsWith("v") &&
-    activeProposal.baseRev !== "pending-browser-rev"
-      ? activeProposal.baseRev
-      : live._rev;
+    activeProposal.baseRev !== "pending-browser-rev";
+
+  if (!hasOpaqueRev) {
+    if (!doesLiveEntryMatchProposalBase(activeProposal, live)) {
+      return callOpenClawChat({
+        action: "record_proposal_receipt",
+        conversationId: activeProposal.conversationId,
+        proposalId: activeProposal.proposalId,
+        status: "conflict",
+        conflictRev: live._rev,
+        errorMessage: "Entry was modified by another save since this proposal was created.",
+      });
+    }
+    const stampedSnap = await callOpenClawChat({
+      action: "stamp_proposal_rev",
+      conversationId: activeProposal.conversationId,
+      proposalId: activeProposal.proposalId,
+      baseRev: live._rev,
+    });
+    const stampedProp = stampedSnap.proposals.find(
+      p => p.proposalId === activeProposal.proposalId,
+    );
+    if (stampedProp?.status === "conflict") {
+      return stampedSnap;
+    }
+  }
+
+  const expectedRev = hasOpaqueRev ? activeProposal.baseRev : live._rev;
 
   // Detect concurrent edit before even sending PUT if expectedRev already diverged!
   if (expectedRev !== live._rev) {
@@ -248,12 +309,10 @@ export async function rebaseConflictedProposal(
     proposal.locale,
   );
   return callOpenClawChat({
-    action: "record_proposal_receipt",
+    action: "rebase_proposal",
     conversationId: proposal.conversationId,
     proposalId: proposal.proposalId,
-    status: "pending",
     baseRev: live._rev,
-    errorMessage: "",
   });
 }
 
