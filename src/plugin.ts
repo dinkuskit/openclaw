@@ -1,5 +1,6 @@
 import type { SandboxedPlugin } from "emdash/plugin";
 import { openclawAdmin, openclawEditorPanel, openclawPairRoute } from "./admin.js";
+import { openclawChatRoute } from "./chat-engine.js";
 
 /**
  * Standalone OpenClaw Registry plugin for any EmDash CMS site: connects a
@@ -19,6 +20,12 @@ const plugin: SandboxedPlugin = {
       permission: "content:edit_any",
       methods: ["POST"],
       handler: openclawEditorPanel,
+    },
+    chat: {
+      public: false,
+      permission: "content:edit_any",
+      methods: ["POST"],
+      handler: openclawChatRoute,
     },
     pair: {
       public: true,

@@ -2,7 +2,7 @@
   "name": "@dinkuskit/openclaw",
   "version": "0.0.0",
   "private": true,
-  "description": "Connect custom OpenClaw agents and gateways to the EmDash CMS admin with Block Kit approval cards and MCP tools",
+  "description": "Connect custom OpenClaw agents and gateways to the EmDash CMS admin with an interactive Antigravity × OpenClaw native chat harness, Block Kit Registry profile, and revision-fenced approvals",
   "type": "module",
   "engines": {
     "node": ">=24.15.0 <25"
@@ -14,17 +14,27 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "emdash-plugin validate && emdash-plugin build && node scripts/check-registry-bundle.mjs",
+    "build": "emdash-plugin validate && emdash-plugin build && node scripts/build-native.mjs && node scripts/check-registry-bundle.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "verify:quick": "bin/verify-openclaw quick",
     "verify:full": "bin/verify-openclaw full"
   },
+  "dependencies": {
+    "@openclaw/gateway-client": "2026.11.1",
+    "@openclaw/gateway-protocol": "2026.11.1"
+  },
   "devDependencies": {
     "@emdash-cms/blocks": "1.4.0",
     "@emdash-cms/plugin-cli": "0.13.5",
     "@emdash-cms/plugin-types": "0.6.0",
+    "@types/react": "19.3.0",
+    "@types/ws": "8.18.2",
     "emdash": "1.4.0",
+    "esbuild": "0.28.2",
+    "esbuild-plugin-solid": "0.6.0",
+    "react": "19.3.1",
+    "solid-js": "1.9.18",
     "typescript": "6.0.3"
   },
   "license": "MIT",
@@ -38,7 +48,20 @@
       "types": "./dist/index.d.mts",
       "default": "./dist/index.mjs"
     },
-    "./sandbox": "./dist/plugin.mjs"
+    "./sandbox": "./dist/plugin.mjs",
+    "./native": {
+      "types": "./dist/native.d.mts",
+      "default": "./dist/native.mjs"
+    },
+    "./admin": {
+      "types": "./dist/admin.d.mts",
+      "default": "./dist/admin.mjs"
+    },
+    "./astro": {
+      "types": "./dist/astro.d.mts",
+      "default": "./dist/astro.mjs"
+    },
+    "./stream-endpoint": "./dist/stream-endpoint.mjs"
   },
   "peerDependencies": {
     "emdash": "1.4.0"

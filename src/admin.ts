@@ -1,5 +1,6 @@
 import type { Block, BlockResponse, FormField } from "@emdash-cms/blocks/server";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
+import { publishOpenClawEvent } from "./sse-bus.js";
 
 /** EmDash Editor role (40) and Administrator role (50). */
 const EDITOR = 40;
@@ -118,13 +119,24 @@ async function discoverSiteCollections(
 }
 
 async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
-  const raw = await ctx.settings.get("connection");
+  let raw: unknown;
+  try {
+    raw = await ctx.settings.get("connection");
+  } catch {
+    await ctx.settings.delete("connection").catch(() => {});
+    return null;
+  }
   if (typeof raw !== "string" || !raw) return null;
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
     if (
       typeof parsed.gatewayUrl === "string" &&
-      parsed.gatewayUrl.startsWith("https://") &&
+      (parsed.gatewayUrl.startsWith("https://") ||
+        parsed.gatewayUrl.startsWith("wss://") ||
+        parsed.gatewayUrl.startsWith("ws://127.0.0.1:") ||
+        parsed.gatewayUrl.startsWith("ws://localhost:") ||
+        parsed.gatewayUrl.startsWith("http://127.0.0.1:") ||
+        parsed.gatewayUrl.startsWith("http://localhost:")) &&
       typeof parsed.agentId === "string" &&
       parsed.agentId.length > 0 &&
       typeof parsed.gatewayToken === "string" &&
@@ -600,27 +612,75 @@ function resolveSiteOrigin(route: SandboxedRouteContext): string {
   return "http://localhost:4321";
 }
 
+function csprngToken(prefix: string, byteLen = 18): string {
+  const bytes = new Uint8Array(byteLen);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    throw new Error("WebCrypto getRandomValues is required for token generation");
+  }
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let out = prefix;
+  for (const b of bytes) {
+    out += alphabet[b % alphabet.length];
+  }
+  return out;
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function extractBearerHeader(route: SandboxedRouteContext): string | undefined {
+  const headers = (route as unknown as { request?: { headers?: unknown } }).request?.headers;
+  if (!headers) return undefined;
+  let authVal: string | null | undefined;
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    authVal = (headers as { get: (k: string) => string | null }).get("authorization");
+  } else if (typeof headers === "object") {
+    const rec = headers as Record<string, unknown>;
+    const raw = rec.authorization ?? rec.Authorization;
+    if (typeof raw === "string") authVal = raw;
+  }
+  if (typeof authVal === "string" && /^Bearer\s+/i.test(authVal)) {
+    return authVal.replace(/^Bearer\s+/i, "").trim() || undefined;
+  }
+  return undefined;
+}
+
+const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
+
 function generatePairingCode(): string {
-  return `oc_pair_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+  return csprngToken("oc_pair_", 12);
 }
 
 async function loadOrCreatePairingCode(ctx: PluginContext): Promise<string> {
   if (ctx.kv) {
     const existing = await ctx.kv.get("pairing_code");
-    if (typeof existing === "string" && existing.startsWith("oc_pair_")) {
+    const expiresAt = await ctx.kv.get("pairing_code_expires_at");
+    const validExpiry =
+      typeof expiresAt !== "number" || expiresAt > Date.now();
+    if (typeof existing === "string" && existing.startsWith("oc_pair_") && validExpiry) {
       return existing;
     }
     const fresh = generatePairingCode();
     await ctx.kv.set("pairing_code", fresh);
+    await ctx.kv.set("pairing_code_expires_at", Date.now() + PAIRING_CODE_TTL_MS);
     return fresh;
   }
-  return "oc_pair_ready";
+  return generatePairingCode();
 }
 
 async function rotatePairingCode(ctx: PluginContext): Promise<string> {
   const fresh = generatePairingCode();
   if (ctx.kv) {
     await ctx.kv.set("pairing_code", fresh);
+    await ctx.kv.set("pairing_code_expires_at", Date.now() + PAIRING_CODE_TTL_MS);
   }
   return fresh;
 }
@@ -782,15 +842,30 @@ export async function openclawAdmin(
     (event.action_id === "approve_proposal" || event.action_id === "reject_proposal")
   ) {
     const proposalId = cleanText(event.value, 120);
-    const remaining = proposals.filter(item => item.proposalId !== proposalId);
-    if (ctx.kv) {
-      await ctx.kv.set("pending_proposals", remaining);
+    if (event.action_id === "reject_proposal") {
+      const remaining = proposals.filter(item => item.proposalId !== proposalId);
+      if (ctx.kv) {
+        await ctx.kv.set("pending_proposals", remaining);
+      }
+      return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
+        type: "info",
+        message: `Rejected proposal ${proposalId ?? ""}. No CMS changes were applied.`,
+      });
     }
-    const verb = event.action_id === "approve_proposal" ? "Approved" : "Rejected";
-    return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
-      type: "success",
-      message: `${verb} proposal ${proposalId ?? ""}.`,
-    });
+    // Honest sandbox boundary: Block Kit runs without content:write or browser _rev access.
+    // Never delete the pending proposal and falsely claim "Approved".
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      "Sandboxed Block Kit mode cannot execute _rev-fenced writes directly. Open the Native OpenClaw harness or Content Editor to review and save this draft.",
+      {
+        type: "info",
+        message: `Proposal ${proposalId ?? ""} remains pending until saved with _rev verification.`,
+      },
+    );
   }
 
   if (event.type === "form_submit" && event.action_id === "steer_agent" && activeTurn) {
@@ -799,7 +874,7 @@ export async function openclawAdmin(
       activeTurn = {
         ...activeTurn,
         status: "steered",
-        lastUpdate: `Steered mid-task: "${steerMessage}"`,
+        lastUpdate: `Queued mid-task steer: "${steerMessage}"`,
       };
       if (ctx.kv) {
         await ctx.kv.set("active_turn", activeTurn);
@@ -814,24 +889,42 @@ export async function openclawAdmin(
       undefined,
       {
         type: "info",
-        message: `Sent mid-task steer to @${connection.agentId}.`,
+        message: `Queued mid-task steer for @${connection.agentId}.`,
       },
     );
   }
 
   if (event.type === "block_action" && event.action_id === "check_status") {
-    if (ctx.kv) {
-      await ctx.kv.delete("active_turn");
+    if (!activeTurn) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        null,
+        isAdmin,
+        "No active task is currently running.",
+      );
+    }
+    if (activeTurn.status === "completed") {
+      if (ctx.kv) {
+        await ctx.kv.delete("active_turn");
+      }
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        null,
+        isAdmin,
+        `Completed task "${activeTurn.prompt}": ${activeTurn.lastUpdate}`,
+      );
     }
     return workspacePage(
       connection,
       collections,
       proposals,
-      null,
+      activeTurn,
       isAdmin,
-      activeTurn
-        ? `Completed task "${activeTurn.prompt}" (${activeTurn.lastUpdate}).`
-        : "No active task is currently running.",
+      `Task "${activeTurn.prompt}" is still ${activeTurn.status} — ${activeTurn.lastUpdate}`,
     );
   }
 
@@ -1038,6 +1131,25 @@ export async function openclawPairRoute(
           ? (params.arguments as Record<string, unknown>)
           : {};
       const connection = await loadConnection(ctx);
+      const suppliedToken =
+        extractBearerHeader(route) ??
+        cleanText(params.sessionToken, 300) ??
+        cleanText(args.sessionToken, 300) ??
+        cleanText(input.sessionToken, 300);
+      if (
+        !connection ||
+        !suppliedToken ||
+        !constantTimeEqual(suppliedToken, connection.gatewayToken)
+      ) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32001,
+            message: "UNAUTHORIZED_SESSION: Pass Authorization: Bearer <sessionToken> or sessionToken.",
+          },
+        };
+      }
       if (toolName === "emdash_submit_proposal" && ctx.kv) {
         const proposals = await loadProposals(ctx);
         const proposal: PendingProposal = {
@@ -1084,8 +1196,11 @@ export async function openclawPairRoute(
   const action = cleanText(input.action, 40);
   if (action) {
     const connection = await loadConnection(ctx);
-    const token = cleanText(input.sessionToken, 300) ?? cleanText(input.gatewayToken, 300);
-    if (!connection || !token || token !== connection.gatewayToken) {
+    const token =
+      extractBearerHeader(route) ??
+      cleanText(input.sessionToken, 300) ??
+      cleanText(input.gatewayToken, 300);
+    if (!connection || !token || !constantTimeEqual(token, connection.gatewayToken)) {
       return {
         ok: false,
         error: "UNAUTHORIZED_SESSION",
@@ -1107,6 +1222,12 @@ export async function openclawPairRoute(
           lastUpdate: reply,
         });
       }
+      publishOpenClawEvent({
+        type: "workspace_sync",
+        conversationId: "conv_catalog_overview",
+        reason: "external_agent_turn_completed",
+        timestamp: new Date().toISOString(),
+      });
       return { ok: true, status: "completed", reply };
     }
     if (action === "propose" && ctx.kv) {
@@ -1122,14 +1243,27 @@ export async function openclawPairRoute(
       };
       proposals.push(proposal);
       await ctx.kv.set("pending_proposals", proposals);
+      publishOpenClawEvent({
+        type: "workspace_sync",
+        conversationId: "conv_catalog_overview",
+        reason: "external_agent_proposal",
+        timestamp: new Date().toISOString(),
+      });
       return { ok: true, proposal };
     }
   }
 
-  // 3. 1-Step Pairing via one-time pairingCode (gatewayUrl and gatewayToken are optional!)
+  // 3. 1-Step Pairing via admin-minted one-time pairingCode (never mints on unauthenticated requests)
   const pairingCode = cleanText(input.pairingCode, 120);
-  const expectedCode = await loadOrCreatePairingCode(ctx);
-  if (!pairingCode || pairingCode !== expectedCode) {
+  const storedCode = ctx.kv ? await ctx.kv.get("pairing_code") : null;
+  const expiresAt = ctx.kv ? await ctx.kv.get("pairing_code_expires_at") : null;
+  const isExpired = typeof expiresAt === "number" && expiresAt <= Date.now();
+  if (
+    !pairingCode ||
+    typeof storedCode !== "string" ||
+    isExpired ||
+    !constantTimeEqual(pairingCode, storedCode)
+  ) {
     return {
       ok: false,
       error: "INVALID_PAIRING_CODE",
@@ -1139,13 +1273,15 @@ export async function openclawPairRoute(
 
   const rawGatewayUrl = cleanText(input.gatewayUrl, 300);
   const gatewayUrl =
-    rawGatewayUrl && rawGatewayUrl.startsWith("https://")
+    rawGatewayUrl &&
+    (rawGatewayUrl.startsWith("https://") ||
+      rawGatewayUrl.startsWith("wss://") ||
+      rawGatewayUrl.startsWith("ws://127.0.0.1:") ||
+      rawGatewayUrl.startsWith("ws://localhost:"))
       ? rawGatewayUrl
       : "https://agent-session.openclaw.local";
   const agentId = cleanText(input.agentId, 80) ?? "openclaw";
-  const sessionToken =
-    cleanText(input.gatewayToken, 300) ??
-    `oc_sess_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+  const sessionToken = cleanText(input.gatewayToken, 300) ?? csprngToken("oc_sess_", 20);
   const authorityMode =
     input.authorityMode === "read_only" ? "read_only" : "propose_with_approval";
 
@@ -1164,6 +1300,12 @@ export async function openclawPairRoute(
     JSON.stringify(nextConnection),
   );
   await rotatePairingCode(ctx);
+  publishOpenClawEvent({
+    type: "workspace_sync",
+    conversationId: "conv_catalog_overview",
+    reason: "agent_paired",
+    timestamp: new Date().toISOString(),
+  });
 
   return {
     ok: true,
