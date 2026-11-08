@@ -2061,13 +2061,66 @@ export async function pollPairedAgentTurn(
   return null;
 }
 
+const MAX_PAIRED_AGENT_REPLY_CHARS = 32_000;
+
 export async function completePairedAgentTurn(
   ctx: PluginContext,
   connection: OpenClawConnection,
-  params: { turnId?: string; reply?: unknown },
+  params: { turnId?: unknown; reply?: unknown; requireReply?: boolean },
 ): Promise<Record<string, unknown>> {
-  const reply = cleanInputText(params.reply, 8000) ?? "Completed.";
-  const requestedTurnId = cleanInputText(params.turnId, 120);
+  let requestedTurnId: string | undefined;
+  if (params.turnId !== undefined && params.turnId !== null) {
+    requestedTurnId = cleanInputText(params.turnId, 120);
+    if (!requestedTurnId) {
+      return {
+        ok: false,
+        error: "INVALID_TURN_ID",
+        message: "turnId must be a non-empty string up to 120 characters.",
+      };
+    }
+  }
+
+  let reply: string;
+  if (params.reply === undefined) {
+    if (params.requireReply) {
+      return {
+        ok: false,
+        error: "INVALID_REPLY",
+        message: "reply is required and must be a non-empty string.",
+      };
+    }
+    reply = "Completed.";
+  } else if (typeof params.reply !== "string") {
+    return {
+      ok: false,
+      error: "INVALID_REPLY",
+      message: "reply must be a string.",
+    };
+  } else {
+    const normalized = params.reply.replace(/\r\n?/g, "\n").trim();
+    if (normalized.length === 0) {
+      return {
+        ok: false,
+        error: "INVALID_REPLY",
+        message: "reply must not be empty.",
+      };
+    }
+    if (normalized.length > MAX_PAIRED_AGENT_REPLY_CHARS) {
+      return {
+        ok: false,
+        error: "REPLY_TOO_LARGE",
+        message: `reply exceeds the ${MAX_PAIRED_AGENT_REPLY_CHARS}-character limit (${normalized.length} characters). Shorten or split the response before calling complete_turn again.`,
+      };
+    }
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(normalized)) {
+      return {
+        ok: false,
+        error: "INVALID_REPLY",
+        message: "reply must not contain ASCII control characters.",
+      };
+    }
+    reply = normalized;
+  }
 
   if (!ctx.kv) {
     return {

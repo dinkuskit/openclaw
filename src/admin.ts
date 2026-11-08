@@ -1283,12 +1283,13 @@ export async function openclawPairRoute(
             },
             {
               name: "emdash_complete_turn",
-              description: "Complete an active native chat or Block Kit turn with the agent reply.",
+              description:
+                "Complete an active native chat or Block Kit turn with the agent reply (up to 32,000 characters).",
               inputSchema: {
                 type: "object",
                 properties: {
-                  turnId: { type: "string" },
-                  reply: { type: "string" },
+                  turnId: { type: "string", minLength: 1, maxLength: 120 },
+                  reply: { type: "string", minLength: 1, maxLength: 32000 },
                 },
                 required: ["reply"],
               },
@@ -1344,8 +1345,9 @@ export async function openclawPairRoute(
       }
       if (toolName === "emdash_complete_turn") {
         const completed = await completePairedAgentTurn(ctx, connection, {
-          turnId: cleanText(args.turnId, 120),
+          turnId: args.turnId,
           reply: args.reply,
+          requireReply: true,
         });
         if (!completed.ok) {
           return {
@@ -1470,7 +1472,7 @@ export async function openclawPairRoute(
     }
     if (action === "complete_turn") {
       return completePairedAgentTurn(ctx, connection, {
-        turnId: cleanText(input.turnId, 120),
+        turnId: input.turnId,
         reply: input.reply,
       });
     }

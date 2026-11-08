@@ -1708,33 +1708,62 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
     }),
   );
 
-  const completeRes = await pair(
-    createNativeRouteCtx({
-      userId: "anon",
-      role: 0,
-      sharedSettings,
-      sharedKv,
-      itemsByCollection,
-      input: {
-        action: "complete_turn",
-        sessionToken: pairRes.sessionToken,
-        turnId: polled.activeTurn.turnId,
-        reply: [
-          "Updated the autumn launch excerpt as requested.",
-          "```emdash-proposal",
-          JSON.stringify({
-            collection: "products",
-            entryId: "prod_01",
-            summary: "Autumn 10-word excerpt",
-            proposedFields: {
-              excerpt: "Weatherproof organic waxed cotton jacket built for crisp autumn mornings.",
+  const completeRes = await (async () => {
+    // Oversized replies are rejected with REPLY_TOO_LARGE without finalizing or discarding the active turn
+    const oversizedMcp = await pair(
+      createNativeRouteCtx({
+        userId: "anon",
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        itemsByCollection,
+        input: {
+          jsonrpc: "2.0",
+          id: 90,
+          method: "tools/call",
+          params: {
+            name: "emdash_complete_turn",
+            sessionToken: pairRes.sessionToken,
+            arguments: {
+              turnId: polled.activeTurn.turnId,
+              reply: "A".repeat(33_000),
             },
-          }),
-          "```",
-        ].join("\n"),
-      },
-    }),
-  );
+          },
+        },
+      }),
+    );
+    assert.equal(oversizedMcp.error.code, -32004);
+    assert.match(oversizedMcp.error.message, /REPLY_TOO_LARGE/);
+
+    return pair(
+      createNativeRouteCtx({
+        userId: "anon",
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        itemsByCollection,
+        input: {
+          action: "complete_turn",
+          sessionToken: pairRes.sessionToken,
+          turnId: polled.activeTurn.turnId,
+          reply: [
+            "Updated the autumn launch excerpt as requested.",
+            "```emdash-proposal",
+            JSON.stringify({
+              collection: "products",
+              entryId: "prod_01",
+              summary: "Autumn 10-word excerpt",
+              proposedFields: {
+                excerpt:
+                  "Weatherproof organic waxed cotton jacket built for crisp autumn mornings.",
+              },
+            }),
+            "```",
+          ].join("\n"),
+        },
+      }),
+    );
+  })();
   assert.equal(completeRes.ok, true);
   assert.equal(completeRes.conversationId, convId);
   assert.equal(completeRes.proposalIds.length, 1);
