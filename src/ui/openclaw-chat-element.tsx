@@ -172,14 +172,25 @@ const SLASH_COMMANDS = [
   { cmd: "/pair", hint: "Open Gateway & 1-click Agent Pairing sheet", fill: "__OPEN_PAIR__" },
 ];
 
+interface ConversationStreamBuffer {
+  text: string;
+  tools: ToolCallTrace[];
+  phase: string | null;
+}
+
+const EMPTY_STREAM_BUFFER: ConversationStreamBuffer = {
+  text: "",
+  tools: [],
+  phase: null,
+};
+
 function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProps; rootNode: ShadowRoot }) {
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
   const [snapshot, setSnapshot] = createSignal<OpenClawWorkspaceSnapshot | null>(null);
   const [loading, setLoading] = createSignal(true);
-  const [activeTurnRequests, setActiveTurnRequests] = createSignal(0);
-  const [steeringInFlight, setSteeringInFlight] = createSignal(false);
-  const [streamingText, setStreamingText] = createSignal("");
-  const [streamingTools, setStreamingTools] = createSignal<ToolCallTrace[]>([]);
+  const [activeTurnRequestsByConv, setActiveTurnRequestsByConv] = createSignal<Record<string, number>>({});
+  const [steeringByConv, setSteeringByConv] = createSignal<Record<string, boolean>>({});
+  const [streamByConv, setStreamByConv] = createSignal<Record<string, ConversationStreamBuffer>>({});
   const [streamState, setStreamState] = createSignal<"live" | "reconnecting" | "buffered">("live");
   const [errorBanner, setErrorBanner] = createSignal<string | null>(null);
 
@@ -189,17 +200,21 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     null | "automations" | "customizations" | "pairing" | "attach"
   >(null);
 
-  const [composerText, setComposerText] = createSignal("");
-  const [attachedEntry, setAttachedEntry] = createSignal<BoundEntryRef | undefined>(undefined);
+  const [composerByConv, setComposerByConv] = createSignal<Record<string, string>>({});
+  const [attachedEntryByConv, setAttachedEntryByConv] = createSignal<
+    Record<string, BoundEntryRef | undefined>
+  >({});
   const [openToolIds, setOpenToolIds] = createSignal<Record<string, boolean>>({});
-  const [activeTurnIdx, setActiveTurnIdx] = createSignal(0);
+  const [turnIdxByConv, setTurnIdxByConv] = createSignal<Record<string, number>>({});
 
   // Proposal review & drill-down state (`overview-proposal-drilldown-003`)
   const [selectedProposalId, setSelectedProposalId] = createSignal<string | null>(null);
   const [highlightedProposalId, setHighlightedProposalId] = createSignal<string | null>(null);
   const [applyingProposalId, setApplyingProposalId] = createSignal<string | null>(null);
   const [editingProposalId, setEditingProposalId] = createSignal<string | null>(null);
-  const [editFieldDrafts, setEditFieldDrafts] = createSignal<Record<string, string>>({});
+  const [editFieldDraftsByProp, setEditFieldDraftsByProp] = createSignal<
+    Record<string, Record<string, string>>
+  >({});
   const [copiedPairing, setCopiedPairing] = createSignal(false);
 
   // Manual Gateway config fields in Pairing sheet
@@ -208,7 +223,6 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   const [gwTokenInput, setGwTokenInput] = createSignal("");
   const [allowExecApprovalsInput, setAllowExecApprovalsInput] = createSignal(false);
   const [probingGateway, setProbingGateway] = createSignal(false);
-  const [runStartupPhase, setRunStartupPhase] = createSignal<string | null>(null);
   const [resolvingApprovalId, setResolvingApprovalId] = createSignal<string | null>(null);
 
   let transcriptRef: HTMLDivElement | undefined;
@@ -216,6 +230,73 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   let stickToBottom = true;
 
   const isEditorPanel = createMemo(() => props.getHostProps().surface === "editor-panel");
+
+  const activeThread = createMemo<ConversationThread | undefined>(() => {
+    const snap = snapshot();
+    if (!snap) return undefined;
+    return (
+      snap.threads.find(t => t.conversationId === snap.activeConversationId) ?? snap.threads[0]
+    );
+  });
+
+  const activeConvKey = createMemo(
+    () => activeThread()?.conversationId ?? snapshot()?.activeConversationId ?? "__default__",
+  );
+
+  const composerText = createMemo(() => composerByConv()[activeConvKey()] ?? "");
+  const setComposerText = (val: string, convId = activeConvKey()) => {
+    setComposerByConv(prev => ({ ...prev, [convId]: val }));
+  };
+
+  const attachedEntry = createMemo(() => attachedEntryByConv()[activeConvKey()]);
+  const setAttachedEntry = (val: BoundEntryRef | undefined, convId = activeConvKey()) => {
+    setAttachedEntryByConv(prev => ({ ...prev, [convId]: val }));
+  };
+
+  const activeStream = createMemo<ConversationStreamBuffer>(
+    () => streamByConv()[activeConvKey()] ?? EMPTY_STREAM_BUFFER,
+  );
+  const streamingText = createMemo(() => activeStream().text);
+  const streamingTools = createMemo(() => activeStream().tools);
+  const runStartupPhase = createMemo(() => activeStream().phase);
+
+  const activeTurnRequests = createMemo(() => activeTurnRequestsByConv()[activeConvKey()] ?? 0);
+  const steeringInFlight = createMemo(() => Boolean(steeringByConv()[activeConvKey()]));
+  const activeTurnIdx = createMemo(() => turnIdxByConv()[activeConvKey()] ?? 0);
+  const setActiveTurnIdx = (idx: number, convId = activeConvKey()) => {
+    setTurnIdxByConv(prev => ({ ...prev, [convId]: idx }));
+  };
+
+  const clearConversationStream = (convId: string) => {
+    setStreamByConv(prev => {
+      if (!(convId in prev)) return prev;
+      const next = { ...prev };
+      delete next[convId];
+      return next;
+    });
+  };
+
+  const updateConversationStream = (
+    convId: string,
+    updater: (prev: ConversationStreamBuffer) => ConversationStreamBuffer,
+  ) => {
+    setStreamByConv(prev => ({
+      ...prev,
+      [convId]: updater(prev[convId] ?? EMPTY_STREAM_BUFFER),
+    }));
+  };
+
+  const editDraftForProposal = (proposalId: string): Record<string, string> =>
+    editFieldDraftsByProp()[proposalId] ?? {};
+  const setEditDraftField = (proposalId: string, field: string, value: string) => {
+    setEditFieldDraftsByProp(prev => ({
+      ...prev,
+      [proposalId]: {
+        ...(prev[proposalId] ?? {}),
+        [field]: value,
+      },
+    }));
+  };
 
   const effectiveBoundEntry = createMemo<BoundEntryRef | undefined>(() => {
     const host = props.getHostProps();
@@ -230,17 +311,19 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     return attachedEntry();
   });
 
-  const activeThread = createMemo<ConversationThread | undefined>(() => {
-    const snap = snapshot();
-    if (!snap) return undefined;
-    return (
-      snap.threads.find(t => t.conversationId === snap.activeConversationId) ?? snap.threads[0]
-    );
-  });
+  const isConversationRunning = (convId: string, threadStatus?: ConversationThread["status"]) =>
+    (activeTurnRequestsByConv()[convId] ?? 0) > 0 || threadStatus === "running";
 
-  const sending = createMemo(
-    () => activeTurnRequests() > 0 || activeThread()?.status === "running",
+  const sending = createMemo(() =>
+    isConversationRunning(activeConvKey(), activeThread()?.status),
   );
+
+  const anyConversationRunning = createMemo(() => {
+    for (const count of Object.values(activeTurnRequestsByConv())) {
+      if (count > 0) return true;
+    }
+    return (snapshot()?.threads ?? []).some(t => t.status === "running");
+  });
 
   const renderedMessages = createMemo(() =>
     (activeThread()?.messages ?? []).filter(
@@ -250,6 +333,22 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
   const hasConcretePatch = (p: RevisionProposal) =>
     Object.keys(p.proposedFields ?? {}).length > 0 && p.entryId !== "current";
+
+  const canProposalStageDraft = (p: RevisionProposal): boolean => {
+    const snap = snapshot();
+    if (!snap) return true;
+    const col = snap.collections.find(c => c.slug === p.collection);
+    if (!col || !Array.isArray(col.supports)) return true;
+    if (col.supports.includes("revisions")) return true;
+    const entry = snap.entriesPreview.find(
+      e => e.collection === p.collection && e.id === p.entryId,
+    );
+    return entry?.status === "draft" && col.supports.includes("drafts");
+  };
+
+  const needsProposalReconcile = (p: RevisionProposal): boolean =>
+    p.status === "outcome_unknown" ||
+    (p.status === "applying" && applyingProposalId() !== p.proposalId);
 
   const groupedThreads = createMemo(() => {
     const snap = snapshot();
@@ -268,6 +367,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     (snapshot()?.proposals ?? []).filter(
       p =>
         p.status === "pending" ||
+        p.status === "failed" ||
         p.status === "conflict" ||
         p.status === "applying" ||
         p.status === "outcome_unknown",
@@ -341,6 +441,20 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     }
   };
 
+  const applyIncomingSnapshotPreservingFocus = (
+    incoming: OpenClawWorkspaceSnapshot,
+    preserveFocusedConvId?: string,
+  ): OpenClawWorkspaceSnapshot => {
+    if (
+      preserveFocusedConvId &&
+      preserveFocusedConvId !== incoming.activeConversationId &&
+      incoming.threads.some(t => t.conversationId === preserveFocusedConvId)
+    ) {
+      return { ...incoming, activeConversationId: preserveFocusedConvId };
+    }
+    return incoming;
+  };
+
   const refreshWorkspace = async (preferredConvId?: string) => {
     try {
       const snap = await callOpenClawChat({
@@ -360,7 +474,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       }
       setErrorBanner(null);
       const stamped = await ensureProposalBaseRevs(snap.proposals, snap.activeConversationId);
-      if (stamped) setSnapshot(stamped);
+      if (stamped) {
+        setSnapshot(applyIncomingSnapshotPreservingFocus(stamped, snapshot()?.activeConversationId));
+      }
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Failed to load OpenClaw workspace");
     } finally {
@@ -369,6 +485,18 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   };
 
   onMount(() => {
+    // Auto-collapse sidebars on narrow initial viewports so the chat stage stays usable
+    const hostEl = props.rootNode.host as HTMLElement | undefined;
+    const initialWidth =
+      hostEl?.getBoundingClientRect().width ||
+      (typeof window !== "undefined" ? window.innerWidth : 1280);
+    if (initialWidth > 0 && initialWidth < 1080) {
+      setRightOpen(false);
+    }
+    if (initialWidth > 0 && initialWidth < 820) {
+      setLeftOpen(false);
+    }
+
     // Sync theme with EmDash Admin's root `data-mode="dark" | "light"`
     const syncTheme = () => {
       const mode = document.documentElement.getAttribute("data-mode");
@@ -386,27 +514,43 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     const disconnectStream = connectOpenClawEventStream({
       endpoint: "/_emdash/api/openclaw/stream",
       onStatus: status => setStreamState(status),
+      onReconnect: () => {
+        void refreshWorkspace(snapshot()?.activeConversationId);
+      },
       onEvent: event => {
-        if (event.type === "assistant_delta") {
-          if (event.conversationId !== snapshot()?.activeConversationId) return;
-          setStreamingText(event.content);
-          setRunStartupPhase(null);
-          scrollTranscriptToBottom();
+        if (event.type === "turn_started") {
+          updateConversationStream(event.conversationId, () => ({
+            text: "",
+            tools: [],
+            phase: null,
+          }));
+        } else if (event.type === "assistant_delta") {
+          updateConversationStream(event.conversationId, prev => ({
+            ...prev,
+            text: event.content,
+            phase: null,
+          }));
+          if (event.conversationId === activeConvKey()) {
+            scrollTranscriptToBottom();
+          }
         } else if (event.type === "run_status") {
-          if (event.conversationId !== snapshot()?.activeConversationId) return;
-          setRunStartupPhase(event.phase);
+          updateConversationStream(event.conversationId, prev => ({
+            ...prev,
+            phase: event.phase,
+          }));
         } else if (event.type === "tool_call") {
-          if (event.conversationId !== snapshot()?.activeConversationId) return;
-          setStreamingTools(prev => {
-            const idx = prev.findIndex(t => t.callId === event.toolCall.callId);
+          updateConversationStream(event.conversationId, prev => {
+            const idx = prev.tools.findIndex(t => t.callId === event.toolCall.callId);
             if (idx >= 0) {
-              const copy = [...prev];
+              const copy = [...prev.tools];
               copy[idx] = event.toolCall;
-              return copy;
+              return { ...prev, tools: copy };
             }
-            return [...prev, event.toolCall];
+            return { ...prev, tools: [...prev.tools, event.toolCall] };
           });
-          scrollTranscriptToBottom();
+          if (event.conversationId === activeConvKey()) {
+            scrollTranscriptToBottom();
+          }
         } else if (event.type === "gateway_status") {
           setSnapshot(prev => (prev ? { ...prev, gatewayBridge: event.gatewayBridge } : prev));
         } else if (
@@ -414,6 +558,11 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           event.type === "exec_approval_updated" ||
           event.type === "workspace_sync"
         ) {
+          if (event.type === "workspace_sync" && event.reason === "turn_completed") {
+            if ((activeTurnRequestsByConv()[event.conversationId] ?? 0) === 0) {
+              clearConversationStream(event.conversationId);
+            }
+          }
           void refreshWorkspace(snapshot()?.activeConversationId);
         }
       },
@@ -486,25 +635,29 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   };
 
   const sendPrompt = async (overridePrompt?: string, isSteer = false) => {
+    const convKey = activeConvKey();
     const text = (overridePrompt ?? composerText()).trim();
     if (!text) return;
     if (text === "/pair") {
-      setComposerText("");
+      setComposerText("", convKey);
       setActiveSheet("pairing");
       return;
     }
 
     const targetConversationId = snapshot()?.activeConversationId;
-    setComposerText("");
+    const targetBoundEntry = effectiveBoundEntry();
+    setComposerText("", convKey);
     if (textareaRef) textareaRef.style.height = "38px";
     stickToBottom = true;
 
     if (isSteer) {
-      setSteeringInFlight(true);
+      setSteeringByConv(prev => ({ ...prev, [convKey]: true }));
     } else {
-      setActiveTurnRequests(n => n + 1);
-      setStreamingText("");
-      setStreamingTools([]);
+      setActiveTurnRequestsByConv(prev => ({
+        ...prev,
+        [convKey]: (prev[convKey] ?? 0) + 1,
+      }));
+      clearConversationStream(convKey);
     }
 
     try {
@@ -512,30 +665,45 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         action: isSteer ? "steer_turn" : "send_message",
         prompt: text,
         conversationId: targetConversationId,
-        ...(effectiveBoundEntry() ? { boundEntry: effectiveBoundEntry() } : {}),
+        ...(targetBoundEntry ? { boundEntry: targetBoundEntry } : {}),
       });
-      setSnapshot(snap);
-      const stamped = await ensureProposalBaseRevs(snap.proposals, snap.activeConversationId);
-      if (stamped) setSnapshot(stamped);
+      const currentFocus = snapshot()?.activeConversationId;
+      const switchedAway =
+        Boolean(targetConversationId) &&
+        Boolean(currentFocus) &&
+        currentFocus !== targetConversationId;
+      const mergedSnap = switchedAway
+        ? applyIncomingSnapshotPreservingFocus(snap, currentFocus)
+        : snap;
+      setSnapshot(mergedSnap);
+
+      const resolvedConvId = snap.activeConversationId;
+      const stamped = await ensureProposalBaseRevs(snap.proposals, resolvedConvId);
+      if (stamped) {
+        setSnapshot(
+          applyIncomingSnapshotPreservingFocus(stamped, snapshot()?.activeConversationId),
+        );
+      }
+
       const latestTurnCount =
         (stamped ?? snap).threads
-          .find(t => t.conversationId === snap.activeConversationId)
+          .find(t => t.conversationId === resolvedConvId)
           ?.messages.filter(m => !(m.role === "assistant" && m.status === "streaming" && !m.content))
           .length ?? 1;
-      setActiveTurnIdx(Math.max(0, latestTurnCount - 1));
-      scrollTranscriptToBottom(true);
+      setActiveTurnIdx(Math.max(0, latestTurnCount - 1), resolvedConvId);
+      if (!switchedAway) {
+        scrollTranscriptToBottom(true);
+      }
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Failed to send message");
     } finally {
       if (isSteer) {
-        setSteeringInFlight(false);
+        setSteeringByConv(prev => ({ ...prev, [convKey]: false }));
       } else {
-        const remaining = Math.max(0, activeTurnRequests() - 1);
-        setActiveTurnRequests(remaining);
+        const remaining = Math.max(0, (activeTurnRequestsByConv()[convKey] ?? 1) - 1);
+        setActiveTurnRequestsByConv(prev => ({ ...prev, [convKey]: remaining }));
         if (remaining === 0) {
-          setStreamingText("");
-          setStreamingTools([]);
-          setRunStartupPhase(null);
+          clearConversationStream(convKey);
         }
       }
     }
@@ -547,11 +715,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         action: "create_thread",
         title: "New Store Conversation",
       });
-      setStreamingText("");
-      setStreamingTools([]);
-      setRunStartupPhase(null);
       setSnapshot(snap);
-      setActiveTurnIdx(0);
+      setActiveTurnIdx(0, snap.activeConversationId);
+      const hostEl = props.rootNode.host as HTMLElement | undefined;
+      if ((hostEl?.clientWidth ?? 1280) < 960) {
+        setLeftOpen(false);
+      }
       textareaRef?.focus();
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Could not create thread");
@@ -559,10 +728,14 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   };
 
   const handleSelectThread = async (conversationId: string) => {
-    setStreamingText("");
-    setStreamingTools([]);
-    setRunStartupPhase(null);
+    const hostEl = props.rootNode.host as HTMLElement | undefined;
+    if ((hostEl?.clientWidth ?? 1280) < 960) {
+      setLeftOpen(false);
+    }
     await refreshWorkspace(conversationId);
+    if (textareaRef) {
+      textareaRef.style.height = "38px";
+    }
     scrollTranscriptToBottom(true);
   };
 
@@ -571,12 +744,16 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     if (!snap?.isAdmin) return;
     const current = snap.connection?.authorityMode ?? "propose_with_approval";
     const nextMode = current === "read_only" ? "propose_with_approval" : "read_only";
-    const updated = await callOpenClawChat({
-      action: "configure_connection",
-      conversationId: snap.activeConversationId,
-      authorityMode: nextMode,
-    });
-    setSnapshot(updated);
+    try {
+      const updated = await callOpenClawChat({
+        action: "configure_connection",
+        conversationId: snap.activeConversationId,
+        authorityMode: nextMode,
+      });
+      setSnapshot(updated);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Could not update authority mode");
+    }
   };
 
   const handleToggleCollection = async (slug: string) => {
@@ -586,24 +763,37 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     const next = current.includes(slug)
       ? current.filter(item => item !== slug)
       : [...current, slug];
-    const updated = await callOpenClawChat({
-      action: "configure_connection",
-      conversationId: snap.activeConversationId,
-      enabledCollections: next,
-    });
-    setSnapshot(updated);
+    try {
+      const updated = await callOpenClawChat({
+        action: "configure_connection",
+        conversationId: snap.activeConversationId,
+        enabledCollections: next,
+      });
+      setSnapshot(updated);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Could not update collection access");
+    }
   };
 
   const handleApproveProposal = async (proposal: RevisionProposal) => {
     setApplyingProposalId(proposal.proposalId);
     try {
-      const edits = editingProposalId() === proposal.proposalId ? editFieldDrafts() : undefined;
+      const edits =
+        editingProposalId() === proposal.proposalId
+          ? editDraftForProposal(proposal.proposalId)
+          : undefined;
       const updated = await applyRevisionProposal(proposal, edits);
       setSnapshot(updated);
       setEditingProposalId(null);
-      setEditFieldDrafts({});
+      setEditFieldDraftsByProp(prev => {
+        const next = { ...prev };
+        delete next[proposal.proposalId];
+        return next;
+      });
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : "Failed to apply proposal");
+      const msg = err instanceof Error ? err.message : "Failed to apply proposal";
+      await refreshWorkspace(snapshot()?.activeConversationId);
+      setErrorBanner(msg);
     } finally {
       setApplyingProposalId(null);
     }
@@ -620,6 +810,10 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       });
       setSnapshot(updated);
       if (selectedProposalId() === proposal.proposalId) setSelectedProposalId(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Could not reject proposal";
+      await refreshWorkspace(snapshot()?.activeConversationId);
+      setErrorBanner(msg);
     } finally {
       setApplyingProposalId(null);
     }
@@ -664,9 +858,10 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       });
       setSnapshot(updated);
     } catch (err) {
-      setErrorBanner(
-        err instanceof Error ? err.message : "Failed to resolve Gateway execution approval",
-      );
+      const msg =
+        err instanceof Error ? err.message : "Failed to resolve Gateway execution approval";
+      await refreshWorkspace(snapshot()?.activeConversationId);
+      setErrorBanner(msg);
     } finally {
       setResolvingApprovalId(null);
     }
@@ -695,7 +890,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         init[d.field] = d.after;
       }
     }
-    setEditFieldDrafts(init);
+    setEditFieldDraftsByProp(prev => ({ ...prev, [proposal.proposalId]: init }));
     setEditingProposalId(proposal.proposalId);
   };
 
@@ -753,8 +948,22 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       setSnapshot(updated);
       setGwUrlInput("");
       setGwTokenInput("");
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Could not disconnect Gateway");
     } finally {
       setProbingGateway(false);
+    }
+  };
+
+  const handleStopTurn = async () => {
+    try {
+      const updated = await callOpenClawChat({
+        action: "stop_turn",
+        conversationId: snapshot()?.activeConversationId,
+      });
+      setSnapshot(updated);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Could not stop active run");
     }
   };
 
@@ -854,7 +1063,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       const isCurrent = () =>
                         snapshot()?.activeConversationId === thread.conversationId;
                       const isRunning = () =>
-                        (isCurrent() && sending()) || thread.status === "running";
+                        isConversationRunning(thread.conversationId, thread.status);
                       return (
                         <button
                           type="button"
@@ -1023,6 +1232,22 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           onScroll={handleTranscriptScroll}
         >
           <div class="oc-transcript-inner">
+            <Show when={snapshot()?.settingsError}>
+              <div class="oc-proposal-card" data-status="conflict">
+                <div class="oc-proposal-header">
+                  <span class="oc-proposal-title">Stored Credentials Warning</span>
+                  <Show when={snapshot()?.isAdmin}>
+                    <button type="button" class="oc-btn" onClick={() => setActiveSheet("pairing")}>
+                      Gateway Settings
+                    </button>
+                  </Show>
+                </div>
+                <div style={{ "font-size": "12.5px", color: "var(--oc-text-body)" }}>
+                  {snapshot()?.settingsError}
+                </div>
+              </div>
+            </Show>
+
             <Show when={errorBanner()}>
               <div class="oc-proposal-card" data-status="conflict">
                 <div class="oc-proposal-header">
@@ -1319,6 +1544,16 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                       <Show when={p().status === "outcome_unknown"}>
                                         <span class="oc-badge is-amber">? Outcome Unknown</span>
                                       </Show>
+                                      <Show when={p().status === "applying"}>
+                                        <span class="oc-badge is-amber">
+                                          {applyingProposalId() === p().proposalId
+                                            ? "Applying…"
+                                            : "? Interrupted Save"}
+                                        </span>
+                                      </Show>
+                                      <Show when={p().status === "failed"}>
+                                        <span class="oc-badge is-coral">✕ Save Failed</span>
+                                      </Show>
                                       <Show when={p().status === "superseded"}>
                                         <span class="oc-badge">Superseded</span>
                                       </Show>
@@ -1347,12 +1582,16 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                                 <input
                                                   type="text"
                                                   class="oc-edit-input"
-                                                  value={editFieldDrafts()[diff.field] ?? diff.after}
+                                                  value={
+                                                    editDraftForProposal(p().proposalId)[diff.field] ??
+                                                    diff.after
+                                                  }
                                                   onInput={e =>
-                                                    setEditFieldDrafts(prev => ({
-                                                      ...prev,
-                                                      [diff.field]: e.currentTarget.value,
-                                                    }))
+                                                    setEditDraftField(
+                                                      p().proposalId,
+                                                      diff.field,
+                                                      e.currentTarget.value,
+                                                    )
                                                   }
                                                 />
                                               </Show>
@@ -1361,7 +1600,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                         </For>
                                       }
                                     >
-                                      <For each={Object.entries(editFieldDrafts())}>
+                                      <For each={Object.entries(editDraftForProposal(p().proposalId))}>
                                         {([field, val]) => (
                                           <div>
                                             <div class="oc-diff-field-name">{field}</div>
@@ -1370,10 +1609,11 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                               class="oc-edit-input"
                                               value={val}
                                               onInput={e =>
-                                                setEditFieldDrafts(prev => ({
-                                                  ...prev,
-                                                  [field]: e.currentTarget.value,
-                                                }))
+                                                setEditDraftField(
+                                                  p().proposalId,
+                                                  field,
+                                                  e.currentTarget.value,
+                                                )
                                               }
                                             />
                                           </div>
@@ -1391,41 +1631,56 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                   <Show
                                     when={
                                       p().status === "pending" ||
+                                      p().status === "failed" ||
                                       p().status === "conflict" ||
-                                      p().status === "outcome_unknown"
+                                      needsProposalReconcile(p())
                                     }
                                   >
                                     <div class="oc-proposal-actions">
                                       <Show
-                                        when={p().status === "outcome_unknown"}
+                                        when={needsProposalReconcile(p())}
                                         fallback={
                                           <Show
                                             when={p().status === "conflict"}
                                             fallback={
                                               <Show
-                                                when={
-                                                  hasConcretePatch(p()) ||
-                                                  (editingProposalId() === p().proposalId &&
-                                                    p().entryId !== "current")
-                                                }
+                                                when={canProposalStageDraft(p())}
                                                 fallback={
-                                                  <span class="oc-badge">
-                                                    Summary-only · no concrete patch
+                                                  <span
+                                                    class="oc-badge is-amber"
+                                                    title="Collection does not support staging drafts without modifying live content"
+                                                  >
+                                                    Collection lacks draft revisions · edit in EmDash
                                                   </span>
                                                 }
                                               >
-                                                <button
-                                                  type="button"
-                                                  class="oc-btn oc-btn-primary"
-                                                  disabled={applyingProposalId() === p().proposalId}
-                                                  onClick={() => void handleApproveProposal(p())}
+                                                <Show
+                                                  when={
+                                                    hasConcretePatch(p()) ||
+                                                    (editingProposalId() === p().proposalId &&
+                                                      p().entryId !== "current")
+                                                  }
+                                                  fallback={
+                                                    <span class="oc-badge">
+                                                      Summary-only · no concrete patch
+                                                    </span>
+                                                  }
                                                 >
-                                                  {applyingProposalId() === p().proposalId
-                                                    ? "Applying to EmDash…"
-                                                    : editingProposalId() === p().proposalId
-                                                      ? `Save as rev #${(p().revisionNumber ?? 1) + 1}`
-                                                      : "Approve & Save Draft"}
-                                                </button>
+                                                  <button
+                                                    type="button"
+                                                    class="oc-btn oc-btn-primary"
+                                                    disabled={applyingProposalId() === p().proposalId}
+                                                    onClick={() => void handleApproveProposal(p())}
+                                                  >
+                                                    {applyingProposalId() === p().proposalId
+                                                      ? "Applying to EmDash…"
+                                                      : editingProposalId() === p().proposalId
+                                                        ? `Save as rev #${(p().revisionNumber ?? 1) + 1}`
+                                                        : p().status === "failed"
+                                                          ? "Retry Save Draft"
+                                                          : "Approve & Save Draft"}
+                                                  </button>
+                                                </Show>
                                               </Show>
                                             }
                                           >
@@ -1454,7 +1709,8 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
                                       <Show
                                         when={
-                                          p().status === "pending" &&
+                                          (p().status === "pending" || p().status === "failed") &&
+                                          canProposalStageDraft(p()) &&
                                           editingProposalId() !== p().proposalId &&
                                           p().entryId !== "current"
                                         }
@@ -1468,7 +1724,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                         </button>
                                       </Show>
 
-                                      <Show when={p().status !== "outcome_unknown"}>
+                                      <Show when={!needsProposalReconcile(p())}>
                                         <button
                                           type="button"
                                           class="oc-btn"
@@ -1760,12 +2016,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     <button
                       type="button"
                       class="oc-btn"
-                      onClick={() =>
-                        void callOpenClawChat({
-                          action: "stop_turn",
-                          conversationId: snapshot()?.activeConversationId,
-                        }).then(s => setSnapshot(s))
-                      }
+                      onClick={() => void handleStopTurn()}
                     >
                       ■ Stop
                     </button>
@@ -1831,6 +2082,11 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       {snapshot()?.gatewayBridge.lastError}
                     </div>
                   </Show>
+                  <Show when={snapshot()?.settingsError}>
+                    <div style={{ color: "var(--oc-accent-amber)", "font-size": "11.5px" }}>
+                      {snapshot()?.settingsError}
+                    </div>
+                  </Show>
                 </div>
 
                 <label class="oc-field-label">
@@ -1848,7 +2104,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     onInput={e => setGwUrlInput(e.currentTarget.value)}
                   />
                 </label>
-                <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "10px" }}>
+                <div class="oc-form-grid">
                   <label class="oc-field-label">
                     <span>Agent ID</span>
                     <input
@@ -1949,7 +2205,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       type="button"
                       class="oc-btn"
                       onClick={() =>
-                        void callOpenClawChat({ action: "rotate_pairing_code" }).then(s => setSnapshot(s))
+                        void callOpenClawChat({ action: "rotate_pairing_code" })
+                          .then(s => setSnapshot(s))
+                          .catch(err =>
+                            setErrorBanner(
+                              err instanceof Error ? err.message : "Could not rotate pairing code",
+                            ),
+                          )
                       }
                     >
                       Rotate Code ({snapshot()?.pairingCode})
@@ -2030,7 +2292,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                             void callOpenClawChat({
                               action: "toggle_automation",
                               automationId: rule.automationId,
-                            }).then(s => setSnapshot(s))
+                            })
+                              .then(s => setSnapshot(s))
+                              .catch(err =>
+                                setErrorBanner(
+                                  err instanceof Error ? err.message : "Could not toggle automation",
+                                ),
+                              )
                           }
                         >
                           {rule.enabled ? "Enabled" : "Paused"}
@@ -2141,14 +2409,60 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       </div>
                     )}
                   </For>
-                  <Show when={sel().status === "pending"}>
-                    <div style={{ display: "flex", gap: "6px", "align-items": "center" }}>
+                  <Show
+                    when={
+                      sel().status === "pending" ||
+                      sel().status === "failed" ||
+                      sel().status === "conflict" ||
+                      needsProposalReconcile(sel())
+                    }
+                  >
+                    <div style={{ display: "flex", gap: "6px", "align-items": "center", "flex-wrap": "wrap" }}>
                       <Show
-                        when={hasConcretePatch(sel())}
+                        when={needsProposalReconcile(sel())}
                         fallback={
-                          <span class="oc-badge" style={{ flex: "1" }}>
-                            Summary-only · no concrete patch
-                          </span>
+                          <Show
+                            when={sel().status === "conflict"}
+                            fallback={
+                              <Show
+                                when={canProposalStageDraft(sel())}
+                                fallback={
+                                  <span class="oc-badge is-amber" style={{ flex: "1" }}>
+                                    Collection lacks draft revisions
+                                  </span>
+                                }
+                              >
+                                <Show
+                                  when={hasConcretePatch(sel())}
+                                  fallback={
+                                    <span class="oc-badge" style={{ flex: "1" }}>
+                                      Summary-only · no concrete patch
+                                    </span>
+                                  }
+                                >
+                                  <button
+                                    type="button"
+                                    class="oc-btn oc-btn-primary"
+                                    style={{ flex: "1", "justify-content": "center" }}
+                                    disabled={applyingProposalId() === sel().proposalId}
+                                    onClick={() => void handleApproveProposal(sel())}
+                                  >
+                                    {sel().status === "failed" ? "Retry Save" : "Approve & Save"}
+                                  </button>
+                                </Show>
+                              </Show>
+                            }
+                          >
+                            <button
+                              type="button"
+                              class="oc-btn oc-btn-primary"
+                              style={{ flex: "1", "justify-content": "center" }}
+                              disabled={applyingProposalId() === sel().proposalId}
+                              onClick={() => void handleRebaseProposal(sel())}
+                            >
+                              Rebase _rev
+                            </button>
+                          </Show>
                         }
                       >
                         <button
@@ -2156,18 +2470,21 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                           class="oc-btn oc-btn-primary"
                           style={{ flex: "1", "justify-content": "center" }}
                           disabled={applyingProposalId() === sel().proposalId}
-                          onClick={() => void handleApproveProposal(sel())}
+                          onClick={() => void handleReconcileProposal(sel())}
                         >
-                          Approve & Save
+                          Reconcile with EmDash
                         </button>
                       </Show>
-                      <button
-                        type="button"
-                        class="oc-btn"
-                        onClick={() => void handleRejectProposal(sel())}
-                      >
-                        Reject
-                      </button>
+                      <Show when={!needsProposalReconcile(sel())}>
+                        <button
+                          type="button"
+                          class="oc-btn"
+                          disabled={applyingProposalId() === sel().proposalId}
+                          onClick={() => void handleRejectProposal(sel())}
+                        >
+                          Reject
+                        </button>
+                      </Show>
                     </div>
                   </Show>
                 </div>
@@ -2233,10 +2550,10 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
             <div class="oc-overview-subhead">
               <span>Background Runs</span>
-              <span class="oc-count-pill">{sending() ? 1 : 0}</span>
+              <span class="oc-count-pill">{anyConversationRunning() ? 1 : 0}</span>
             </div>
             <div style={{ padding: "2px 13px 8px", "font-size": "11.5px", color: "var(--oc-text-muted)" }}>
-              {sending()
+              {anyConversationRunning()
                 ? "Active store inspection turn streaming…"
                 : "Idle · all turns settled"}
             </div>

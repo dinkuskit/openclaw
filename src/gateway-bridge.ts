@@ -5,6 +5,7 @@ import {
   resetGatewaySessionMessageSubscriptionCoordinator,
 } from "@openclaw/gateway-client";
 import type { EventFrame, HelloOk } from "@openclaw/gateway-protocol/frame-guards";
+import { GATEWAY_CLIENT_CAPS } from "@openclaw/gateway-protocol/client-info";
 import { PROTOCOL_VERSION } from "@openclaw/gateway-protocol/version";
 import {
   getHostGatewayBridge,
@@ -206,6 +207,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     string,
     { conversationId: string; ownerUserId?: string; visibility?: "personal" | "shared" }
   >();
+  #audienceSeq = new Map<string, number>();
+  #steerRunIds = new Set<string>();
   #activeCollectors = new Map<string, ActiveRunCollector>();
   #approvals = new Map<string, GatewayExecApproval>();
 
@@ -278,18 +281,21 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         ? normalized.extractedToken
         : undefined;
 
-    const nextFingerprint = crypto
-      .createHash("sha256")
-      .update(
-        JSON.stringify({
-          wsUrl: normalized.wsUrl,
-          agentId: connection.agentId,
-          token: tokenCandidate ?? "",
-          deviceToken: connection.deviceToken ?? "",
-          deviceId: identity.deviceId,
-        }),
-      )
-      .digest("hex");
+    const computeFingerprint = (devToken?: string) =>
+      crypto
+        .createHash("sha256")
+        .update(
+          JSON.stringify({
+            wsUrl: normalized.wsUrl,
+            agentId: connection.agentId,
+            token: tokenCandidate ?? "",
+            deviceToken: devToken ?? "",
+            deviceId: identity.deviceId,
+          }),
+        )
+        .digest("hex");
+
+    const nextFingerprint = computeFingerprint(connection.deviceToken);
 
     if (
       this.#client &&
@@ -302,6 +308,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       return this.#status;
     }
 
+    const hadPriorSessions =
+      this.#sessionToConversation.size > 0 || this.#activeCollectors.size > 0;
     await this.disconnect();
     this.#fingerprint = nextFingerprint;
     this.#status = {
@@ -315,6 +323,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     this.#emitStatus();
 
     let storedDeviceToken = connection.deviceToken;
+    let helloCount = 0;
 
     const connectSettled = new Promise<GatewayBridgeStatus>(resolve => {
       let resolvedOnce = false;
@@ -336,6 +345,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         mode: "backend",
         role: "operator",
         scopes: ["operator.read", "operator.write", "operator.approvals"],
+        caps: [GATEWAY_CLIENT_CAPS.TOOL_EVENTS],
         minProtocol: PROTOCOL_VERSION,
         maxProtocol: PROTOCOL_VERSION,
         connectChallengeTimeoutMs: 6_000,
@@ -353,6 +363,9 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
               : null,
           storeDeviceAuthToken: ({ token, scopes }) => {
             storedDeviceToken = token;
+            if (this.#client === client) {
+              this.#fingerprint = computeFingerprint(token);
+            }
             if (Array.isArray(scopes) && scopes.length > 0) {
               this.#status = { ...this.#status, grantedScopes: scopes };
             }
@@ -360,10 +373,14 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           },
           clearDeviceAuthToken: () => {
             storedDeviceToken = undefined;
+            if (this.#client === client) {
+              this.#fingerprint = computeFingerprint(undefined);
+            }
           },
           redactForLog: redactGatewaySecrets,
         },
         onHelloOk: (hello: HelloOk) => {
+          helloCount += 1;
           const helloRec = hello as unknown as {
             protocol?: number;
             server?: { version?: string };
@@ -384,6 +401,13 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             lastError: undefined,
           };
           this.#emitStatus();
+          if (helloCount > 1 || hadPriorSessions) {
+            queueMicrotask(() => {
+              if (this.#client === client) {
+                void this.#recoverSessionsAfterReconnect(connection.agentId);
+              }
+            });
+          }
           finishOnce(this.#status);
         },
         onConnectError: (err: Error) => {
@@ -464,18 +488,43 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     sessionKey: string,
     audience: { ownerUserId?: string; visibility: "personal" | "shared" },
   ): void {
+    this.#audienceSeq.set(sessionKey, (this.#audienceSeq.get(sessionKey) ?? 0) + 1);
     const binding = this.#sessionToConversation.get(sessionKey);
-    if (binding) {
-      this.#sessionToConversation.set(sessionKey, {
-        ...binding,
-        ownerUserId: audience.ownerUserId ?? binding.ownerUserId,
-        visibility: audience.visibility,
-      });
-    }
+    this.#sessionToConversation.set(sessionKey, {
+      conversationId: binding?.conversationId ?? "",
+      ownerUserId: audience.ownerUserId ?? binding?.ownerUserId,
+      visibility: audience.visibility,
+    });
     const collector = this.#activeCollectors.get(sessionKey);
     if (collector) {
       collector.ownerUserId = audience.ownerUserId ?? collector.ownerUserId;
       collector.visibility = audience.visibility;
+    }
+  }
+
+  async #recoverSessionsAfterReconnect(agentId: string): Promise<void> {
+    const sessionKeys = new Set<string>([
+      ...this.#sessionToConversation.keys(),
+      ...this.#activeCollectors.keys(),
+    ]);
+    for (const sessionKey of sessionKeys) {
+      await this.#ensureSubscribed(sessionKey, agentId);
+      const collector = this.#activeCollectors.get(sessionKey);
+      if (collector && !collector.settled) {
+        this.#refreshCollectorTimer(collector);
+      }
+      const binding = this.#sessionToConversation.get(sessionKey);
+      const conversationId = collector?.conversationId ?? binding?.conversationId;
+      if (conversationId) {
+        publishOpenClawEvent({
+          type: "workspace_sync",
+          conversationId,
+          reason: "gateway_reconnected",
+          timestamp: new Date().toISOString(),
+          ownerUserId: collector?.ownerUserId ?? binding?.ownerUserId,
+          visibility: collector?.visibility ?? binding?.visibility ?? "personal",
+        });
+      }
     }
   }
 
@@ -575,7 +624,45 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     }
   }
 
+  #resolveEffectiveTurnAudience(
+    req: GatewayTurnRequest,
+    seqAtStart: number,
+    refreshed?: { ownerUserId?: string; visibility: "personal" | "shared" },
+  ): { ownerUserId?: string; visibility: "personal" | "shared" } {
+    const seqNow = this.#audienceSeq.get(req.sessionKey) ?? 0;
+    const bound = this.#sessionToConversation.get(req.sessionKey);
+    if (seqNow > seqAtStart && bound?.visibility) {
+      const visibility =
+        bound.visibility === "personal" || refreshed?.visibility === "personal"
+          ? "personal"
+          : (refreshed?.visibility ?? bound.visibility);
+      return {
+        ownerUserId: bound.ownerUserId ?? refreshed?.ownerUserId ?? req.ownerUserId,
+        visibility,
+      };
+    }
+    return {
+      ownerUserId: refreshed?.ownerUserId ?? req.ownerUserId,
+      visibility: refreshed?.visibility ?? req.visibility ?? "personal",
+    };
+  }
+
   async sendTurn(req: GatewayTurnRequest): Promise<GatewayTurnResult> {
+    const seqAtStart = this.#audienceSeq.get(req.sessionKey) ?? 0;
+    const priorBinding = this.#sessionToConversation.get(req.sessionKey);
+    if (!priorBinding) {
+      this.#sessionToConversation.set(req.sessionKey, {
+        conversationId: req.conversationId,
+        ownerUserId: req.ownerUserId,
+        visibility: req.visibility ?? "personal",
+      });
+    } else if (!priorBinding.conversationId) {
+      this.#sessionToConversation.set(req.sessionKey, {
+        ...priorBinding,
+        conversationId: req.conversationId,
+      });
+    }
+
     const status = await this.connect(req.connection, req.onDeviceCredentialsUpdated);
     if (status.state !== "connected" || !this.#client) {
       return {
@@ -588,30 +675,37 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       };
     }
 
+    await this.#ensureSubscribed(req.sessionKey, req.connection.agentId);
+    const refreshedAudience = await req.resolveLatestAudience?.().catch(() => undefined);
+    const effectiveAudience = this.#resolveEffectiveTurnAudience(req, seqAtStart, refreshedAudience);
     this.#sessionToConversation.set(req.sessionKey, {
       conversationId: req.conversationId,
-      ownerUserId: req.ownerUserId,
-      visibility: req.visibility,
+      ownerUserId: effectiveAudience.ownerUserId,
+      visibility: effectiveAudience.visibility,
     });
-    await this.#ensureSubscribed(req.sessionKey, req.connection.agentId);
 
     const composedMessage = req.systemContext
       ? `${req.prompt}\n\n<emdash_store_context>\n${req.systemContext}\n</emdash_store_context>`
       : req.prompt;
 
     if (req.steer) {
+      const activeCollector = this.#activeCollectors.get(req.sessionKey);
+      const expectedRunId = req.expectedRunId ?? activeCollector?.runId;
       try {
-        await this.#client.request("chat.send", {
+        const ack = await this.#client.request<{ runId?: string }>("chat.send", {
           sessionKey: req.sessionKey,
           agentId: req.connection.agentId,
           message: req.prompt,
           queueMode: "steer",
-          ...(req.expectedRunId ? { expectedRunId: req.expectedRunId } : {}),
+          ...(expectedRunId ? { expectedRunId } : {}),
           idempotencyKey: `emdash_steer_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         });
+        if (ack && typeof ack.runId === "string" && ack.runId !== activeCollector?.runId) {
+          this.#steerRunIds.add(ack.runId);
+        }
         return {
           ok: true,
-          runId: req.expectedRunId,
+          runId: ack?.runId ?? expectedRunId,
           replyText: "",
           status: "completed",
           toolCalls: [],
@@ -632,10 +726,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     const timeoutMs = req.timeoutMs ?? 60_000;
 
     return await new Promise<GatewayTurnResult>(resolve => {
+      const latestAudience = this.#resolveEffectiveTurnAudience(req, seqAtStart, refreshedAudience);
       const collector: ActiveRunCollector = {
         conversationId: req.conversationId,
-        ownerUserId: req.ownerUserId,
-        visibility: req.visibility,
+        ownerUserId: latestAudience.ownerUserId,
+        visibility: latestAudience.visibility,
         messageId: req.messageId,
         sessionKey: req.sessionKey,
         timeoutMs,
@@ -657,7 +752,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           idempotencyKey: `emdash_turn_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         })
         .then(ack => {
-          if (ack && typeof ack.runId === "string") {
+          if (ack && typeof ack.runId === "string" && !collector.runId) {
             collector.runId = ack.runId;
           }
         })
@@ -686,13 +781,23 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     if (!this.#client || this.#status.state !== "connected") {
       return { ok: false, error: "Gateway not connected" };
     }
+    const targetRunId = params.runId ?? this.#activeCollectors.get(params.sessionKey)?.runId;
     try {
       // Published 2026.11.1 ChatAbortParamsSchema accepts { sessionKey, agentId?, runId?, preserveSideRuns? } (never sessionId).
-      await this.#client.request("chat.abort", {
-        sessionKey: params.sessionKey,
-        agentId: params.connection.agentId,
-        ...(params.runId ? { runId: params.runId } : {}),
-      });
+      const res = await this.#client.request<{ ok?: boolean; aborted?: boolean; runIds?: string[] }>(
+        "chat.abort",
+        {
+          sessionKey: params.sessionKey,
+          agentId: params.connection.agentId,
+          ...(targetRunId ? { runId: targetRunId } : {}),
+        },
+      );
+      if (res && typeof res === "object" && (res.ok === false || res.aborted === false)) {
+        return {
+          ok: false,
+          error: "Gateway reported that no active run was aborted.",
+        };
+      }
       return { ok: true };
     } catch (err) {
       return {
@@ -772,8 +877,9 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       });
     }
 
+    let rpcResult: unknown;
     try {
-      await this.#client.request("approval.resolve", {
+      rpcResult = await this.#client.request("approval.resolve", {
         id: params.approvalId,
         kind: params.kind,
         decision: params.decision,
@@ -783,16 +889,21 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       try {
         const fallbackMethod =
           params.kind === "plugin" ? "plugin.approval.resolve" : "exec.approval.resolve";
-        await this.#client.request(fallbackMethod, {
+        rpcResult = await this.#client.request(fallbackMethod, {
           id: params.approvalId,
           decision: params.decision,
         });
       } catch (err) {
+        const safeErr = redactGatewaySecrets(err instanceof Error ? err.message : String(err));
+        const latestInMap = this.#approvals.get(params.approvalId);
+        if (latestInMap && latestInMap.status !== "resolving" && latestInMap.status !== "pending") {
+          return { ok: false, approval: latestInMap, error: safeErr };
+        }
         if (existing) {
           const reverted: GatewayExecApproval = {
             ...existing,
             status: "pending",
-            errorMessage: redactGatewaySecrets(err instanceof Error ? err.message : String(err)),
+            errorMessage: safeErr,
           };
           this.#approvals.set(params.approvalId, reverted);
           publishOpenClawEvent({
@@ -804,27 +915,67 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         }
         return {
           ok: false,
-          error: redactGatewaySecrets(err instanceof Error ? err.message : String(err)),
+          error: safeErr,
         };
       }
     }
 
-    const resolved: GatewayExecApproval = {
-      ...(existing ?? {
-        approvalId: params.approvalId,
-        conversationId: "conv_catalog_overview",
-        kind: params.kind,
-        agentId: params.connection.agentId,
-        command: params.approvalId,
-        allowedDecisions: ["allow-once", "deny"],
-        reviewerBound: true,
-        createdAt: new Date().toISOString(),
-      }),
-      status: params.decision === "deny" ? "denied" : "allowed",
-      decision: params.decision,
-      resolvedByUserId: params.resolvedByUserId,
-      errorMessage: undefined,
+    const resObj =
+      rpcResult && typeof rpcResult === "object"
+        ? (rpcResult as Record<string, unknown>)
+        : {};
+    const applied = typeof resObj.applied === "boolean" ? resObj.applied : undefined;
+    const parsedFromRpc =
+      resObj.approval && typeof resObj.approval === "object"
+        ? this.#parseApprovalRecord(existing?.sessionKey ?? "", resObj.approval, existing)
+        : typeof resObj.status === "string"
+          ? this.#parseApprovalRecord(existing?.sessionKey ?? "", resObj, existing)
+          : null;
+    const latestFromWs = this.#approvals.get(params.approvalId);
+
+    const baseRecord: GatewayExecApproval = existing ?? {
+      approvalId: params.approvalId,
+      conversationId: "conv_catalog_overview",
+      kind: params.kind,
+      agentId: params.connection.agentId,
+      command: params.approvalId,
+      allowedDecisions: ["allow-once", "deny"],
+      reviewerBound: true,
+      status: "pending",
+      createdAt: new Date().toISOString(),
     };
+
+    let resolved: GatewayExecApproval;
+    if (parsedFromRpc) {
+      resolved = {
+        ...baseRecord,
+        ...parsedFromRpc,
+        resolvedByUserId:
+          applied === false ? latestFromWs?.resolvedByUserId : params.resolvedByUserId,
+        errorMessage: undefined,
+      };
+    } else if (
+      latestFromWs &&
+      latestFromWs.status !== "resolving" &&
+      latestFromWs.status !== "pending"
+    ) {
+      resolved = latestFromWs;
+    } else {
+      const recordedDecision =
+        resObj.decision === "allow-once" ||
+        resObj.decision === "allow-always" ||
+        resObj.decision === "deny"
+          ? resObj.decision
+          : params.decision;
+      resolved = {
+        ...baseRecord,
+        status: recordedDecision === "deny" ? "denied" : "allowed",
+        decision: recordedDecision,
+        resolvedByUserId: params.resolvedByUserId,
+        errorMessage: undefined,
+      };
+    }
+
     this.#approvals.set(params.approvalId, resolved);
     publishOpenClawEvent({
       type: "exec_approval_updated",
@@ -832,6 +983,20 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       timestamp: new Date().toISOString(),
       ...approvalAudience,
     });
+
+    if (
+      applied === false ||
+      resolved.status === "expired" ||
+      resolved.status === "cancelled" ||
+      (resolved.decision && resolved.decision !== params.decision)
+    ) {
+      return {
+        ok: false,
+        approval: resolved,
+        error: `Gateway did not apply "${params.decision}" — approval is ${resolved.status}${resolved.decision ? ` (${resolved.decision})` : ""}.`,
+      };
+    }
+
     return { ok: true, approval: resolved };
   }
 
@@ -853,20 +1018,33 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : "";
       const state = typeof payload.state === "string" ? payload.state : "";
       const runId = typeof payload.runId === "string" ? payload.runId : undefined;
+
+      if (runId && this.#steerRunIds.has(runId)) {
+        if (state === "final" || state === "aborted" || state === "error") {
+          this.#steerRunIds.delete(runId);
+        }
+        return;
+      }
+
       const collector = this.#activeCollectors.get(sessionKey);
+      if (collector) {
+        if (runId && collector.runId && runId !== collector.runId) {
+          return;
+        }
+        if (runId && !collector.runId) {
+          collector.runId = runId;
+        }
+        if (state === "status" || state === "delta") {
+          this.#refreshCollectorTimer(collector);
+        }
+      }
+
       const binding = this.#sessionToConversation.get(sessionKey);
       const conversationId = collector?.conversationId ?? binding?.conversationId;
       const audience = {
         ownerUserId: collector?.ownerUserId ?? binding?.ownerUserId,
         visibility: collector?.visibility ?? binding?.visibility ?? ("personal" as const),
       };
-
-      if (collector) {
-        if (runId) collector.runId = runId;
-        if (state === "status" || state === "delta") {
-          this.#refreshCollectorTimer(collector);
-        }
-      }
 
       if (state === "status" && conversationId && runId && typeof payload.phase === "string") {
         publishOpenClawEvent({
@@ -939,8 +1117,12 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
 
     if (evt.event === "agent") {
       const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : "";
+      const runId = typeof payload.runId === "string" ? payload.runId : undefined;
+      if (runId && this.#steerRunIds.has(runId)) return;
       const collector = this.#activeCollectors.get(sessionKey);
       if (!collector) return;
+      if (runId && collector.runId && runId !== collector.runId) return;
+      if (runId && !collector.runId) collector.runId = runId;
       this.#refreshCollectorTimer(collector);
       const stream = typeof payload.stream === "string" ? payload.stream : "";
       const data =
@@ -999,23 +1181,32 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     }
   }
 
-  #ingestApprovalRecord(sessionKey: string, raw: unknown): void {
-    if (!raw || typeof raw !== "object") return;
+  #parseApprovalRecord(
+    sessionKey: string,
+    raw: unknown,
+    existing?: GatewayExecApproval,
+  ): GatewayExecApproval | null {
+    if (!raw || typeof raw !== "object") return null;
     const rec = raw as Record<string, unknown>;
-    const approvalId = typeof rec.id === "string" ? rec.id : undefined;
-    if (!approvalId) return;
+    const approvalId =
+      typeof rec.id === "string"
+        ? rec.id
+        : typeof rec.approvalId === "string"
+          ? rec.approvalId
+          : existing?.approvalId;
+    if (!approvalId) return null;
 
-    const pres =
-      rec.presentation && typeof rec.presentation === "object"
-        ? (rec.presentation as Record<string, unknown>)
-        : rec;
+    const hasPresentation = Boolean(rec.presentation && typeof rec.presentation === "object");
+    const pres = hasPresentation ? (rec.presentation as Record<string, unknown>) : rec;
     const kind =
       pres.kind === "plugin"
         ? ("plugin" as const)
         : pres.kind === "system-agent"
           ? ("system-agent" as const)
-          : ("exec" as const);
-    const rawAllowed = Array.isArray(pres.allowedDecisions) ? pres.allowedDecisions : [];
+          : (existing?.kind ?? ("exec" as const));
+    const rawAllowed = Array.isArray(pres.allowedDecisions)
+      ? pres.allowedDecisions
+      : (existing?.allowedDecisions ?? []);
     const allowedDecisions = rawAllowed.filter(
       (d): d is GatewayApprovalDecision =>
         d === "allow-once" || d === "allow-always" || d === "deny",
@@ -1027,12 +1218,16 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       allowedDecisions.unshift("allow-once");
     }
 
-    const binding = this.#sessionToConversation.get(sessionKey);
-    const collector = this.#activeCollectors.get(sessionKey);
+    const effSessionKey = sessionKey || existing?.sessionKey || "";
+    const binding = effSessionKey ? this.#sessionToConversation.get(effSessionKey) : undefined;
+    const collector = effSessionKey ? this.#activeCollectors.get(effSessionKey) : undefined;
     const conversationId =
-      collector?.conversationId ?? binding?.conversationId ?? "conv_catalog_overview";
+      collector?.conversationId ||
+      binding?.conversationId ||
+      existing?.conversationId ||
+      "conv_catalog_overview";
 
-    const rawStatus = typeof rec.status === "string" ? rec.status : "pending";
+    const rawStatus = typeof rec.status === "string" ? rec.status : (existing?.status ?? "pending");
     const status =
       rawStatus === "allowed" ||
       rawStatus === "denied" ||
@@ -1041,43 +1236,67 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         ? rawStatus
         : "pending";
 
-    const approval: GatewayExecApproval = {
+    return {
       approvalId,
       conversationId,
-      sessionKey: sessionKey || undefined,
+      sessionKey: effSessionKey || undefined,
       kind,
-      agentId: typeof pres.agentId === "string" ? pres.agentId : "openclaw",
-      title: typeof pres.title === "string" ? pres.title : undefined,
+      agentId:
+        typeof pres.agentId === "string" ? pres.agentId : (existing?.agentId ?? "openclaw"),
+      title: typeof pres.title === "string" ? pres.title : existing?.title,
       command:
         typeof pres.commandText === "string"
           ? pres.commandText
           : typeof pres.title === "string"
             ? pres.title
-            : approvalId,
-      commandPreview: typeof pres.commandPreview === "string" ? pres.commandPreview : undefined,
-      description: typeof pres.description === "string" ? pres.description : undefined,
-      warningText: typeof pres.warningText === "string" ? pres.warningText : null,
-      host: typeof pres.host === "string" ? pres.host : null,
-      nodeId: typeof pres.nodeId === "string" ? pres.nodeId : null,
-      urlPath: typeof rec.urlPath === "string" ? rec.urlPath : undefined,
+            : (existing?.command ?? approvalId),
+      commandPreview:
+        typeof pres.commandPreview === "string" ? pres.commandPreview : existing?.commandPreview,
+      description:
+        typeof pres.description === "string" ? pres.description : existing?.description,
+      warningText:
+        typeof pres.warningText === "string"
+          ? pres.warningText
+          : (existing?.warningText ?? null),
+      host: typeof pres.host === "string" ? pres.host : (existing?.host ?? null),
+      nodeId: typeof pres.nodeId === "string" ? pres.nodeId : (existing?.nodeId ?? null),
+      urlPath: typeof rec.urlPath === "string" ? rec.urlPath : existing?.urlPath,
       allowedDecisions,
       reviewerBound: this.#status.grantedScopes.includes("operator.approvals"),
       status,
       decision:
         rec.decision === "allow-once" || rec.decision === "allow-always" || rec.decision === "deny"
           ? rec.decision
-          : undefined,
+          : existing?.decision,
       createdAt:
         typeof rec.createdAtMs === "number"
           ? new Date(rec.createdAtMs).toISOString()
-          : new Date().toISOString(),
-      expiresAtMs: typeof rec.expiresAtMs === "number" ? rec.expiresAtMs : undefined,
+          : (existing?.createdAt ?? new Date().toISOString()),
+      expiresAtMs:
+        typeof rec.expiresAtMs === "number" ? rec.expiresAtMs : existing?.expiresAtMs,
     };
+  }
 
-    this.#approvals.set(approvalId, approval);
+  #ingestApprovalRecord(sessionKey: string, raw: unknown): void {
+    const recId =
+      raw && typeof raw === "object" && typeof (raw as { id?: unknown }).id === "string"
+        ? (raw as { id: string }).id
+        : undefined;
+    const existing = recId ? this.#approvals.get(recId) : undefined;
+    const approval = this.#parseApprovalRecord(sessionKey, raw, existing);
+    if (!approval) return;
+
+    const effSessionKey = approval.sessionKey ?? sessionKey;
+    const binding = effSessionKey ? this.#sessionToConversation.get(effSessionKey) : undefined;
+    const collector = effSessionKey ? this.#activeCollectors.get(effSessionKey) : undefined;
+
+    this.#approvals.set(approval.approvalId, approval);
     if (collector) {
       this.#refreshCollectorTimer(collector);
-      if (!collector.approvals.some(a => a.approvalId === approvalId)) {
+      const idx = collector.approvals.findIndex(a => a.approvalId === approval.approvalId);
+      if (idx >= 0) {
+        collector.approvals[idx] = approval;
+      } else {
         collector.approvals.push(approval);
       }
     }

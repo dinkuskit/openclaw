@@ -79,7 +79,8 @@ export async function fetchLiveEntryWithRev(
 ): Promise<LiveEmDashEntry> {
   const params = new URLSearchParams();
   if (locale) params.set("locale", locale);
-  const url = `${API_BASE}/content/${encodeURIComponent(collection)}/${encodeURIComponent(entryId)}${params.toString() ? `?${params}` : ""}`;
+  const querySuffix = params.toString() ? `?${params}` : "";
+  const url = `${API_BASE}/content/${encodeURIComponent(collection)}/${encodeURIComponent(entryId)}${querySuffix}`;
   const res = await fetch(url, {
     method: "GET",
     credentials: "same-origin",
@@ -93,7 +94,87 @@ export async function fetchLiveEntryWithRev(
   if (!res.ok || !json?.success || !json.data) {
     throw new Error(json?.error?.message ?? `Failed to read ${collection}/${entryId}`);
   }
-  return json.data;
+
+  const entry = json.data;
+  const itemRecord = entry.item as Record<string, unknown>;
+  if (
+    typeof entry.item.draftRevisionId === "string" &&
+    entry.item.draftRevisionId.length > 0 &&
+    entry.item.draftRevisionId !== entry.item.liveRevisionId &&
+    !("liveData" in itemRecord)
+  ) {
+    const compareUrl = `${API_BASE}/content/${encodeURIComponent(collection)}/${encodeURIComponent(entryId)}/compare${querySuffix}`;
+    const compareRes = await fetch(compareUrl, {
+      method: "GET",
+      credentials: "same-origin",
+      headers: emdashHeaders(),
+    });
+    const compareJson = (await compareRes.json().catch(() => null)) as {
+      success?: boolean;
+      data?: {
+        hasChanges?: boolean;
+        draft?: Record<string, unknown> | null;
+      };
+      error?: { message?: string };
+    } | null;
+    if (!compareRes.ok || !compareJson?.success || !compareJson.data) {
+      throw new Error(
+        compareJson?.error?.message ??
+          `Failed to read staged draft revision for ${collection}/${entryId}`,
+      );
+    }
+    if (
+      compareJson.data.hasChanges &&
+      compareJson.data.draft &&
+      typeof compareJson.data.draft === "object"
+    ) {
+      const cleanDraft: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(compareJson.data.draft)) {
+        if (!k.startsWith("_")) {
+          cleanDraft[k] = v;
+        }
+      }
+      return {
+        ...entry,
+        item: {
+          ...entry.item,
+          data: {
+            ...(entry.item.data ?? {}),
+            ...cleanDraft,
+          },
+        },
+      };
+    }
+  }
+
+  return entry;
+}
+
+export async function fetchCollectionSupports(collection: string): Promise<string[]> {
+  const res = await fetch(
+    `${API_BASE}/schema/collections/${encodeURIComponent(collection)}`,
+    {
+      method: "GET",
+      credentials: "same-origin",
+      headers: emdashHeaders(),
+    },
+  );
+  const json = (await res.json().catch(() => null)) as {
+    success?: boolean;
+    data?: {
+      item?: { supports?: unknown };
+      supports?: unknown;
+    };
+    error?: { message?: string };
+  } | null;
+  const rawSupports = json?.data?.item?.supports ?? json?.data?.supports;
+  if (!res.ok || !json?.success || !Array.isArray(rawSupports)) {
+    throw new Error(
+      json?.error?.message ??
+        `Failed to verify revision capability for collection "${collection}"`,
+    );
+  }
+  return rawSupports.filter((s): s is string => typeof s === "string");
 }
 
 /**
@@ -162,9 +243,10 @@ export async function applyRevisionProposal(
     const nextProp = revisedSnap.revisedProposalId
       ? revisedSnap.proposals.find(p => p.proposalId === revisedSnap.revisedProposalId)
       : revisedSnap.proposals.find(p => p.supersedesProposalId === proposal.proposalId);
-    if (nextProp) {
-      activeProposal = nextProp;
+    if (!nextProp) {
+      throw new Error("Proposal revision was not created — refresh and inspect its current status.");
     }
+    activeProposal = nextProp;
   }
 
   if (Object.keys(activeProposal.proposedFields ?? {}).length === 0) {
@@ -173,11 +255,28 @@ export async function applyRevisionProposal(
     );
   }
 
-  const live = await fetchLiveEntryWithRev(
-    activeProposal.collection,
-    activeProposal.entryId,
-    activeProposal.locale,
-  );
+  const [live, supports] = await Promise.all([
+    fetchLiveEntryWithRev(
+      activeProposal.collection,
+      activeProposal.entryId,
+      activeProposal.locale,
+    ),
+    fetchCollectionSupports(activeProposal.collection),
+  ]);
+
+  const entryStatus = live.item.status ?? "published";
+  const canStageDraft =
+    supports.includes("revisions") ||
+    (entryStatus === "draft" && supports.includes("drafts"));
+  if (!canStageDraft) {
+    return callOpenClawChat({
+      action: "record_proposal_receipt",
+      conversationId: activeProposal.conversationId,
+      proposalId: activeProposal.proposalId,
+      status: "failed",
+      errorMessage: `Collection "${activeProposal.collection}" does not support staging drafts for ${entryStatus} entries — saving would modify live content immediately.`,
+    });
+  }
 
   const hasOpaqueRev =
     Boolean(activeProposal.baseRev) &&
@@ -221,6 +320,18 @@ export async function applyRevisionProposal(
       conflictRev: live._rev,
       errorMessage: "Entry was modified by another save since this proposal was created.",
     });
+  }
+
+  // Server-side pre-apply fence: ensures stale tabs cannot apply rejected/superseded/applied proposals
+  // and marks the proposal `applying` before dispatching the CMS write.
+  const preflight = (await callOpenClawChat({
+    action: "begin_apply_proposal",
+    conversationId: activeProposal.conversationId,
+    proposalId: activeProposal.proposalId,
+    expectedRev,
+  })) as OpenClawWorkspaceSnapshot & { applyReady?: boolean };
+  if (preflight.applyReady === false) {
+    return preflight;
   }
 
   const mergedData: Record<string, unknown> = {
@@ -288,22 +399,46 @@ export async function applyRevisionProposal(
     });
   }
 
-  return callOpenClawChat({
-    action: "record_proposal_receipt",
-    conversationId: activeProposal.conversationId,
-    proposalId: activeProposal.proposalId,
-    status: "applied",
-    appliedRev: putJson.data._rev ?? expectedRev,
-  });
+  try {
+    return await callOpenClawChat({
+      action: "record_proposal_receipt",
+      conversationId: activeProposal.conversationId,
+      proposalId: activeProposal.proposalId,
+      status: "applied",
+      appliedRev: putJson.data._rev ?? expectedRev,
+    });
+  } catch {
+    return await reconcileUnknownProposal(activeProposal);
+  }
 }
 
 export async function reconcileUnknownProposal(
   proposal: RevisionProposal,
 ): Promise<OpenClawWorkspaceSnapshot> {
+  let clientVerifiedMatch: boolean | undefined;
+  let observedRev: string | undefined;
+  const fieldEntries = Object.entries(proposal.proposedFields ?? {}).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+  if (fieldEntries.length > 0 && proposal.entryId !== "current") {
+    try {
+      const live = await fetchLiveEntryWithRev(
+        proposal.collection,
+        proposal.entryId,
+        proposal.locale,
+      );
+      observedRev = live._rev;
+      clientVerifiedMatch = fieldEntries.every(([k, v]) => live.item.data?.[k] === v);
+    } catch {
+      // Fall back to server-side reconciliation if browser read fails.
+    }
+  }
   return callOpenClawChat({
     action: "reconcile_proposal",
     conversationId: proposal.conversationId,
     proposalId: proposal.proposalId,
+    ...(clientVerifiedMatch !== undefined ? { clientVerifiedMatch } : {}),
+    ...(observedRev ? { observedRev } : {}),
   });
 }
 
@@ -331,14 +466,17 @@ export function connectOpenClawEventStream(options: {
   endpoint: string;
   onEvent: (event: OpenClawStreamEvent) => void;
   onStatus: (status: "live" | "reconnecting" | "buffered") => void;
+  onReconnect?: () => void;
 }): () => void {
   let stopped = false;
+  let hasConnectedOnce = false;
   let activeController: AbortController | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const start = async (attempt: number) => {
     if (stopped) return;
     activeController = new AbortController();
+    let established = false;
     try {
       const res = await fetch(options.endpoint, {
         method: "GET",
@@ -353,7 +491,13 @@ export function connectOpenClawEventStream(options: {
         return;
       }
 
+      established = true;
+      const isReconnect = hasConnectedOnce || attempt > 0;
+      hasConnectedOnce = true;
       options.onStatus("live");
+      if (isReconnect) {
+        options.onReconnect?.();
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -386,8 +530,9 @@ export function connectOpenClawEventStream(options: {
 
     if (!stopped) {
       options.onStatus("reconnecting");
-      const delay = Math.min(8_000, 800 * Math.pow(1.6, attempt));
-      retryTimer = setTimeout(() => void start(attempt + 1), delay);
+      const nextAttempt = established ? 1 : attempt + 1;
+      const delay = Math.min(8_000, 800 * Math.pow(1.6, established ? 0 : attempt));
+      retryTimer = setTimeout(() => void start(nextAttempt), delay);
     }
   };
 

@@ -1,6 +1,6 @@
 import type { Block, BlockResponse, FormField } from "@emdash-cms/blocks/server";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
-import { publishOpenClawEvent } from "./sse-bus.js";
+import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
 
 /** EmDash Editor role (40) and Administrator role (50). */
 const EDITOR = 40;
@@ -142,15 +142,20 @@ async function discoverSiteCollections(
   ];
 }
 
-async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
+async function loadConnectionState(
+  ctx: PluginContext,
+): Promise<{ connection: OpenClawConnection | null; error?: string }> {
   let raw: unknown;
   try {
     raw = await ctx.settings.get("connection");
   } catch {
-    await ctx.settings.delete("connection").catch(() => {});
-    return null;
+    return {
+      connection: null,
+      error:
+        "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.",
+    };
   }
-  if (typeof raw !== "string" || !raw) return null;
+  if (typeof raw !== "string" || !raw) return { connection: null };
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
     if (
@@ -167,22 +172,31 @@ async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | 
       parsed.gatewayToken.length > 0
     ) {
       return {
-        gatewayUrl: parsed.gatewayUrl,
-        agentId: parsed.agentId,
-        gatewayToken: parsed.gatewayToken,
-        authorityMode:
-          parsed.authorityMode === "propose_with_approval"
-            ? "propose_with_approval"
-            : "read_only",
-        enabledCollections: Array.isArray(parsed.enabledCollections)
-          ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
-          : ["pages", "posts"],
+        connection: {
+          gatewayUrl: parsed.gatewayUrl,
+          agentId: parsed.agentId,
+          gatewayToken: parsed.gatewayToken,
+          authorityMode:
+            parsed.authorityMode === "propose_with_approval"
+              ? "propose_with_approval"
+              : "read_only",
+          enabledCollections: Array.isArray(parsed.enabledCollections)
+            ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+            : ["pages", "posts"],
+        },
       };
     }
   } catch {
-    // Malformed settings require re-setup.
+    // Preserve stored encrypted value instead of deleting on parse errors.
   }
-  return null;
+  return {
+    connection: null,
+    error: "Stored OpenClaw settings could not be parsed. Re-save Gateway settings to replace them.",
+  };
+}
+
+async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
+  return (await loadConnectionState(ctx)).connection;
 }
 
 async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
@@ -824,15 +838,16 @@ export async function openclawAdmin(
     );
   }
 
-  const connection = await loadConnection(ctx);
+  const connState = await loadConnectionState(ctx);
+  const connection = connState.connection;
   if (!connection) {
     if (event.type === "block_action" && event.action_id === "check_pairing") {
-      return setupPage(true, collections, siteOrigin, pairingCode, undefined, {
+      return setupPage(true, collections, siteOrigin, pairingCode, connState.error, {
         type: "info",
         message: "Waiting for your OpenClaw agent to complete the pairing POST.",
       });
     }
-    return setupPage(isAdmin, collections, siteOrigin, pairingCode);
+    return setupPage(isAdmin, collections, siteOrigin, pairingCode, connState.error);
   }
 
   if (event.type === "block_action" && event.action_id === "disconnect" && isAdmin) {
@@ -867,10 +882,14 @@ export async function openclawAdmin(
   ) {
     const proposalId = cleanText(event.value, 120);
     if (event.action_id === "reject_proposal") {
-      const remaining = proposals.filter(item => item.proposalId !== proposalId);
-      if (ctx.kv) {
-        await ctx.kv.set("pending_proposals", remaining);
-      }
+      const remaining = await withOpenClawStorageLock("proposals", async () => {
+        const current = await loadProposals(ctx);
+        const next = current.filter(item => item.proposalId !== proposalId);
+        if (ctx.kv) {
+          await ctx.kv.set("pending_proposals", next);
+        }
+        return next;
+      });
       return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
         type: "info",
         message: `Rejected proposal ${proposalId ?? ""}. No CMS changes were applied.`,
@@ -1035,17 +1054,19 @@ export async function openclawEditorPanel(
   if (event?.type === "form_submit" && event.action_id === "collaborate_entry") {
     const instruction = cleanText(event.values.instruction, 500);
     if (instruction && ctx.kv) {
-      const proposals = await loadProposals(ctx);
-      proposals.push({
-        proposalId: `prop_${Date.now()}`,
-        agentId: connection.agentId,
-        collection,
-        entryId,
-        summary: `${collection}/${entryId}: ${instruction}`,
-        targetTool: "content:collaborate",
-        createdAt: new Date().toISOString(),
+      await withOpenClawStorageLock("proposals", async () => {
+        const proposals = await loadProposals(ctx);
+        proposals.push({
+          proposalId: `prop_${Date.now()}`,
+          agentId: connection.agentId,
+          collection,
+          entryId,
+          summary: `${collection}/${entryId}: ${instruction}`,
+          targetTool: "content:collaborate",
+          createdAt: new Date().toISOString(),
+        });
+        await ctx.kv!.set("pending_proposals", proposals);
       });
-      await ctx.kv.set("pending_proposals", proposals);
     }
     return {
       blocks: [
@@ -1176,7 +1197,6 @@ export async function openclawPairRoute(
         };
       }
       if (toolName === "emdash_submit_proposal" && ctx.kv) {
-        const proposals = await loadProposals(ctx);
         const proposedFields = extractSafeExternalFields(args.proposedFields);
         const proposal: PendingProposal = {
           proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1188,8 +1208,11 @@ export async function openclawPairRoute(
           ...(proposedFields ? { proposedFields } : {}),
           createdAt: new Date().toISOString(),
         };
-        proposals.push(proposal);
-        await ctx.kv.set("pending_proposals", proposals);
+        await withOpenClawStorageLock("proposals", async () => {
+          const proposals = await loadProposals(ctx);
+          proposals.push(proposal);
+          await ctx.kv!.set("pending_proposals", proposals);
+        });
         publishOpenClawEvent({
           type: "workspace_sync",
           conversationId: "conv_default",
@@ -1266,7 +1289,6 @@ export async function openclawPairRoute(
       return { ok: true, status: "completed", reply };
     }
     if (action === "propose" && ctx.kv) {
-      const proposals = await loadProposals(ctx);
       const proposedFields = extractSafeExternalFields(input.proposedFields);
       const proposal: PendingProposal = {
         proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1278,8 +1300,11 @@ export async function openclawPairRoute(
         ...(proposedFields ? { proposedFields } : {}),
         createdAt: new Date().toISOString(),
       };
-      proposals.push(proposal);
-      await ctx.kv.set("pending_proposals", proposals);
+      await withOpenClawStorageLock("proposals", async () => {
+        const proposals = await loadProposals(ctx);
+        proposals.push(proposal);
+        await ctx.kv!.set("pending_proposals", proposals);
+      });
       publishOpenClawEvent({
         type: "workspace_sync",
         conversationId: "conv_default",

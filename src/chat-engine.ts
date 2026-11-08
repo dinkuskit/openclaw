@@ -17,7 +17,7 @@ import type {
   SiteCollectionSummary,
   ToolCallTrace,
 } from "./protocol.js";
-import { publishOpenClawEvent } from "./sse-bus.js";
+import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
 
 const EDITOR = 40;
 const ADMIN = 50;
@@ -57,12 +57,14 @@ interface ExtendedPluginContext {
         slug: string;
         label?: string;
         name?: string;
+        supports?: string[];
         fields?: Array<{ name?: string; slug?: string; type?: string; label?: string }>;
       }>
     >;
     getCollection?: (slug: string) => Promise<{
       slug: string;
       label?: string;
+      supports?: string[];
       fields?: Array<{ name?: string; slug?: string; type?: string; label?: string }>;
     } | null>;
   };
@@ -193,15 +195,25 @@ function classifyTransportMode(
   return "live-gateway";
 }
 
-export async function readConnectionSettings(ctx: PluginContext): Promise<OpenClawConnection | null> {
+export interface ConnectionSettingsReadState {
+  connection: OpenClawConnection | null;
+  error?: string;
+}
+
+export async function readConnectionSettingsState(
+  ctx: PluginContext,
+): Promise<ConnectionSettingsReadState> {
   let raw: unknown;
   try {
     raw = await ctx.settings.get("connection");
   } catch {
-    await ctx.settings.delete("connection").catch(() => {});
-    return null;
+    return {
+      connection: null,
+      error:
+        "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.",
+    };
   }
-  if (typeof raw !== "string" || !raw) return null;
+  if (typeof raw !== "string" || !raw) return { connection: null };
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
     if (
@@ -213,32 +225,42 @@ export async function readConnectionSettings(ctx: PluginContext): Promise<OpenCl
       parsed.gatewayToken.length > 0
     ) {
       return {
-        gatewayUrl: parsed.gatewayUrl,
-        agentId: parsed.agentId,
-        gatewayToken: parsed.gatewayToken,
-        ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
-          ? { deviceToken: parsed.deviceToken }
-          : {}),
-        ...(parsed.deviceIdentity &&
-        typeof parsed.deviceIdentity.deviceId === "string" &&
-        typeof parsed.deviceIdentity.publicKeyPem === "string" &&
-        typeof parsed.deviceIdentity.privateKeyPem === "string"
-          ? { deviceIdentity: parsed.deviceIdentity }
-          : {}),
-        authorityMode:
-          parsed.authorityMode === "propose_with_approval"
-            ? "propose_with_approval"
-            : "read_only",
-        allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
-        enabledCollections: Array.isArray(parsed.enabledCollections)
-          ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
-          : ["pages", "products"],
+        connection: {
+          gatewayUrl: parsed.gatewayUrl,
+          agentId: parsed.agentId,
+          gatewayToken: parsed.gatewayToken,
+          ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
+            ? { deviceToken: parsed.deviceToken }
+            : {}),
+          ...(parsed.deviceIdentity &&
+          typeof parsed.deviceIdentity.deviceId === "string" &&
+          typeof parsed.deviceIdentity.publicKeyPem === "string" &&
+          typeof parsed.deviceIdentity.privateKeyPem === "string"
+            ? { deviceIdentity: parsed.deviceIdentity }
+            : {}),
+          authorityMode:
+            parsed.authorityMode === "propose_with_approval"
+              ? "propose_with_approval"
+              : "read_only",
+          allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
+          enabledCollections: Array.isArray(parsed.enabledCollections)
+            ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+            : ["pages", "products"],
+        },
       };
     }
   } catch {
-    // Malformed settings require re-pairing.
+    // Preserve stored encrypted value instead of deleting on parse errors.
   }
-  return null;
+  return {
+    connection: null,
+    error:
+      "Stored OpenClaw connection settings could not be parsed. Re-save Gateway credentials to replace them.",
+  };
+}
+
+export async function readConnectionSettings(ctx: PluginContext): Promise<OpenClawConnection | null> {
+  return (await readConnectionSettingsState(ctx)).connection;
 }
 
 async function persistConnectionSettings(
@@ -261,10 +283,18 @@ export async function listSiteCollections(
     if (ext.schema?.listCollections) {
       const cols = await ext.schema.listCollections();
       if (Array.isArray(cols) && cols.length > 0) {
-        return cols.map(col => ({
-          slug: col.slug,
-          label: col.label ?? col.name ?? col.slug,
-        }));
+        return cols.map(col => {
+          const supports = Array.isArray(col.supports)
+            ? col.supports.filter((s): s is string => typeof s === "string")
+            : undefined;
+          return {
+            slug: col.slug,
+            label: col.label ?? col.name ?? col.slug,
+            ...(supports
+              ? { supports, supportsRevisions: supports.includes("revisions") }
+              : {}),
+          };
+        });
       }
     }
   } catch {
@@ -274,6 +304,21 @@ export async function listSiteCollections(
     { slug: "pages", label: "Pages" },
     { slug: "posts", label: "Posts" },
   ];
+}
+
+function canCollectionStageDraft(
+  collections: SiteCollectionSummary[],
+  collectionSlug: string,
+  entryStatus?: string,
+): boolean {
+  const col = collections.find(c => c.slug === collectionSlug);
+  if (!col || !Array.isArray(col.supports)) {
+    return true;
+  }
+  if (col.supports.includes("revisions")) {
+    return true;
+  }
+  return entryStatus === "draft" && col.supports.includes("drafts");
 }
 
 function summarizeItem(collection: string, raw: RawContentItem): CatalogEntrySummary {
@@ -411,6 +456,10 @@ async function getSingleContentItem(
   }
 }
 
+const MAX_PERSONAL_THREADS_PER_USER = 40;
+const MAX_SHARED_THREADS = 80;
+const MAX_TOTAL_THREADS = 240;
+
 async function loadThreads(ctx: PluginContext): Promise<ConversationThread[]> {
   if (!ctx.kv) return [];
   const raw = await ctx.kv.get("chat_threads_v2");
@@ -418,9 +467,94 @@ async function loadThreads(ctx: PluginContext): Promise<ConversationThread[]> {
   return raw as ConversationThread[];
 }
 
-async function saveThreads(ctx: PluginContext, threads: ConversationThread[]): Promise<void> {
-  if (!ctx.kv) return;
-  await ctx.kv.set("chat_threads_v2", threads.slice(0, 60));
+function retainThreads(
+  threads: ConversationThread[],
+  preserveIds: Iterable<string> = [],
+): ConversationThread[] {
+  const preserveSet = new Set(preserveIds);
+  const deduped: ConversationThread[] = [];
+  const seen = new Set<string>();
+  for (const t of threads) {
+    if (!t?.conversationId || seen.has(t.conversationId)) continue;
+    seen.add(t.conversationId);
+    deduped.push(t);
+  }
+
+  const isPinned = (t: ConversationThread) =>
+    preserveSet.has(t.conversationId) ||
+    t.status === "running" ||
+    t.conversationId === "conv_default";
+
+  const byUpdatedDesc = (a: ConversationThread, b: ConversationThread) =>
+    (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0);
+
+  const retainedIds = new Set<string>();
+  const sharedBucket: ConversationThread[] = [];
+  const personalBuckets = new Map<string, ConversationThread[]>();
+
+  for (const t of deduped) {
+    if (t.visibility === "shared" || !t.ownerUserId) {
+      sharedBucket.push(t);
+    } else {
+      const list = personalBuckets.get(t.ownerUserId) ?? [];
+      list.push(t);
+      personalBuckets.set(t.ownerUserId, list);
+    }
+  }
+
+  const keepFromBucket = (bucket: ConversationThread[], cap: number) => {
+    const pinned = bucket.filter(isPinned);
+    const rest = bucket.filter(t => !isPinned(t)).sort(byUpdatedDesc);
+    for (const t of pinned) retainedIds.add(t.conversationId);
+    for (const t of rest.slice(0, Math.max(0, cap - pinned.length))) {
+      retainedIds.add(t.conversationId);
+    }
+  };
+
+  keepFromBucket(sharedBucket, MAX_SHARED_THREADS);
+  for (const bucket of personalBuckets.values()) {
+    keepFromBucket(bucket, MAX_PERSONAL_THREADS_PER_USER);
+  }
+
+  const filtered = deduped.filter(t => retainedIds.has(t.conversationId));
+  if (filtered.length <= MAX_TOTAL_THREADS) {
+    return filtered;
+  }
+
+  const pinnedAll = filtered.filter(isPinned);
+  const restAll = filtered.filter(t => !isPinned(t)).sort(byUpdatedDesc);
+  const finalAllowed = new Set<string>([
+    ...pinnedAll.map(t => t.conversationId),
+    ...restAll
+      .slice(0, Math.max(0, MAX_TOTAL_THREADS - pinnedAll.length))
+      .map(t => t.conversationId),
+  ]);
+  return filtered.filter(t => finalAllowed.has(t.conversationId));
+}
+
+async function saveThreads(
+  ctx: PluginContext,
+  threads: ConversationThread[],
+  preserveIds: Iterable<string> = [],
+): Promise<ConversationThread[]> {
+  const retained = retainThreads(threads, preserveIds);
+  if (ctx.kv) {
+    await ctx.kv.set("chat_threads_v2", retained);
+  }
+  return retained;
+}
+
+async function mutateThreads<T>(
+  ctx: PluginContext,
+  preserveIds: Iterable<string>,
+  mutator: (current: ConversationThread[]) => Promise<{ threads: ConversationThread[]; result: T }> | { threads: ConversationThread[]; result: T },
+): Promise<T> {
+  return await withOpenClawStorageLock("threads", async () => {
+    const current = await loadThreads(ctx);
+    const { threads: next, result } = await mutator(current);
+    await saveThreads(ctx, next, preserveIds);
+    return result;
+  });
 }
 
 function isThreadVisibleToUser(thread: ConversationThread, userId: string): boolean {
@@ -429,110 +563,165 @@ function isThreadVisibleToUser(thread: ConversationThread, userId: string): bool
   return thread.ownerUserId === userId;
 }
 
-export async function loadRevisionProposals(ctx: PluginContext): Promise<RevisionProposal[]> {
-  if (!ctx.kv) return [];
-  const rawV2 = await ctx.kv.get("revision_proposals_v2");
-  const v2List: RevisionProposal[] = Array.isArray(rawV2)
+function normalizeV2Proposals(rawV2: unknown): RevisionProposal[] {
+  return Array.isArray(rawV2)
     ? (rawV2 as RevisionProposal[]).map(p => ({
         ...p,
         revisionNumber: typeof p.revisionNumber === "number" ? p.revisionNumber : 1,
       }))
     : [];
+}
 
-  const legacy = await ctx.kv.get("pending_proposals");
-  if (!Array.isArray(legacy) || legacy.length === 0) {
-    return v2List;
+async function hydrateLegacyPendingProposal(
+  ctx: PluginContext,
+  item: Record<string, unknown>,
+  fallbackIdx: number,
+): Promise<RevisionProposal> {
+  const proposalId =
+    typeof item.proposalId === "string" ? item.proposalId : `prop_legacy_${fallbackIdx}`;
+  const collection = typeof item.collection === "string" ? item.collection : "pages";
+  const entryId = typeof item.entryId === "string" ? item.entryId : "current";
+  const summary =
+    typeof item.summary === "string" ? item.summary : "Proposed content change";
+
+  const proposedFields: Record<string, unknown> = {};
+  if (item.proposedFields && typeof item.proposedFields === "object") {
+    for (const [k, v] of Object.entries(item.proposedFields as Record<string, unknown>)) {
+      if (!EXCLUDED_DRAFT_ONLY_FIELDS.has(k) && typeof v === "string") {
+        proposedFields[k] = v;
+      }
+    }
   }
 
-  const existingIds = new Set(v2List.map(p => p.proposalId));
-  const newlyImported: RevisionProposal[] = [];
+  let entrySlug = entryId;
+  let entryTitle = entryId === "current" ? "External Agent Proposal" : entryId;
+  let baseRev = "pending-browser-rev";
+  let diffs: ContentFieldDiff[] = [
+    {
+      field: "summary",
+      label: "External Summary (No Concrete Patch)",
+      before: "(current saved content)",
+      after: summary,
+      addedLines: 0,
+      removedLines: 0,
+    },
+  ];
 
-  for (let idx = 0; idx < legacy.length; idx++) {
-    const item = legacy[idx] as Record<string, unknown>;
-    const proposalId =
-      typeof item.proposalId === "string" ? item.proposalId : `prop_legacy_${idx}`;
-    if (existingIds.has(proposalId)) continue;
-    existingIds.add(proposalId);
+  if (entryId !== "current") {
+    const { item: stored } = await getSingleContentItem(ctx, collection, entryId);
+    if (stored) {
+      entrySlug = stored.slug;
+      entryTitle = stored.title;
+      if (stored._rev) baseRev = stored._rev;
+    }
+    if (Object.keys(proposedFields).length > 0) {
+      diffs = Object.entries(proposedFields).map(([field, val]) => {
+        const rawBefore = stored?.fields[field];
+        const beforeVal =
+          typeof rawBefore === "string"
+            ? rawBefore
+            : field === "title" || field === "name"
+              ? (stored?.title ?? "")
+              : "";
+        return {
+          field,
+          label: field,
+          before: beforeVal || "(empty)",
+          after: String(val),
+          ...countDiffLines(beforeVal, String(val)),
+        };
+      });
+    }
+  }
 
-    const collection = typeof item.collection === "string" ? item.collection : "pages";
-    const entryId = typeof item.entryId === "string" ? item.entryId : "current";
-    const summary =
-      typeof item.summary === "string" ? item.summary : "Proposed content change";
+  return {
+    proposalId,
+    revisionNumber: 1,
+    conversationId: "conv_default",
+    agentId: typeof item.agentId === "string" ? item.agentId : "openclaw",
+    collection,
+    entryId,
+    entrySlug,
+    entryTitle,
+    baseRev,
+    summary,
+    targetTool: typeof item.targetTool === "string" ? item.targetTool : "content:update",
+    proposedFields: entryId === "current" ? {} : proposedFields,
+    diffs,
+    status: "pending",
+    createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
 
-    const proposedFields: Record<string, unknown> = {};
-    if (item.proposedFields && typeof item.proposedFields === "object") {
-      for (const [k, v] of Object.entries(item.proposedFields as Record<string, unknown>)) {
-        if (!EXCLUDED_DRAFT_ONLY_FIELDS.has(k) && typeof v === "string") {
-          proposedFields[k] = v;
+export async function loadRevisionProposals(ctx: PluginContext): Promise<RevisionProposal[]> {
+  if (!ctx.kv) return [];
+
+  for (let pass = 0; pass < 3; pass++) {
+    const legacySnapshot = await ctx.kv.get("pending_proposals");
+    if (!Array.isArray(legacySnapshot) || legacySnapshot.length === 0) {
+      return normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
+    }
+
+    const v2Snapshot = normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
+    const knownIds = new Set(v2Snapshot.map(p => p.proposalId));
+    const hydratedById = new Map<string, RevisionProposal>();
+    const processedIds = new Set<string>();
+
+    for (let idx = 0; idx < legacySnapshot.length; idx++) {
+      const rawItem = legacySnapshot[idx];
+      if (!rawItem || typeof rawItem !== "object") continue;
+      const rec = rawItem as Record<string, unknown>;
+      const id = typeof rec.proposalId === "string" ? rec.proposalId : `prop_legacy_${idx}`;
+      processedIds.add(id);
+      if (knownIds.has(id) || hydratedById.has(id)) continue;
+      hydratedById.set(id, await hydrateLegacyPendingProposal(ctx, rec, idx));
+    }
+
+    const { merged, hasUnprocessed } = await withOpenClawStorageLock("proposals", async () => {
+      const freshV2 = normalizeV2Proposals(await ctx.kv!.get("revision_proposals_v2"));
+      const freshLegacyRaw = await ctx.kv!.get("pending_proposals");
+      const freshLegacy = Array.isArray(freshLegacyRaw) ? freshLegacyRaw : [];
+      const freshExistingIds = new Set(freshV2.map(p => p.proposalId));
+
+      const toPrepend: RevisionProposal[] = [];
+      for (const [id, built] of hydratedById) {
+        if (!freshExistingIds.has(id)) {
+          freshExistingIds.add(id);
+          toPrepend.push(built);
         }
       }
-    }
 
-    let entrySlug = entryId;
-    let entryTitle = entryId === "current" ? "External Agent Proposal" : entryId;
-    let baseRev = "pending-browser-rev";
-    let diffs: ContentFieldDiff[] = [
-      {
-        field: "summary",
-        label: "External Summary (No Concrete Patch)",
-        before: "(current saved content)",
-        after: summary,
-        addedLines: 0,
-        removedLines: 0,
-      },
-    ];
-
-    if (entryId !== "current") {
-      const { item: stored } = await getSingleContentItem(ctx, collection, entryId);
-      if (stored) {
-        entrySlug = stored.slug;
-        entryTitle = stored.title;
-        if (stored._rev) baseRev = stored._rev;
+      const nextV2 =
+        toPrepend.length > 0 ? [...toPrepend, ...freshV2].slice(0, 80) : freshV2;
+      if (toPrepend.length > 0) {
+        await ctx.kv!.set("revision_proposals_v2", nextV2);
       }
-      if (Object.keys(proposedFields).length > 0) {
-        diffs = Object.entries(proposedFields).map(([field, val]) => {
-          const rawBefore = stored?.fields[field];
-          const beforeVal =
-            typeof rawBefore === "string"
-              ? rawBefore
-              : field === "title" || field === "name"
-                ? (stored?.title ?? "")
-                : "";
-          return {
-            field,
-            label: field,
-            before: beforeVal || "(empty)",
-            after: String(val),
-            ...countDiffLines(beforeVal, String(val)),
-          };
-        });
-      }
-    }
 
-    newlyImported.push({
-      proposalId,
-      revisionNumber: 1,
-      conversationId: "conv_default",
-      agentId: typeof item.agentId === "string" ? item.agentId : "openclaw",
-      collection,
-      entryId,
-      entrySlug,
-      entryTitle,
-      baseRev,
-      summary,
-      targetTool: typeof item.targetTool === "string" ? item.targetTool : "content:update",
-      proposedFields: entryId === "current" ? {} : proposedFields,
-      diffs,
-      status: "pending",
-      createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      const remainingLegacy = freshLegacy.filter((rawItem, idx) => {
+        if (!rawItem || typeof rawItem !== "object") return false;
+        const rec = rawItem as Record<string, unknown>;
+        const id = typeof rec.proposalId === "string" ? rec.proposalId : `prop_legacy_${idx}`;
+        return !processedIds.has(id) && !freshExistingIds.has(id);
+      });
+
+      if (remainingLegacy.length === 0) {
+        if (freshLegacy.length > 0) {
+          await ctx.kv!.delete("pending_proposals");
+        }
+      } else {
+        await ctx.kv!.set("pending_proposals", remainingLegacy);
+      }
+
+      return { merged: nextV2, hasUnprocessed: remainingLegacy.length > 0 };
     });
+
+    if (!hasUnprocessed) {
+      return merged;
+    }
   }
 
-  const merged = [...newlyImported, ...v2List].slice(0, 80);
-  await ctx.kv.set("revision_proposals_v2", merged);
-  await ctx.kv.delete("pending_proposals");
-  return merged;
+  return normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
 }
 
 export async function saveRevisionProposals(
@@ -557,17 +746,27 @@ async function savePersistedExecApprovals(
   await ctx.kv.set("gateway_exec_approvals_v1", approvals.slice(0, 50));
 }
 
+async function upsertPersistedExecApprovals(
+  ctx: PluginContext,
+  incoming: GatewayExecApproval[],
+): Promise<GatewayExecApproval[]> {
+  if (incoming.length === 0) return await loadPersistedExecApprovals(ctx);
+  return await withOpenClawStorageLock("approvals", async () => {
+    const persisted = await loadPersistedExecApprovals(ctx);
+    const byId = new Map<string, GatewayExecApproval>();
+    for (const item of persisted) byId.set(item.approvalId, item);
+    for (const item of incoming) byId.set(item.approvalId, item);
+    const merged = [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    await savePersistedExecApprovals(ctx, merged);
+    return merged;
+  });
+}
+
 async function mergeExecApprovals(ctx: PluginContext): Promise<GatewayExecApproval[]> {
-  const persisted = await loadPersistedExecApprovals(ctx);
   const bridge = getHostGatewayBridge();
   const live = bridge ? bridge.listLiveApprovals() : [];
-  if (live.length === 0) return persisted;
-  const byId = new Map<string, GatewayExecApproval>();
-  for (const item of persisted) byId.set(item.approvalId, item);
-  for (const item of live) byId.set(item.approvalId, item);
-  const merged = [...byId.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  await savePersistedExecApprovals(ctx, merged);
-  return merged;
+  if (live.length === 0) return await loadPersistedExecApprovals(ctx);
+  return await upsertPersistedExecApprovals(ctx, live);
 }
 
 async function loadAutomations(
@@ -870,8 +1069,9 @@ function ensureUserThreads(
   collections: SiteCollectionSummary[],
   entriesPreview: CatalogEntrySummary[],
   boundEntry?: BoundEntryRef,
-): ConversationThread[] {
+): { threads: ConversationThread[]; addedIds: string[] } {
   let next = [...allThreads];
+  const addedIds: string[] = [];
 
   if (boundEntry) {
     const existingBound = next.find(
@@ -886,6 +1086,7 @@ function ensureUserThreads(
         e => e.collection === boundEntry.collection && e.id === boundEntry.entryId,
       );
       const convId = `conv_entry_${currentUserId}_${boundEntry.collection}_${boundEntry.entryId}`;
+      addedIds.push(convId);
       next = [
         {
           conversationId: convId,
@@ -918,20 +1119,24 @@ function ensureUserThreads(
       currentUserId === "u1" || currentUserId === "dev-admin"
         ? "conv_catalog_overview"
         : `conv_${currentUserId}_overview`;
-    next.push({
-      conversationId: convId,
-      ownerUserId: currentUserId,
-      visibility: "personal",
-      sessionKey: buildCanonicalSessionKey(agentId, convId),
-      title: hasProducts ? "Catalog & Products Overview" : "Site Content Overview",
-      scopeGroup: hasProducts ? "products" : "pages & storefront",
-      status: "idle",
-      createdAt: now,
-      updatedAt: now,
-      messages: [],
-    });
+    addedIds.push(convId);
+    next = [
+      {
+        conversationId: convId,
+        ownerUserId: currentUserId,
+        visibility: "personal",
+        sessionKey: buildCanonicalSessionKey(agentId, convId),
+        title: hasProducts ? "Catalog & Products Overview" : "Site Content Overview",
+        scopeGroup: hasProducts ? "products" : "pages & storefront",
+        status: "idle",
+        createdAt: now,
+        updatedAt: now,
+        messages: [],
+      },
+      ...next,
+    ];
   }
-  return next;
+  return { threads: next, addedIds };
 }
 
 export async function buildWorkspaceSnapshot(
@@ -947,7 +1152,8 @@ export async function buildWorkspaceSnapshot(
   const siteName =
     (ctx as unknown as { site?: { name?: string } }).site?.name ?? "EmDash Store";
   const pairingCode = isAdmin ? await getOrCreatePairingCode(ctx) : "";
-  const connection = await readConnectionSettings(ctx);
+  const connState = await readConnectionSettingsState(ctx);
+  const connection = connState.connection;
   const collections = await listSiteCollections(ctx);
 
   const visibleSlugs = connection
@@ -969,7 +1175,7 @@ export async function buildWorkspaceSnapshot(
 
   const agentId = connection?.agentId ?? "openclaw";
   let allThreads = await loadThreads(ctx);
-  allThreads = ensureUserThreads(
+  const initialEnsure = ensureUserThreads(
     allThreads,
     currentUserId,
     agentId,
@@ -977,7 +1183,23 @@ export async function buildWorkspaceSnapshot(
     entriesPreview,
     boundEntry,
   );
-  await saveThreads(ctx, allThreads);
+  if (initialEnsure.addedIds.length > 0) {
+    allThreads = await mutateThreads(ctx, initialEnsure.addedIds, current => {
+      const reEnsured = ensureUserThreads(
+        current,
+        currentUserId,
+        agentId,
+        enrichedCollections,
+        entriesPreview,
+        boundEntry,
+      );
+      const retained = retainThreads(reEnsured.threads, [
+        ...initialEnsure.addedIds,
+        ...reEnsured.addedIds,
+      ]);
+      return { threads: retained, result: retained };
+    });
+  }
 
   const visibleThreads = allThreads.filter(t => isThreadVisibleToUser(t, currentUserId));
   const visibleConvIds = new Set(visibleThreads.map(t => t.conversationId));
@@ -1037,6 +1259,7 @@ export async function buildWorkspaceSnapshot(
     pairingCode,
     pairingCommand: isAdmin ? buildPairingCommandString(siteOrigin, pairingCode) : "",
     pairingPrompt: isAdmin ? buildPairingPromptString(siteOrigin, pairingCode) : "",
+    ...(connState.error ? { settingsError: connState.error } : {}),
     connection: connection
       ? {
           gatewayUrl: connection.gatewayUrl,
@@ -1216,7 +1439,8 @@ export async function openclawChatRoute(
   }
 
   if (action === "configure_connection" && role >= ADMIN) {
-    const existing = await readConnectionSettings(ctx);
+    const existingState = await readConnectionSettingsState(ctx);
+    const existing = existingState.connection;
     const collections = await listSiteCollections(ctx);
     const bridge = getHostGatewayBridge();
 
@@ -1244,6 +1468,14 @@ export async function openclawChatRoute(
       if (normalized.extractedToken) {
         extractedToken = normalized.extractedToken;
       }
+    }
+
+    if (existingState.error && !extractedToken) {
+      return {
+        ok: false,
+        error: "SETTINGS_READ_ERROR",
+        message: `${existingState.error} Provide a Gateway token explicitly to replace stored credentials.`,
+      };
     }
 
     const agentId = cleanInputText(input.agentId, 80) ?? existing?.agentId ?? "openclaw";
@@ -1281,7 +1513,9 @@ export async function openclawChatRoute(
 
     if (bridge && classifyTransportMode(gatewayUrl) === "gateway-ws") {
       await bridge.connect(updated, async patch => {
-        const latest = (await readConnectionSettings(ctx)) ?? updated;
+        const latestState = await readConnectionSettingsState(ctx);
+        if (latestState.error) return;
+        const latest = latestState.connection ?? updated;
         await persistConnectionSettings(ctx, {
           ...latest,
           ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
@@ -1308,11 +1542,14 @@ export async function openclawChatRoute(
   }
 
   if (action === "probe_gateway" && role >= ADMIN) {
-    const connection = await readConnectionSettings(ctx);
+    const connState = await readConnectionSettingsState(ctx);
+    const connection = connState.connection;
     const bridge = getHostGatewayBridge();
     if (connection && bridge && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
       await bridge.connect(connection, async patch => {
-        const latest = (await readConnectionSettings(ctx)) ?? connection;
+        const latestState = await readConnectionSettingsState(ctx);
+        if (latestState.error) return;
+        const latest = latestState.connection ?? connection;
         await persistConnectionSettings(ctx, {
           ...latest,
           ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
@@ -1344,13 +1581,15 @@ export async function openclawChatRoute(
   if (action === "toggle_automation" && role >= ADMIN) {
     const automationId = cleanInputText(input.automationId, 80);
     const collections = await listSiteCollections(ctx);
-    const automations = await loadAutomations(ctx, collections);
-    const next = automations.map(rule =>
-      rule.automationId === automationId ? { ...rule, enabled: !rule.enabled } : rule,
-    );
-    if (ctx.kv) {
-      await ctx.kv.set("openclaw_automations_v1", next);
-    }
+    await withOpenClawStorageLock("automations", async () => {
+      const automations = await loadAutomations(ctx, collections);
+      const next = automations.map(rule =>
+        rule.automationId === automationId ? { ...rule, enabled: !rule.enabled } : rule,
+      );
+      if (ctx.kv) {
+        await ctx.kv.set("openclaw_automations_v1", next);
+      }
+    });
     return (await buildWorkspaceSnapshot(
       route,
       ctx,
@@ -1362,7 +1601,6 @@ export async function openclawChatRoute(
   if (action === "create_thread") {
     const connection = await readConnectionSettings(ctx);
     const collections = await listSiteCollections(ctx);
-    const threads = await loadThreads(ctx);
     const title = cleanInputText(input.title, 120) ?? "New Store Conversation";
     const visibility = input.visibility === "shared" ? "shared" : "personal";
     const scopeGroup =
@@ -1383,7 +1621,10 @@ export async function openclawChatRoute(
       updatedAt: now,
       messages: [],
     };
-    await saveThreads(ctx, [newThread, ...threads]);
+    await mutateThreads(ctx, [convId], current => ({
+      threads: [newThread, ...current],
+      result: undefined,
+    }));
     return (await buildWorkspaceSnapshot(
       route,
       ctx,
@@ -1397,21 +1638,33 @@ export async function openclawChatRoute(
     if (targetId) {
       const connection = await readConnectionSettings(ctx);
       const bridge = getHostGatewayBridge();
-      const threads = await loadThreads(ctx);
-      const next = threads.map(t => {
-        if (t.conversationId !== targetId) return t;
-        if (t.ownerUserId && t.ownerUserId !== currentUserId && role < ADMIN) return t;
-        const nextVis: "personal" | "shared" =
-          t.visibility === "shared" ? "personal" : "shared";
-        const sessionKey =
-          t.sessionKey ?? buildCanonicalSessionKey(connection?.agentId ?? "openclaw", t.conversationId);
-        bridge?.updateSessionAudience(sessionKey, {
-          ownerUserId: t.ownerUserId ?? currentUserId,
-          visibility: nextVis,
+      const forbidden = await mutateThreads(ctx, [targetId], current => {
+        const existing = current.find(t => t.conversationId === targetId);
+        if (existing && existing.ownerUserId && existing.ownerUserId !== currentUserId && role < ADMIN) {
+          return { threads: current, result: true };
+        }
+        const next = current.map(t => {
+          if (t.conversationId !== targetId) return t;
+          const nextVis: "personal" | "shared" =
+            t.visibility === "shared" ? "personal" : "shared";
+          const sessionKey =
+            t.sessionKey ??
+            buildCanonicalSessionKey(connection?.agentId ?? "openclaw", t.conversationId);
+          bridge?.updateSessionAudience(sessionKey, {
+            ownerUserId: t.ownerUserId ?? currentUserId,
+            visibility: nextVis,
+          });
+          return { ...t, sessionKey, visibility: nextVis, updatedAt: new Date().toISOString() };
         });
-        return { ...t, sessionKey, visibility: nextVis, updatedAt: new Date().toISOString() };
+        return { threads: next, result: false };
       });
-      await saveThreads(ctx, next);
+      if (forbidden) {
+        return {
+          ok: false,
+          error: "FORBIDDEN",
+          message: "Only the conversation owner or an Administrator can change thread visibility.",
+        };
+      }
     }
     return (await buildWorkspaceSnapshot(
       route,
@@ -1425,22 +1678,41 @@ export async function openclawChatRoute(
     const proposalId = cleanInputText(input.proposalId, 120);
     const baseRev = cleanInputText(input.baseRev, 240);
     if (proposalId && baseRev) {
-      const proposals = await loadRevisionProposals(ctx);
-      const target = proposals.find(p => p.proposalId === proposalId);
-      if (target) {
-        const threads = await loadThreads(ctx);
+      await loadRevisionProposals(ctx);
+      const threads = await loadThreads(ctx);
+      const outcome = await withOpenClawStorageLock("proposals", async () => {
+        const proposals = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        const target = proposals.find(p => p.proposalId === proposalId);
+        if (!target) return { error: null as Record<string, unknown> | null };
         const owningThread = threads.find(t => t.conversationId === target.conversationId);
         if (owningThread && !isThreadVisibleToUser(owningThread, currentUserId)) {
           return {
-            ok: false,
-            error: "FORBIDDEN",
-            message: "Conversation access denied.",
+            error: {
+              ok: false,
+              error: "FORBIDDEN",
+              message: "Conversation access denied.",
+            },
           };
         }
         const now = new Date().toISOString();
         let updatedProposal: RevisionProposal | undefined;
 
         if (action === "rebase_proposal") {
+          if (
+            target.status !== "pending" &&
+            target.status !== "conflict" &&
+            target.status !== "failed"
+          ) {
+            return {
+              error: {
+                ok: false,
+                error: "PROPOSAL_NOT_PENDING",
+                message: `Proposal cannot be rebased because its status is "${target.status}".`,
+              },
+            };
+          }
           const { item } = await getSingleContentItem(
             ctx,
             target.collection,
@@ -1509,7 +1781,9 @@ export async function openclawChatRoute(
             ...resolveThreadAudience(threads, target.conversationId, currentUserId),
           });
         }
-      }
+        return { error: null };
+      });
+      if (outcome.error) return outcome.error;
     }
     return (await buildWorkspaceSnapshot(
       route,
@@ -1532,16 +1806,40 @@ export async function openclawChatRoute(
         ? (input.proposedFields as Record<string, unknown>)
         : undefined;
     if (proposalId && editedFields) {
-      const proposals = await loadRevisionProposals(ctx);
-      const parent = proposals.find(p => p.proposalId === proposalId);
-      if (parent && parent.status === "pending") {
-        const threads = await loadThreads(ctx);
+      await loadRevisionProposals(ctx);
+      const threads = await loadThreads(ctx);
+      const collections = await listSiteCollections(ctx);
+      const outcome = await withOpenClawStorageLock("proposals", async () => {
+        const proposals = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        const parent = proposals.find(p => p.proposalId === proposalId);
+        if (!parent) {
+          return {
+            error: {
+              ok: false,
+              error: "PROPOSAL_NOT_FOUND",
+              message: "Proposal no longer exists.",
+            } as Record<string, unknown>,
+          };
+        }
         const owningThread = threads.find(t => t.conversationId === parent.conversationId);
         if (owningThread && !isThreadVisibleToUser(owningThread, currentUserId)) {
           return {
-            ok: false,
-            error: "FORBIDDEN",
-            message: "Conversation access denied.",
+            error: {
+              ok: false,
+              error: "FORBIDDEN",
+              message: "Conversation access denied.",
+            } as Record<string, unknown>,
+          };
+        }
+        if (parent.status !== "pending" && parent.status !== "failed") {
+          return {
+            error: {
+              ok: false,
+              error: "PROPOSAL_NOT_PENDING",
+              message: `Proposal cannot be revised because its status is "${parent.status}".`,
+            } as Record<string, unknown>,
           };
         }
         const sanitizedPatch: Record<string, unknown> = {};
@@ -1552,21 +1850,32 @@ export async function openclawChatRoute(
         }
         if (Object.keys(sanitizedPatch).length === 0 || parent.entryId === "current") {
           return {
-            ok: false,
-            error: "NO_CONCRETE_PATCH",
-            message:
-              "Provide at least one draft-safe field edit on a concrete EmDash entry before revising.",
+            error: {
+              ok: false,
+              error: "NO_CONCRETE_PATCH",
+              message:
+                "Provide at least one draft-safe field edit on a concrete EmDash entry before revising.",
+            } as Record<string, unknown>,
           };
         }
-        const now = new Date().toISOString();
-        const nextProposalId = csprngId("prop_", 8);
-        const mergedFields = { ...parent.proposedFields, ...sanitizedPatch };
         const { item: storedEntry } = await getSingleContentItem(
           ctx,
           parent.collection,
           parent.entryId,
           parent.locale,
         );
+        if (!canCollectionStageDraft(collections, parent.collection, storedEntry?.status ?? "published")) {
+          return {
+            error: {
+              ok: false,
+              error: "REVISIONS_NOT_SUPPORTED",
+              message: `Collection "${parent.collection}" does not support staging drafts for ${storedEntry?.status ?? "published"} entries — saving would modify live content immediately.`,
+            } as Record<string, unknown>,
+          };
+        }
+        const now = new Date().toISOString();
+        const nextProposalId = csprngId("prop_", 8);
+        const mergedFields = { ...parent.proposedFields, ...sanitizedPatch };
         const existingDiffFields = new Set(parent.diffs.map(d => d.field));
         const updatedExistingDiffs = parent.diffs
           .filter(d => d.field in mergedFields)
@@ -1613,6 +1922,7 @@ export async function openclawChatRoute(
           proposedFields: mergedFields,
           diffs: nextDiffs,
           status: "pending",
+          errorMessage: undefined,
           decidedByUserId: currentUserId,
           createdAt: now,
           updatedAt: now,
@@ -1631,31 +1941,49 @@ export async function openclawChatRoute(
           ),
         ];
         await saveRevisionProposals(ctx, nextList);
+        return {
+          error: null,
+          revised,
+          parentId: parent.proposalId,
+          conversationId: parent.conversationId,
+          now,
+        };
+      });
 
-        // Also attach the revised proposalId to the conversation turn so it stays inline in chat
-        const updatedThreads = threads.map(t => {
-          if (t.conversationId !== parent.conversationId) return t;
-          return {
-            ...t,
-            messages: t.messages.map(m =>
-              m.proposalIds?.includes(parent.proposalId)
-                ? {
-                    ...m,
-                    proposalIds: m.proposalIds.map(id =>
-                      id === parent.proposalId ? nextProposalId : id,
-                    ),
-                  }
-                : m,
-            ),
-          };
-        });
-        await saveThreads(ctx, updatedThreads);
+      if (outcome.error) {
+        return outcome.error;
+      }
+
+      if (outcome.revised) {
+        const updatedThreads = await mutateThreads(
+          ctx,
+          [outcome.conversationId],
+          current => {
+            const next = current.map(t => {
+              if (t.conversationId !== outcome.conversationId) return t;
+              return {
+                ...t,
+                messages: t.messages.map(m =>
+                  m.proposalIds?.includes(outcome.parentId)
+                    ? {
+                        ...m,
+                        proposalIds: m.proposalIds.map(id =>
+                          id === outcome.parentId ? outcome.revised.proposalId : id,
+                        ),
+                      }
+                    : m,
+                ),
+              };
+            });
+            return { threads: next, result: next };
+          },
+        );
 
         publishOpenClawEvent({
           type: "proposal_updated",
-          proposal: revised,
-          timestamp: now,
-          ...resolveThreadAudience(updatedThreads, parent.conversationId, currentUserId),
+          proposal: outcome.revised,
+          timestamp: outcome.now,
+          ...resolveThreadAudience(updatedThreads, outcome.conversationId, currentUserId),
         });
         return {
           ...((await buildWorkspaceSnapshot(
@@ -1664,7 +1992,7 @@ export async function openclawChatRoute(
             preferredConversationId,
             boundEntry,
           )) as unknown as Record<string, unknown>),
-          revisedProposalId: nextProposalId,
+          revisedProposalId: outcome.revised.proposalId,
         };
       }
     }
@@ -1676,46 +2004,252 @@ export async function openclawChatRoute(
     )) as unknown as Record<string, unknown>;
   }
 
+  /**
+   * Server-side pre-apply fence (`Pending | Failed -> Applying`):
+   * Prevents stale tabs from applying already-rejected/superseded/applied proposals
+   * and blocks collections where `PUT` would mutate live published content directly.
+   */
+  if (action === "begin_apply_proposal") {
+    const proposalId = cleanInputText(input.proposalId, 120);
+    const expectedRev = cleanInputText(input.expectedRev, 240);
+    if (!proposalId) {
+      return {
+        ok: false,
+        error: "INVALID_PROPOSAL",
+        message: "Proposal ID is required.",
+      };
+    }
+
+    await loadRevisionProposals(ctx);
+    const threads = await loadThreads(ctx);
+    const collections = await listSiteCollections(ctx);
+
+    const outcome = await withOpenClawStorageLock("proposals", async () => {
+      const proposals = ctx.kv
+        ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+        : [];
+      const target = proposals.find(p => p.proposalId === proposalId);
+      if (!target) {
+        return {
+          error: {
+            ok: false,
+            error: "PROPOSAL_NOT_FOUND",
+            message: "Proposal no longer exists.",
+          } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+      const owningThread = threads.find(t => t.conversationId === target.conversationId);
+      if (owningThread && !isThreadVisibleToUser(owningThread, currentUserId)) {
+        return {
+          error: {
+            ok: false,
+            error: "FORBIDDEN",
+            message: "Conversation access denied.",
+          } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+      if (Object.keys(target.proposedFields ?? {}).length === 0 || target.entryId === "current") {
+        return {
+          error: {
+            ok: false,
+            error: "NO_CONCRETE_PATCH",
+            message: "Summary-only proposal has no concrete field patch and cannot be applied.",
+          } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+      if (target.status !== "pending" && target.status !== "failed") {
+        return {
+          error: {
+            ok: false,
+            error: "PROPOSAL_NOT_PENDING",
+            message: `Proposal cannot be applied because its status is "${target.status}".`,
+          } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+
+      const baseCheck = await doesStoredEntryMatchProposalBase(ctx, target);
+      const entryStatus = baseCheck.item?.status ?? "published";
+      if (!canCollectionStageDraft(collections, target.collection, entryStatus)) {
+        return {
+          error: {
+            ok: false,
+            error: "REVISIONS_NOT_SUPPORTED",
+            message: `Collection "${target.collection}" does not support staging drafts for ${entryStatus} entries — saving would modify live content immediately.`,
+          } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+
+      const hasOpaqueTargetRev =
+        Boolean(target.baseRev) &&
+        !target.baseRev.startsWith("v") &&
+        target.baseRev !== "pending-browser-rev";
+      const revMismatch =
+        Boolean(expectedRev) && hasOpaqueTargetRev && target.baseRev !== expectedRev;
+
+      const now = new Date().toISOString();
+      if ((baseCheck.checked && !baseCheck.matches) || revMismatch) {
+        let conflicted: RevisionProposal | undefined;
+        const next = proposals.map(p => {
+          if (p.proposalId !== proposalId) return p;
+          conflicted = {
+            ...p,
+            status: "conflict",
+            conflictRev: expectedRev ?? baseCheck.item?._rev,
+            errorMessage: "Entry was modified by another save since this proposal was created.",
+            updatedAt: now,
+          };
+          return conflicted;
+        });
+        await saveRevisionProposals(ctx, next);
+        if (conflicted) {
+          publishOpenClawEvent({
+            type: "proposal_updated",
+            proposal: conflicted,
+            timestamp: now,
+            ...resolveThreadAudience(threads, target.conversationId, currentUserId),
+          });
+        }
+        return { error: null, applyReady: false };
+      }
+
+      let applying: RevisionProposal | undefined;
+      const next = proposals.map(p => {
+        if (p.proposalId !== proposalId) return p;
+        applying = {
+          ...p,
+          status: "applying",
+          decidedByUserId: currentUserId,
+          ...(expectedRev ? { baseRev: expectedRev } : {}),
+          errorMessage: undefined,
+          updatedAt: now,
+        };
+        return applying;
+      });
+      await saveRevisionProposals(ctx, next);
+      if (applying) {
+        publishOpenClawEvent({
+          type: "proposal_updated",
+          proposal: applying,
+          timestamp: now,
+          ...resolveThreadAudience(threads, target.conversationId, currentUserId),
+        });
+      }
+      return { error: null, applyReady: true };
+    });
+
+    if (outcome.error) {
+      return outcome.error;
+    }
+
+    return {
+      ...((await buildWorkspaceSnapshot(
+        route,
+        ctx,
+        preferredConversationId,
+        boundEntry,
+      )) as unknown as Record<string, unknown>),
+      applyReady: outcome.applyReady,
+    };
+  }
+
   if (action === "record_proposal_receipt" || action === "reconcile_proposal") {
     const proposalId = cleanInputText(input.proposalId, 120);
     const statusRaw = cleanInputText(input.status, 40) as ProposalLifecycleStatus | undefined;
     const appliedRev = cleanInputText(input.appliedRev, 240);
+    const observedRev = cleanInputText(input.observedRev, 240);
     const conflictRev = cleanInputText(input.conflictRev, 240);
     const baseRev = cleanInputText(input.baseRev, 240);
     const errorMessage = cleanInputText(input.errorMessage, 400);
+    const clientVerifiedMatch =
+      typeof input.clientVerifiedMatch === "boolean" ? input.clientVerifiedMatch : undefined;
 
     if (proposalId) {
-      const proposals = await loadRevisionProposals(ctx);
-      const target = proposals.find(p => p.proposalId === proposalId);
-      if (target) {
-        const threads = await loadThreads(ctx);
+      await loadRevisionProposals(ctx);
+      const threads = await loadThreads(ctx);
+      const outcome = await withOpenClawStorageLock("proposals", async () => {
+        const proposals = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        const target = proposals.find(p => p.proposalId === proposalId);
+        if (!target) return { error: null as Record<string, unknown> | null };
         const owningThread = threads.find(t => t.conversationId === target.conversationId);
         if (owningThread && !isThreadVisibleToUser(owningThread, currentUserId)) {
           return {
-            ok: false,
-            error: "FORBIDDEN",
-            message: "Conversation access denied.",
+            error: {
+              ok: false,
+              error: "FORBIDDEN",
+              message: "Conversation access denied.",
+            },
           };
         }
+
+        if (action === "record_proposal_receipt") {
+          if (
+            statusRaw === "rejected" &&
+            target.status !== "pending" &&
+            target.status !== "conflict" &&
+            target.status !== "failed"
+          ) {
+            return {
+              error: {
+                ok: false,
+                error: "PROPOSAL_ALREADY_FINALIZED",
+                message: `Proposal cannot be rejected because its status is "${target.status}".`,
+              },
+            };
+          }
+          if (
+            statusRaw === "applied" &&
+            (target.status === "rejected" || target.status === "superseded")
+          ) {
+            return {
+              error: {
+                ok: false,
+                error: "PROPOSAL_NOT_PENDING",
+                message: `Proposal cannot be marked applied because its status is "${target.status}".`,
+              },
+            };
+          }
+        } else if (
+          target.status === "rejected" ||
+          target.status === "superseded"
+        ) {
+          return {
+            error: {
+              ok: false,
+              error: "PROPOSAL_NOT_PENDING",
+              message: `Proposal cannot be reconciled because its status is "${target.status}".`,
+            },
+          };
+        }
+
         let verifiedStatus: ProposalLifecycleStatus =
           action === "reconcile_proposal" ? target.status : (statusRaw ?? target.status);
         let reconciledServerSide = target.reconciledServerSide;
         let finalError = errorMessage;
+        let finalAppliedRev = appliedRev;
 
         if (
           (verifiedStatus === "applied" || verifiedStatus === "outcome_unknown") &&
           Object.keys(target.proposedFields ?? {}).length === 0
         ) {
           return {
-            ok: false,
-            error: "NO_CONCRETE_PATCH",
-            message:
-              "Summary-only proposal has no concrete field patch and cannot be marked applied.",
+            error: {
+              ok: false,
+              error: "NO_CONCRETE_PATCH",
+              message:
+                "Summary-only proposal has no concrete field patch and cannot be marked applied.",
+            },
           };
         }
 
         // Server-side content reconciliation: never trust a browser `applied` claim if stored CMS fields disagree,
-        // and recover `outcome_unknown` automatically if the PUT landed before the network dropped!
+        // and recover `outcome_unknown` / interrupted `applying` saves deterministically!
         if (
           verifiedStatus === "applied" ||
           verifiedStatus === "outcome_unknown" ||
@@ -1736,6 +2270,17 @@ export async function openclawChatRoute(
               finalError =
                 "Stored EmDash entry still has prior content — the interrupted save did not apply. Safe to retry.";
             }
+          } else if (action === "reconcile_proposal" && clientVerifiedMatch !== undefined) {
+            reconciledServerSide = false;
+            if (clientVerifiedMatch) {
+              verifiedStatus = "applied";
+              finalAppliedRev = finalAppliedRev ?? observedRev;
+              finalError = undefined;
+            } else {
+              verifiedStatus = "pending";
+              finalError =
+                "Stored EmDash draft still has prior content — the interrupted save did not apply. Safe to retry.";
+            }
           }
         }
 
@@ -1748,7 +2293,7 @@ export async function openclawChatRoute(
             decidedByUserId: currentUserId,
             ...(reconciledServerSide !== undefined ? { reconciledServerSide } : {}),
             ...(baseRev ? { baseRev } : {}),
-            ...(appliedRev ? { appliedRev } : {}),
+            ...(finalAppliedRev ? { appliedRev: finalAppliedRev } : {}),
             ...(conflictRev ? { conflictRev } : {}),
             errorMessage: finalError,
             updatedAt: new Date().toISOString(),
@@ -1764,7 +2309,9 @@ export async function openclawChatRoute(
             ...resolveThreadAudience(threads, target.conversationId, currentUserId),
           });
         }
-      }
+        return { error: null };
+      });
+      if (outcome.error) return outcome.error;
     }
     return (await buildWorkspaceSnapshot(
       route,
@@ -1776,7 +2323,7 @@ export async function openclawChatRoute(
 
   /**
    * Dual-Authority Gateway Execution Approval resolution (Section 4):
-   *CMS draft permission (`content:edit_any`) NEVER automatically grants Gateway
+   * CMS draft permission (`content:edit_any`) NEVER automatically grants Gateway
    * execution approval authority. Requires Site Admin (`role >= ADMIN`),
    * explicit `allowGatewayExecApprovals` opt-in, and `operator.approvals` scope.
    */
@@ -1826,21 +2373,17 @@ export async function openclawChatRoute(
       decision,
       resolvedByUserId: currentUserId,
     });
+
+    if (res.approval) {
+      await upsertPersistedExecApprovals(ctx, [res.approval]);
+    }
+
     if (!res.ok) {
       return {
         ok: false,
         error: "GATEWAY_APPROVAL_FAILED",
         message: res.error ?? "Gateway rejected approval resolution.",
       };
-    }
-
-    if (res.approval) {
-      const persisted = await loadPersistedExecApprovals(ctx);
-      const next = [
-        res.approval,
-        ...persisted.filter(a => a.approvalId !== res.approval!.approvalId),
-      ];
-      await savePersistedExecApprovals(ctx, next);
     }
 
     return (await buildWorkspaceSnapshot(
@@ -1854,43 +2397,55 @@ export async function openclawChatRoute(
   if (action === "stop_turn") {
     const connection = await readConnectionSettings(ctx);
     const bridge = getHostGatewayBridge();
-    const threads = await loadThreads(ctx);
-    const target = threads.find(
+    const initialThreads = await loadThreads(ctx);
+    const target = initialThreads.find(
       t =>
         isThreadVisibleToUser(t, currentUserId) &&
         (!preferredConversationId || t.conversationId === preferredConversationId),
     );
-    if (
-      target &&
-      connection &&
-      bridge &&
-      classifyTransportMode(connection.gatewayUrl) === "gateway-ws"
-    ) {
-      await bridge.abortTurn({
+    if (target && connection && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
+      if (!bridge) {
+        return {
+          ok: false,
+          error: "STOP_FAILED",
+          message: "Gateway WebSocket bridge is unavailable.",
+        };
+      }
+      const abortRes = await bridge.abortTurn({
         connection,
         sessionKey:
           target.sessionKey ?? buildCanonicalSessionKey(connection.agentId, target.conversationId),
         runId: target.activeRunId,
       });
+      if (!abortRes.ok) {
+        return {
+          ok: false,
+          error: "STOP_FAILED",
+          message: abortRes.error ?? "Gateway could not abort the active run.",
+        };
+      }
     }
 
-    const next = threads.map(t => {
-      if (!isThreadVisibleToUser(t, currentUserId)) return t;
-      if (preferredConversationId && t.conversationId !== preferredConversationId) return t;
-      return {
-        ...t,
-        status: "stopped" as const,
-        activeRunId: undefined,
-        runPhase: undefined,
-        updatedAt: new Date().toISOString(),
-        messages: t.messages.map(m =>
-          m.status === "streaming" || m.status === "queued"
-            ? { ...m, status: "stopped" as const }
-            : m,
-        ),
-      };
+    const targetId = target?.conversationId ?? preferredConversationId;
+    await mutateThreads(ctx, targetId ? [targetId] : [], current => {
+      const next = current.map(t => {
+        if (!isThreadVisibleToUser(t, currentUserId)) return t;
+        if (targetId && t.conversationId !== targetId) return t;
+        return {
+          ...t,
+          status: "stopped" as const,
+          activeRunId: undefined,
+          runPhase: undefined,
+          updatedAt: new Date().toISOString(),
+          messages: t.messages.map(m =>
+            m.status === "streaming" || m.status === "queued"
+              ? { ...m, status: "stopped" as const }
+              : m,
+          ),
+        };
+      });
+      return { threads: next, result: undefined };
     });
-    await saveThreads(ctx, next);
     if (ctx.kv) await ctx.kv.delete("active_turn");
     return (await buildWorkspaceSnapshot(
       route,
@@ -1910,9 +2465,10 @@ export async function openclawChatRoute(
       };
     }
 
-    let connection = await readConnectionSettings(ctx);
+    const connState = await readConnectionSettingsState(ctx);
+    let connection = connState.connection;
     const collections = await listSiteCollections(ctx);
-    if (!connection && role >= ADMIN) {
+    if (!connection && !connState.error && role >= ADMIN) {
       connection = {
         gatewayUrl: "https://agent-session.openclaw.local",
         agentId: "openclaw",
@@ -1936,21 +2492,6 @@ export async function openclawChatRoute(
     const userMsgId = csprngId("msg_u_", 6);
     const assistantMsgId = csprngId("msg_a_", 6);
 
-    let allThreads = await loadThreads(ctx);
-    allThreads = ensureUserThreads(allThreads, currentUserId, agentId, collections, [], boundEntry);
-    const visibleThreads = allThreads.filter(t => isThreadVisibleToUser(t, currentUserId));
-    const targetThread =
-      (preferredConversationId
-        ? visibleThreads.find(t => t.conversationId === preferredConversationId)
-        : undefined) ?? visibleThreads[0]!;
-    const targetConvId = targetThread.conversationId;
-    const sessionKey =
-      targetThread.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
-    const audience = {
-      ownerUserId: targetThread.ownerUserId ?? currentUserId,
-      visibility: targetThread.visibility ?? ("personal" as const),
-    };
-
     const userMsg: ChatTurnMessage = {
       messageId: userMsgId,
       role: "user",
@@ -1965,22 +2506,57 @@ export async function openclawChatRoute(
       createdAt: now,
       status: "streaming",
     };
-    const startedThreads = allThreads.map(t => {
-      if (t.conversationId !== targetConvId) return t;
-      const autoTitle =
-        t.messages.length === 0 && t.title === "New Store Conversation"
-          ? prompt.slice(0, 42) + (prompt.length > 42 ? "…" : "")
-          : t.title;
+
+    const startedInfo = await mutateThreads(ctx, [], current => {
+      const ensured = ensureUserThreads(
+        current,
+        currentUserId,
+        agentId,
+        collections,
+        [],
+        boundEntry,
+      );
+      const visible = ensured.threads.filter(t => isThreadVisibleToUser(t, currentUserId));
+      const targetThread =
+        (preferredConversationId
+          ? visible.find(t => t.conversationId === preferredConversationId)
+          : undefined) ?? visible[0]!;
+      const targetConvId = targetThread.conversationId;
+      const sessionKey =
+        targetThread.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
+      const next = ensured.threads.map(t => {
+        if (t.conversationId !== targetConvId) return t;
+        const autoTitle =
+          t.messages.length === 0 && t.title === "New Store Conversation"
+            ? prompt.slice(0, 42) + (prompt.length > 42 ? "…" : "")
+            : t.title;
+        return {
+          ...t,
+          sessionKey,
+          title: autoTitle,
+          status: "running" as const,
+          updatedAt: now,
+          messages: [...t.messages, userMsg, placeholderAssistantMsg],
+        };
+      });
+      const retained = retainThreads(next, [targetConvId, ...ensured.addedIds]);
       return {
-        ...t,
-        sessionKey,
-        title: autoTitle,
-        status: "running" as const,
-        updatedAt: now,
-        messages: [...t.messages, userMsg, placeholderAssistantMsg],
+        threads: retained,
+        result: {
+          targetThread,
+          targetConvId,
+          sessionKey,
+          initialAudience: {
+            ownerUserId: targetThread.ownerUserId ?? currentUserId,
+            visibility: targetThread.visibility ?? ("personal" as const),
+          },
+        },
       };
     });
-    await saveThreads(ctx, startedThreads);
+
+    const { targetThread, targetConvId, sessionKey } = startedInfo;
+    const readLiveAudience = async () =>
+      resolveThreadAudience(await loadThreads(ctx), targetConvId, currentUserId);
 
     publishOpenClawEvent({
       type: "turn_started",
@@ -1988,7 +2564,7 @@ export async function openclawChatRoute(
       messageId: assistantMsgId,
       prompt,
       timestamp: now,
-      ...audience,
+      ...startedInfo.initialAudience,
     });
 
     const toolCalls: ToolCallTrace[] = [];
@@ -2027,13 +2603,14 @@ export async function openclawChatRoute(
           : null,
       };
       toolCalls.push(trace);
+      const toolAudience = await readLiveAudience();
       publishOpenClawEvent({
         type: "tool_call",
         conversationId: targetConvId,
         messageId: assistantMsgId,
         toolCall: trace,
         timestamp: new Date().toISOString(),
-        ...audience,
+        ...toolAudience,
       });
       if (item) gatheredEntries.push(item);
     }
@@ -2073,13 +2650,14 @@ export async function openclawChatRoute(
         })),
       };
       toolCalls.push(trace);
+      const listAudience = await readLiveAudience();
       publishOpenClawEvent({
         type: "tool_call",
         conversationId: targetConvId,
         messageId: assistantMsgId,
         toolCall: trace,
         timestamp: new Date().toISOString(),
-        ...audience,
+        ...listAudience,
       });
     }
 
@@ -2117,11 +2695,13 @@ export async function openclawChatRoute(
           "Gateway WebSocket URL is configured, but the host Node bridge (`openclawBridge()`) is not mounted in this profile.";
         turnFinalStatus = "failed";
       } else {
+        const preSendAudience = await readLiveAudience();
         const gwResult = await bridge.sendTurn({
           connection,
           conversationId: targetConvId,
-          ownerUserId: targetThread.ownerUserId,
-          visibility: targetThread.visibility,
+          ownerUserId: preSendAudience.ownerUserId,
+          visibility: preSendAudience.visibility,
+          resolveLatestAudience: readLiveAudience,
           messageId: assistantMsgId,
           sessionKey,
           prompt,
@@ -2129,7 +2709,9 @@ export async function openclawChatRoute(
           steer: action === "steer_turn",
           expectedRunId: targetThread.activeRunId,
           onDeviceCredentialsUpdated: async patch => {
-            const latest = (await readConnectionSettings(ctx)) ?? connection!;
+            const latestState = await readConnectionSettingsState(ctx);
+            if (latestState.error) return;
+            const latest = latestState.connection ?? connection!;
             await persistConnectionSettings(ctx, {
               ...latest,
               ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
@@ -2146,10 +2728,7 @@ export async function openclawChatRoute(
           createdExecApprovals.push(gwApproval);
         }
         if (createdExecApprovals.length > 0) {
-          const persisted = await loadPersistedExecApprovals(ctx);
-          const byId = new Map(persisted.map(a => [a.approvalId, a]));
-          for (const a of createdExecApprovals) byId.set(a.approvalId, a);
-          await savePersistedExecApprovals(ctx, [...byId.values()]);
+          await upsertPersistedExecApprovals(ctx, createdExecApprovals);
         }
 
         if (!gwResult.ok && gwResult.status === "failed") {
@@ -2172,7 +2751,12 @@ export async function openclawChatRoute(
             );
             assistantReply = parsed.cleanedText;
             for (const p of parsed.proposals) {
-              createdProposals.push(p);
+              const targetEntry = gatheredEntries.find(
+                e => e.collection === p.collection && e.id === p.entryId,
+              );
+              if (canCollectionStageDraft(collections, p.collection, targetEntry?.status ?? "published")) {
+                createdProposals.push(p);
+              }
             }
           } else {
             assistantReply = gwResult.replyText;
@@ -2202,7 +2786,16 @@ export async function openclawChatRoute(
           ) ?? gatheredEntries[0];
       }
 
-      if (isMutationIntent && matchedEntry && authorityMode === "propose_with_approval") {
+      const canStageMatchedDraft = matchedEntry
+        ? canCollectionStageDraft(collections, matchedEntry.collection, matchedEntry.status)
+        : true;
+
+      if (
+        isMutationIntent &&
+        matchedEntry &&
+        authorityMode === "propose_with_approval" &&
+        canStageMatchedDraft
+      ) {
         const cleanPrompt = prompt.replace(/^\/propose\s*/i, "").trim() || "Refine copy";
         const proposal = buildSmartFieldProposal(
           matchedEntry,
@@ -2226,6 +2819,17 @@ export async function openclawChatRoute(
           `I inspected **${matchedEntry?.title ?? "your store content"}**, but \`@${agentId}\` is currently in **Read-Only** authority mode.`,
           ``,
           `Switch authority to **Read + Propose (\`propose_with_approval\`)** in the composer bar or **Customizations** to queue a revision-fenced EmDash draft card — I never write directly to your database without your approval.`,
+        ].join("\n");
+      } else if (
+        isMutationIntent &&
+        matchedEntry &&
+        authorityMode === "propose_with_approval" &&
+        !canStageMatchedDraft
+      ) {
+        assistantReply = [
+          `I inspected **${matchedEntry.title}** (\`${matchedEntry.collection}/${matchedEntry.slug}\`), which is currently \`${matchedEntry.status}\`.`,
+          ``,
+          `Collection \`${matchedEntry.collection}\` does not have \`revisions\` enabled, so staging a draft save would modify live content immediately. Enable \`revisions\` on \`${matchedEntry.collection}\` or edit this entry directly in EmDash Admin.`,
         ].join("\n");
       } else if (createdProposals.length > 0 && matchedEntry) {
         const prop = createdProposals[0]!;
@@ -2270,8 +2874,7 @@ export async function openclawChatRoute(
         ].join("\n");
       }
 
-      const streamThreads = await loadThreads(ctx);
-      const streamAudience = resolveThreadAudience(streamThreads, targetConvId, currentUserId);
+      const streamAudience = await readLiveAudience();
       const chunks = assistantReply.match(/.{1,80}(\s|$)/gs) ?? [assistantReply];
       let acc = "";
       for (const chunk of chunks) {
@@ -2314,44 +2917,49 @@ export async function openclawChatRoute(
       execApprovalIds: createdExecApprovals.map(a => a.approvalId),
     };
 
-    const latestThreads = await loadThreads(ctx);
-    const baseThreads = latestThreads.some(t => t.conversationId === targetConvId)
-      ? latestThreads
-      : startedThreads;
-    const updatedThreads = baseThreads.map(t => {
-      if (t.conversationId !== targetConvId) return t;
-      const hasPlaceholder = t.messages.some(m => m.messageId === assistantMsgId);
-      const mergedAssistant: ChatTurnMessage =
-        t.status === "stopped" && turnFinalStatus === "completed" && !assistantReply
-          ? { ...assistantMsg, status: "stopped" }
-          : assistantMsg;
-      const nextMessages = hasPlaceholder
-        ? t.messages.map(m => (m.messageId === assistantMsgId ? mergedAssistant : m))
-        : [...t.messages, userMsg, mergedAssistant];
-      const stillStreaming = nextMessages.some(m => m.status === "streaming");
-      const nextStatus = stillStreaming
-        ? ("running" as const)
-        : turnFinalStatus === "failed"
-          ? ("failed" as const)
-          : turnFinalStatus === "stopped" || t.status === "stopped"
-            ? ("stopped" as const)
-            : ("idle" as const);
-      return {
-        ...t,
-        sessionKey,
-        status: nextStatus,
-        ...(stillStreaming ? {} : { activeRunId: undefined, runPhase: undefined }),
-        updatedAt: new Date().toISOString(),
-        messages: nextMessages,
-      };
+    const updatedThreads = await mutateThreads(ctx, [targetConvId], current => {
+      const hasTarget = current.some(t => t.conversationId === targetConvId);
+      const source = hasTarget ? current : [{ ...targetThread, messages: [userMsg] }, ...current];
+      const next = source.map(t => {
+        if (t.conversationId !== targetConvId) return t;
+        const hasPlaceholder = t.messages.some(m => m.messageId === assistantMsgId);
+        const mergedAssistant: ChatTurnMessage =
+          t.status === "stopped" && turnFinalStatus === "completed" && !assistantReply
+            ? { ...assistantMsg, status: "stopped" }
+            : assistantMsg;
+        const nextMessages = hasPlaceholder
+          ? t.messages.map(m => (m.messageId === assistantMsgId ? mergedAssistant : m))
+          : [...t.messages, userMsg, mergedAssistant];
+        const stillStreaming = nextMessages.some(m => m.status === "streaming");
+        const nextStatus = stillStreaming
+          ? ("running" as const)
+          : turnFinalStatus === "failed"
+            ? ("failed" as const)
+            : turnFinalStatus === "stopped" || t.status === "stopped"
+              ? ("stopped" as const)
+              : ("idle" as const);
+        return {
+          ...t,
+          sessionKey,
+          status: nextStatus,
+          ...(stillStreaming ? {} : { activeRunId: undefined, runPhase: undefined }),
+          updatedAt: new Date().toISOString(),
+          messages: nextMessages,
+        };
+      });
+      return { threads: next, result: next };
     });
-    await saveThreads(ctx, updatedThreads);
 
     const finalAudience = resolveThreadAudience(updatedThreads, targetConvId, currentUserId);
 
     if (createdProposals.length > 0) {
-      const existingProposals = await loadRevisionProposals(ctx);
-      await saveRevisionProposals(ctx, [...createdProposals, ...existingProposals]);
+      await loadRevisionProposals(ctx);
+      await withOpenClawStorageLock("proposals", async () => {
+        const fresh = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        await saveRevisionProposals(ctx, [...createdProposals, ...fresh]);
+      });
       for (const proposal of createdProposals) {
         publishOpenClawEvent({
           type: "proposal_updated",

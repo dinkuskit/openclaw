@@ -3,6 +3,13 @@ import assert from "node:assert/strict";
 import { createPlugin, openclawNativePlugin } from "../dist/native.mjs";
 import { openclawBridge } from "../dist/astro.mjs";
 import { GET as streamGet } from "../dist/stream-endpoint.mjs";
+import pluginSandbox from "../dist/plugin.mjs";
+import {
+  applyRevisionProposal,
+  connectOpenClawEventStream,
+  fetchLiveEntryWithRev,
+  reconcileUnknownProposal,
+} from "../.tmp/solid-build/emdash-client.mjs";
 
 function createStoreFixtures() {
   return {
@@ -639,4 +646,547 @@ test("enforces admin-only pairing codes, private proposal SSE, base-rev conflict
     t => t.conversationId === editorSnap.activeConversationId,
   );
   assert.ok(finalAliceThread.messages.some(m => /Atelier Field Jacket/.test(m.content)));
+});
+
+test("browser emdash-client preserves /compare staged drafts, enforces revision capabilities, blocks stale-tab applies, and reconciles interrupted saves", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+  const itemsByCollection = createStoreFixtures();
+  itemsByCollection.banners = [
+    {
+      id: "ban_01",
+      slug: "summer-banner",
+      status: "published",
+      version: 1,
+      data: { title: "Summer Sale", excerpt: "Live banner text" },
+    },
+  ];
+  const collections = [
+    { slug: "products", label: "Products", supports: ["drafts", "revisions"] },
+    { slug: "banners", label: "Banners", supports: ["drafts"] },
+  ];
+
+  // EmDash 1.4.0: GET /content/products/prod_01 returns live fields while /compare returns staged draft
+  itemsByCollection.products[0].liveRevisionId = "rev_live_1";
+  itemsByCollection.products[0].draftRevisionId = "rev_draft_2";
+  let stagedDraft = {
+    title: "Unpublished Staged Jacket Title",
+    excerpt: "Waxed organic cotton jacket.",
+    _internalMeta: "strip_me",
+  };
+  const putPayloads = [];
+  let activeTabUser = "u_admin";
+
+  const makeEmDash140Ctx = input => {
+    const ctx = createNativeRouteCtx({
+      userId: activeTabUser,
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      collections,
+      itemsByCollection,
+      input,
+    });
+    // Simulate EmDash 1.4.0 plugin runtime where ctx.content.getRevision is absent
+    delete ctx.content.getRevision;
+    return ctx;
+  };
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (urlRaw, init = {}) => {
+    const url = String(urlRaw);
+    const method = (init.method ?? "GET").toUpperCase();
+
+    if (url.endsWith("/_emdash/api/plugins/dinkus-openclaw/chat")) {
+      const body = JSON.parse(String(init.body ?? "{}"));
+      const data = await chat(makeEmDash140Ctx(body));
+      return Response.json({ success: true, data });
+    }
+
+    const schemaMatch = url.match(/\/_emdash\/api\/schema\/collections\/([^?]+)/);
+    if (schemaMatch && method === "GET") {
+      const slug = decodeURIComponent(schemaMatch[1]);
+      const col = collections.find(c => c.slug === slug);
+      return Response.json({
+        success: true,
+        data: { item: { slug, supports: col?.supports ?? [] } },
+      });
+    }
+
+    const compareMatch = url.match(/\/_emdash\/api\/content\/([^/]+)\/([^/?]+)\/compare/);
+    if (compareMatch && method === "GET") {
+      return Response.json({
+        success: true,
+        data: { hasChanges: true, draft: stagedDraft },
+      });
+    }
+
+    const contentMatch = url.match(/\/_emdash\/api\/content\/([^/]+)\/([^/?]+)/);
+    if (contentMatch && method === "GET") {
+      const [, colSlug, id] = contentMatch;
+      const item = (itemsByCollection[colSlug] ?? []).find(i => i.id === id);
+      return Response.json({
+        success: true,
+        data: { item: structuredClone(item), _rev: `opaque_${colSlug}_${item.version}` },
+      });
+    }
+
+    if (contentMatch && method === "PUT") {
+      const [, colSlug, id] = contentMatch;
+      const parsed = JSON.parse(String(init.body ?? "{}"));
+      putPayloads.push({ colSlug, id, parsed });
+      stagedDraft = { ...parsed.data };
+      const item = (itemsByCollection[colSlug] ?? []).find(i => i.id === id);
+      item.version += 1;
+      item.draftRevisionId = `rev_draft_${item.version}`;
+      return Response.json({
+        success: true,
+        data: { item, _rev: `opaque_${colSlug}_${item.version}` },
+      });
+    }
+
+    throw new Error(`Unexpected fetch in test: ${method} ${url}`);
+  };
+
+  try {
+    // 1. Apply proposal on published entry with existing staged draft: /compare draft fields MUST be preserved!
+    const turn = await chat(
+      makeEmDash140Ctx({
+        action: "send_message",
+        prompt: 'Propose an updated excerpt for Atelier Field Jacket to "Preserved Draft Excerpt"',
+      }),
+    );
+    const prop = turn.proposals[0];
+    assert.ok(prop);
+
+    const fetched = await fetchLiveEntryWithRev("products", "prod_01");
+    assert.equal(fetched.item.data.title, "Unpublished Staged Jacket Title");
+    assert.equal("_internalMeta" in fetched.item.data, false);
+
+    const appliedSnap = await applyRevisionProposal(prop);
+    assert.equal(putPayloads.length, 1);
+    assert.equal(
+      putPayloads[0].parsed.data.title,
+      "Unpublished Staged Jacket Title",
+      "Existing staged draft title must not be overwritten with older live title",
+    );
+    assert.equal(putPayloads[0].parsed.data.excerpt, "Preserved Draft Excerpt");
+    assert.equal(
+      appliedSnap.proposals.find(p => p.proposalId === prop.proposalId)?.status,
+      "applied",
+    );
+
+    // 2. Collection WITHOUT `revisions` on a published entry MUST NOT send PUT to live content!
+    const bannerProposal = {
+      proposalId: "prop_banner_live_1",
+      revisionNumber: 1,
+      conversationId: turn.activeConversationId,
+      agentId: "openclaw",
+      collection: "banners",
+      entryId: "ban_01",
+      entrySlug: "summer-banner",
+      entryTitle: "Summer Sale",
+      baseRev: "opaque_banners_1",
+      summary: "Attempt draft save on non-revision collection",
+      targetTool: "content:update",
+      proposedFields: { excerpt: "Would mutate live!" },
+      diffs: [
+        {
+          field: "excerpt",
+          label: "excerpt",
+          before: "Live banner text",
+          after: "Would mutate live!",
+          addedLines: 1,
+          removedLines: 1,
+        },
+      ],
+      status: "pending",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    sharedKv.set("revision_proposals_v2", [
+      bannerProposal,
+      ...(sharedKv.get("revision_proposals_v2") ?? []),
+    ]);
+
+    const serverBlocked = await chat(
+      makeEmDash140Ctx({
+        action: "begin_apply_proposal",
+        conversationId: turn.activeConversationId,
+        proposalId: "prop_banner_live_1",
+        expectedRev: "opaque_banners_1",
+      }),
+    );
+    assert.equal(serverBlocked.ok, false);
+    assert.equal(serverBlocked.error, "REVISIONS_NOT_SUPPORTED");
+
+    const clientBlockedSnap = await applyRevisionProposal(bannerProposal);
+    assert.equal(putPayloads.length, 1, "PUT must never be called for non-revision published entry");
+    const failedBanner = clientBlockedSnap.proposals.find(
+      p => p.proposalId === "prop_banner_live_1",
+    );
+    assert.equal(failedBanner.status, "failed");
+
+    // 3. Stale tab cannot apply a proposal that was already rejected or superseded in another tab!
+    const staleProposal = {
+      ...bannerProposal,
+      proposalId: "prop_stale_tab_1",
+      collection: "products",
+      entryId: "prod_01",
+      entrySlug: "atelier-field-jacket",
+      entryTitle: "Unpublished Staged Jacket Title",
+      baseRev: `opaque_products_${itemsByCollection.products[0].version}`,
+      proposedFields: { excerpt: "Stale tab write" },
+      diffs: [
+        {
+          field: "excerpt",
+          label: "excerpt",
+          before: "Waxed organic cotton jacket.",
+          after: "Stale tab write",
+          addedLines: 1,
+          removedLines: 1,
+        },
+      ],
+      status: "pending",
+    };
+    sharedKv.set("revision_proposals_v2", [
+      staleProposal,
+      ...(sharedKv.get("revision_proposals_v2") ?? []),
+    ]);
+
+    // Tab 1 rejects it
+    await chat(
+      makeEmDash140Ctx({
+        action: "record_proposal_receipt",
+        conversationId: turn.activeConversationId,
+        proposalId: "prop_stale_tab_1",
+        status: "rejected",
+      }),
+    );
+
+    // Tab 2 still holds `staleProposal` (`status: "pending"`) and tries to apply or Edit & Approve
+    await assert.rejects(
+      () => applyRevisionProposal(staleProposal),
+      /status is "rejected"/,
+    );
+    await assert.rejects(
+      () => applyRevisionProposal(staleProposal, { excerpt: "Stale revised write" }),
+      /status is "rejected"/,
+    );
+    assert.equal(putPayloads.length, 1, "Stale tab must never dispatch PUT");
+
+    // 4. Interrupted `applying` save on EmDash 1.4.0 published draft reconciles via /compare!
+    const interruptedProp = {
+      ...staleProposal,
+      proposalId: "prop_interrupted_1",
+      proposedFields: { excerpt: "Preserved Draft Excerpt" },
+      status: "applying",
+    };
+    sharedKv.set("revision_proposals_v2", [
+      interruptedProp,
+      ...(sharedKv.get("revision_proposals_v2") ?? []),
+    ]);
+    const reconciledSnap = await reconcileUnknownProposal(interruptedProp);
+    const reconciledItem = reconciledSnap.proposals.find(
+      p => p.proposalId === "prop_interrupted_1",
+    );
+    assert.equal(reconciledItem.status, "applied");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("shared->personal toggle mid-setup isolates SSE, 65+ threads keep new user turns, concurrent /pair imports survive, and credential read errors stay non-destructive", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+  const itemsByCollection = createStoreFixtures();
+
+  // 1. Non-destructive credential read handling on `settings.get` failure
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "wss://gw.example.com",
+        gatewayToken: "secret_preserved_tok",
+        agentId: "roboclaw",
+      },
+    }),
+  );
+  assert.ok(sharedSettings.has("connection"));
+
+  const brokenSettingsCtx = input => {
+    const ctx = createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input,
+    });
+    ctx.settings.get = async () => {
+      throw new Error("Decryption key unavailable");
+    };
+    return ctx;
+  };
+
+  const snapDuringOutage = await chat(brokenSettingsCtx({ action: "get_workspace" }));
+  assert.ok(snapDuringOutage.settingsError);
+  assert.ok(sharedSettings.has("connection"), "get_workspace must not delete encrypted settings");
+
+  const brokenAdminCtx = brokenSettingsCtx({ type: "page_load" });
+  await pluginSandbox.routes.admin.handler(brokenAdminCtx, brokenAdminCtx);
+  assert.ok(sharedSettings.has("connection"), "admin Block Kit route must not delete encrypted settings");
+
+  const partialSaveBlocked = await chat(
+    brokenSettingsCtx({ action: "configure_connection", authorityMode: "read_only" }),
+  );
+  assert.equal(partialSaveBlocked.ok, false);
+  assert.equal(partialSaveBlocked.error, "SETTINGS_READ_ERROR");
+  assert.match(sharedSettings.get("connection").value, /secret_preserved_tok/);
+
+  // Reset to local inspector mode for turn tests
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "https://agent-session.openclaw.local",
+        gatewayToken: "local_tok",
+        authorityMode: "propose_with_approval",
+      },
+    }),
+  );
+
+  // 2. Making a shared conversation personal while content reads are in flight must NOT leak tool_call or assistant_delta to u_bob!
+  const createdShared = await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "create_thread", title: "Shared Then Private", visibility: "shared" },
+    }),
+  );
+  const sharedConvId = createdShared.activeConversationId;
+
+  const bobAbort = new AbortController();
+  const bobStream = await streamGet({
+    request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+      signal: bobAbort.signal,
+    }),
+    url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+    locals: { user: { id: "u_bob", role: 40 } },
+  });
+  const bobReader = bobStream.body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await bobReader.read()).value), /"type":"connected"/);
+
+  let releaseList;
+  const pauseList = new Promise(r => {
+    releaseList = r;
+  });
+  const aliceSlowSendCtx = createNativeRouteCtx({
+    userId: "u_alice",
+    role: 40,
+    sharedSettings,
+    sharedKv,
+    itemsByCollection,
+    input: {
+      action: "send_message",
+      conversationId: sharedConvId,
+      prompt: "Inspect products confidentially",
+    },
+  });
+  const origList = aliceSlowSendCtx.content.list;
+  aliceSlowSendCtx.content.list = async slug => {
+    await pauseList;
+    return origList(slug);
+  };
+
+  const inFlightSend = chat(aliceSlowSendCtx);
+  // Read turn_started (emitted while still shared)
+  const turnStartFrame = decoder.decode((await bobReader.read()).value);
+  assert.match(turnStartFrame, /"type":"turn_started"/);
+
+  // Now Alice switches the thread to personal BEFORE content.list finishes!
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_alice",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "toggle_thread_visibility", conversationId: sharedConvId },
+    }),
+  );
+
+  releaseList();
+  await inFlightSend;
+
+  // Emit a known shared marker so we can read Bob's next frame deterministically without hanging
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "configure_connection", gatewayUrl: "https://agent-session.openclaw.local" },
+    }),
+  );
+  let bobNextCombined = "";
+  while (!bobNextCombined.includes('"reason":"connection_updated"')) {
+    bobNextCombined += decoder.decode((await bobReader.read()).value);
+  }
+  assert.doesNotMatch(bobNextCombined, /"type":"tool_call"/);
+  assert.doesNotMatch(bobNextCombined, /"type":"assistant_delta"/);
+  assert.match(bobNextCombined, /"reason":"connection_updated"/);
+  bobAbort.abort();
+
+  // 3. Store capacity: 65 existing personal threads from other users must NOT drop a new user's initialized thread or message!
+  const crowdedThreads = Array.from({ length: 65 }, (_, i) => ({
+    conversationId: `conv_crowded_${i}`,
+    ownerUserId: `u_crowd_${i}`,
+    visibility: "personal",
+    title: `Crowded ${i}`,
+    scopeGroup: "products",
+    status: "idle",
+    createdAt: new Date(Date.now() + 10_000).toISOString(),
+    updatedAt: new Date(Date.now() + 10_000).toISOString(),
+    messages: [],
+  }));
+  sharedKv.set("chat_threads_v2", crowdedThreads);
+
+  const newEditorTurn = await chat(
+    createNativeRouteCtx({
+      userId: "u_latecomer",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "send_message", prompt: "Can you see my products?" },
+    }),
+  );
+  const latecomerConvId = newEditorTurn.activeConversationId;
+  const reloadedLatecomer = await chat(
+    createNativeRouteCtx({
+      userId: "u_latecomer",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace", conversationId: latecomerConvId },
+    }),
+  );
+  const persistedLatecomerThread = reloadedLatecomer.threads.find(
+    t => t.conversationId === latecomerConvId,
+  );
+  assert.ok(persistedLatecomerThread, "New user's thread must survive store retention cap");
+  assert.equal(persistedLatecomerThread.messages.length, 2);
+
+  // 4. Concurrent external proposal arriving in `pending_proposals` while `loadRevisionProposals` is awaiting `content.get` must NOT be deleted!
+  sharedKv.set("pending_proposals", [
+    {
+      proposalId: "prop_race_first",
+      collection: "products",
+      entryId: "prod_01",
+      summary: "First external proposal",
+      proposedFields: { excerpt: "First external copy" },
+    },
+  ]);
+
+  let releaseGet;
+  const pauseGet = new Promise(r => {
+    releaseGet = r;
+  });
+  const slowLoadCtx = createNativeRouteCtx({
+    userId: "u_admin",
+    role: 50,
+    sharedSettings,
+    sharedKv,
+    itemsByCollection,
+    input: { action: "get_workspace" },
+  });
+  const origGet = slowLoadCtx.content.get;
+  let pausedOnce = false;
+  slowLoadCtx.content.get = async (slug, id) => {
+    if (!pausedOnce) {
+      pausedOnce = true;
+      await pauseGet;
+    }
+    return origGet(slug, id);
+  };
+
+  const loadingSnapPromise = chat(slowLoadCtx);
+  await new Promise(r => setTimeout(r, 20));
+
+  // Concurrent external arrival appends `prop_race_second` while `prop_race_first` is mid-hydration
+  const currentPending = sharedKv.get("pending_proposals") ?? [];
+  sharedKv.set("pending_proposals", [
+    ...currentPending,
+    {
+      proposalId: "prop_race_second",
+      collection: "products",
+      entryId: "prod_01",
+      summary: "Second concurrent external proposal",
+      proposedFields: { excerpt: "Second external copy" },
+    },
+  ]);
+
+  releaseGet();
+  const afterRaceSnap = await loadingSnapPromise;
+  assert.ok(afterRaceSnap.proposals.some(p => p.proposalId === "prop_race_first"));
+  assert.ok(
+    afterRaceSnap.proposals.some(p => p.proposalId === "prop_race_second"),
+    "Concurrent external proposal arriving during hydration must not be deleted",
+  );
+
+  // 5. Event stream client invokes `onReconnect` after stream drop
+  const origStreamFetch = globalThis.fetch;
+  let connectCalls = 0;
+  let reconnectNotifications = 0;
+  globalThis.fetch = async () => {
+    connectCalls += 1;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"connected"}\n\n'));
+        controller.close();
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+  try {
+    const stop = connectOpenClawEventStream({
+      endpoint: "http://localhost:4321/_emdash/api/openclaw/stream",
+      onEvent() {},
+      onStatus() {},
+      onReconnect() {
+        reconnectNotifications += 1;
+      },
+    });
+    await new Promise(r => setTimeout(r, 950));
+    stop();
+    assert.ok(connectCalls >= 2);
+    assert.ok(reconnectNotifications >= 1, "onReconnect must fire when SSE reconnects");
+  } finally {
+    globalThis.fetch = origStreamFetch;
+  }
 });

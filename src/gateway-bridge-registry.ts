@@ -19,6 +19,10 @@ export interface GatewayTurnRequest {
   steer?: boolean;
   expectedRunId?: string;
   timeoutMs?: number;
+  resolveLatestAudience?: () => Promise<{
+    ownerUserId?: string;
+    visibility: "personal" | "shared";
+  }>;
   onDeviceCredentialsUpdated?: (patch: {
     deviceIdentity?: StoredDeviceIdentity;
     deviceToken?: string;

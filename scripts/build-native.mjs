@@ -24,6 +24,15 @@ await build({
   plugins: [solidPlugin()],
 });
 
+await build({
+  entryPoints: [resolve(root, "src/ui/emdash-client.ts")],
+  outfile: resolve(tmpDir, "emdash-client.mjs"),
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: ["es2022"],
+});
+
 // 2. Bundle the React `adminEntry` (`pages["/openclaw"]` + `contentEditorPanels`),
 // keeping `react` external so EmDash's host React instance owns hooks & context.
 await build({

@@ -19,6 +19,8 @@ export interface SiteCollectionSummary {
   slug: string;
   label: string;
   entryCount?: number;
+  supports?: string[];
+  supportsRevisions?: boolean;
 }
 
 export interface CatalogEntrySummary {
@@ -199,6 +201,7 @@ export interface OpenClawWorkspaceSnapshot {
   siteOrigin: string;
   siteName: string;
   paired: boolean;
+  settingsError?: string;
   pairingCode: string;
   pairingCommand: string;
   pairingPrompt: string;

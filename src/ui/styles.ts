@@ -4,6 +4,8 @@ export const OPENCLAW_HARNESS_CSS = `
   width: 100%;
   height: 100%;
   min-height: 0;
+  container-type: inline-size;
+  container-name: oc-harness;
   font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", system-ui, sans-serif;
   box-sizing: border-box;
   -webkit-font-smoothing: antialiased;
@@ -264,12 +266,13 @@ export const OPENCLAW_HARNESS_CSS = `
 }
 
 .oc-topbar {
-  height: 44px;
-  padding: 0 14px;
+  min-height: 44px;
+  padding: 6px 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   border-bottom: 1px solid var(--oc-border-subtle);
   flex-shrink: 0;
 }
@@ -944,7 +947,7 @@ export const OPENCLAW_HARNESS_CSS = `
   position: absolute;
   left: 12px;
   bottom: calc(100% + 6px);
-  width: 310px;
+  width: min(310px, calc(100% - 24px));
   border-radius: 11px;
   background: var(--oc-bg-card);
   border: 1px solid var(--oc-border-strong);
@@ -1120,5 +1123,121 @@ export const OPENCLAW_HARNESS_CSS = `
   gap: 5px;
   font-size: 12px;
   color: var(--oc-text-muted);
+}
+
+.oc-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.oc-proposal-card[data-status="applying"] {
+  border-left-color: var(--oc-accent-amber);
+}
+
+.oc-proposal-card[data-status="failed"] {
+  border-left-color: var(--oc-accent-red);
+}
+
+@container oc-harness (max-width: 960px) {
+  .oc-left-sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 24;
+    width: min(268px, 84%);
+    box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-right-sidebar {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 24;
+    width: min(312px, 88%);
+    padding: 12px;
+    border-left: 1px solid var(--oc-border-strong);
+    box-shadow: var(--oc-shadow-float);
+  }
+}
+
+@media (max-width: 960px) {
+  .oc-left-sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 24;
+    width: min(268px, 84%);
+    box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-right-sidebar {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 24;
+    width: min(312px, 88%);
+    padding: 12px;
+    border-left: 1px solid var(--oc-border-strong);
+    box-shadow: var(--oc-shadow-float);
+  }
+}
+
+@container oc-harness (max-width: 640px) {
+  .oc-turn-minimap {
+    display: none;
+  }
+
+  .oc-transcript {
+    padding: 14px 14px 12px;
+  }
+
+  .oc-composer-wrap {
+    padding: 6px 10px 10px;
+  }
+
+  .oc-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .oc-sheet-backdrop {
+    padding: 10px;
+  }
+
+  .oc-sheet {
+    padding: 14px;
+    max-height: 92%;
+  }
+}
+
+@media (max-width: 640px) {
+  .oc-turn-minimap {
+    display: none;
+  }
+
+  .oc-transcript {
+    padding: 14px 14px 12px;
+  }
+
+  .oc-composer-wrap {
+    padding: 6px 10px 10px;
+  }
+
+  .oc-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .oc-sheet-backdrop {
+    padding: 10px;
+  }
+
+  .oc-sheet {
+    padding: 14px;
+    max-height: 92%;
+  }
 }
 `;

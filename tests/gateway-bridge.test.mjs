@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { WebSocketServer } from "ws";
 import { createPlugin } from "../dist/native.mjs";
+import { GET as streamGet } from "../dist/stream-endpoint.mjs";
 
 function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
@@ -28,6 +29,10 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
       if (frame.method === "connect") {
         assert.equal(frame.params.minProtocol, 4);
         assert.equal(frame.params.maxProtocol, 4);
+        assert.ok(
+          frame.params.caps?.includes("tool-events"),
+          "GatewayClient must advertise tool-events capability",
+        );
         assert.ok(frame.params.device?.id, "Ed25519 device identity must be sent");
         assert.ok(frame.params.device?.signature, "Ed25519 challenge signature must be sent");
 
@@ -626,5 +631,473 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     );
   } finally {
     await gw.close();
+  }
+});
+
+test("Gateway bridge isolates steer terminal events, honours Gateway approval/abort outcomes, protects shared->personal setup audience, and re-subscribes on reconnect", async () => {
+  const subscribeLog = [];
+  let pauseSubscribe = null;
+  let nextAbortFails = false;
+  let mainWs = null;
+  let releaseOriginatingFinal = null;
+
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  wss.on("connection", ws => {
+    mainWs = ws;
+    ws.send(
+      JSON.stringify({
+        type: "event",
+        event: "connect.challenge",
+        payload: { nonce: "nonce_edge_v4", ts: Date.now() },
+      }),
+    );
+
+    ws.on("message", async raw => {
+      const frame = JSON.parse(String(raw));
+      if (frame.type !== "req") return;
+
+      if (frame.method === "connect") {
+        assert.ok(frame.params.caps?.includes("tool-events"));
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              type: "hello-ok",
+              protocol: 4,
+              server: { version: "2026.11.1-edge", connId: `conn_${Date.now()}` },
+              features: {
+                methods: [
+                  "chat.send",
+                  "chat.abort",
+                  "sessions.messages.subscribe",
+                  "approval.resolve",
+                ],
+                events: ["chat", "agent", "session.approval"],
+              },
+              auth: {
+                deviceToken: "oc_dev_edge",
+                role: "operator",
+                scopes: ["operator.read", "operator.write", "operator.approvals"],
+              },
+              policy: { maxPayload: 1048576, maxBufferedBytes: 4194304, tickIntervalMs: 30000 },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.messages.subscribe") {
+        const subKey = frame.params.key ?? frame.params.sessionKey;
+        subscribeLog.push(subKey);
+        if (pauseSubscribe) {
+          await pauseSubscribe;
+        }
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { subscribed: true, key: subKey, sessionKey: subKey },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "chat.send") {
+        const sessionKey = frame.params.sessionKey;
+        if (frame.params.queueMode === "steer") {
+          const steerRunId = "run_steer_child_99";
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: true,
+              payload: { runId: steerRunId, status: "started" },
+            }),
+          );
+          // Steer run finishes IMMEDIATELY with its own `final` event — must NOT finish originating run!
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                type: "event",
+                event: "chat",
+                payload: {
+                  runId: steerRunId,
+                  sessionKey,
+                  seq: 1,
+                  state: "final",
+                  message: { role: "assistant", content: "STEER_ACK_ONLY" },
+                },
+              }),
+            );
+          }, 10);
+          return;
+        }
+
+        const origRunId = "run_originating_01";
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { runId: origRunId, status: "started" },
+          }),
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "event",
+            event: "session.approval",
+            payload: {
+              sessionKey,
+              phase: "requested",
+              approval: {
+                id: "appr_race_denied",
+                status: "pending",
+                createdAtMs: Date.now(),
+                presentation: {
+                  kind: "exec",
+                  agentId: "roboclaw",
+                  title: "Contested exec approval",
+                  commandText: "echo test",
+                  allowedDecisions: ["allow-once", "deny"],
+                },
+              },
+            },
+          }),
+        );
+
+        ws.send(
+          JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: origRunId,
+              sessionKey,
+              seq: 1,
+              state: "delta",
+              deltaText: "Confidential Gateway Delta ",
+            },
+          }),
+        );
+
+        if (releaseOriginatingFinal) {
+          await releaseOriginatingFinal;
+        }
+
+        ws.send(
+          JSON.stringify({
+            type: "event",
+            event: "chat",
+            payload: {
+              runId: origRunId,
+              sessionKey,
+              seq: 2,
+              state: "final",
+              message: {
+                role: "assistant",
+                content: "Originating run complete after steer.",
+              },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "approval.resolve") {
+        // Simulate another admin already denied it on Gateway (`applied: false` + recorded `denied` state)
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              applied: false,
+              approval: {
+                id: frame.params.id,
+                status: "denied",
+                decision: "deny",
+                resolvedAtMs: Date.now(),
+                presentation: {
+                  kind: "exec",
+                  agentId: "roboclaw",
+                  title: "Contested exec approval",
+                  commandText: "echo test",
+                  allowedDecisions: ["allow-once", "deny"],
+                },
+              },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "chat.abort") {
+        if (nextAbortFails) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: true,
+              payload: { ok: true, aborted: false, runIds: [] },
+            }),
+          );
+          return;
+        }
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { ok: true, aborted: true, runIds: ["run_originating_01"] },
+          }),
+        );
+      }
+    });
+  });
+
+  await new Promise(r => wss.on("listening", r));
+  const port = wss.address().port;
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+
+  try {
+    await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: `ws://127.0.0.1:${port}`,
+          gatewayToken: "oc_edge_tok",
+          agentId: "roboclaw",
+          authorityMode: "propose_with_approval",
+          allowGatewayExecApprovals: true,
+        },
+      }),
+    );
+
+    const sharedThreadSnap = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: { action: "create_thread", title: "Gateway Steer & Privacy", visibility: "shared" },
+      }),
+    );
+    const convId = sharedThreadSnap.activeConversationId;
+
+    const bobAbort = new AbortController();
+    const bobStream = await streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: bobAbort.signal,
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "u_bob", role: 40 } },
+    });
+    const bobReader = bobStream.body.getReader();
+    const decoder = new TextDecoder();
+    assert.match(decoder.decode((await bobReader.read()).value), /"type":"connected"/);
+
+    // Pause Gateway subscribe AND pause originating final so we test:
+    // (a) shared -> personal toggle while bridge setup is in flight
+    // (b) steer's terminal `final` event NOT prematurely resolving originating turn
+    // (c) failed `chat.abort` NOT marking the active turn `"stopped"`
+    let unblockSub;
+    pauseSubscribe = new Promise(r => {
+      unblockSub = r;
+    });
+    let unblockOrigFinal;
+    releaseOriginatingFinal = new Promise(r => {
+      unblockOrigFinal = r;
+    });
+
+    const origTurnPromise = chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          conversationId: convId,
+          prompt: "Audit jacket sizing",
+        },
+      }),
+    );
+
+    // Drain Bob's initial `turn_started` + `tool_call` frames before toggling privacy
+    await new Promise(r => setTimeout(r, 35));
+
+    // Toggle shared -> personal BEFORE `sessions.messages.subscribe` completes!
+    await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: { action: "toggle_thread_visibility", conversationId: convId },
+      }),
+    );
+
+    pauseSubscribe = null;
+    unblockSub();
+    await new Promise(r => setTimeout(r, 40));
+
+    // Send a mid-run steer whose own `run_steer_child_99` emits `state: "final"` immediately
+    await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "steer_turn",
+          conversationId: convId,
+          prompt: "Include chest measurements",
+        },
+      }),
+    );
+    await new Promise(r => setTimeout(r, 40));
+
+    // Verify originating turn has NOT prematurely completed on steer's `final`!
+    let origSettledEarly = false;
+    origTurnPromise.then(() => {
+      origSettledEarly = true;
+    });
+    await new Promise(r => setTimeout(r, 25));
+    assert.equal(origSettledEarly, false, "Steer terminal event must not finish originating turn");
+
+    // Failed `chat.abort` (`aborted: false`) must return STOP_FAILED and leave thread `running`!
+    nextAbortFails = true;
+    const failedStop = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: { action: "stop_turn", conversationId: convId },
+      }),
+    );
+    assert.equal(failedStop.ok, false);
+    assert.equal(failedStop.error, "STOP_FAILED");
+    const afterFailedStopSnap = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: { action: "get_workspace", conversationId: convId },
+      }),
+    );
+    assert.equal(
+      afterFailedStopSnap.threads.find(t => t.conversationId === convId)?.status,
+      "running",
+      "Failed Gateway abort must not display thread as stopped",
+    );
+
+    // Attempt `allow-once` when Gateway returns `applied: false` with recorded `denied` state
+    const contestedApprovalRes = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "resolve_gateway_approval",
+          conversationId: convId,
+          approvalId: "appr_race_denied",
+          kind: "exec",
+          decision: "allow-once",
+        },
+      }),
+    );
+    assert.equal(contestedApprovalRes.ok, false);
+    assert.equal(contestedApprovalRes.error, "GATEWAY_APPROVAL_FAILED");
+
+    const aliceSnapWithApproval = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_alice",
+        sharedSettings,
+        sharedKv,
+        input: { action: "get_workspace", conversationId: convId },
+      }),
+    );
+    const recordedAppr = aliceSnapWithApproval.execApprovals.find(
+      a => a.approvalId === "appr_race_denied",
+    );
+    assert.equal(
+      recordedAppr?.status,
+      "denied",
+      "Recorded Gateway decision must win over locally attempted allow-once",
+    );
+    assert.equal(recordedAppr?.decision, "deny");
+
+    // Now let originating run finish and confirm it gets the originating reply, NOT `STEER_ACK_ONLY`!
+    releaseOriginatingFinal = null;
+    unblockOrigFinal();
+    const completedOrig = await origTurnPromise;
+    const finishedThread = completedOrig.threads.find(t => t.conversationId === convId);
+    assert.ok(
+      finishedThread.messages.some(
+        m => m.role === "assistant" && m.content === "Originating run complete after steer.",
+      ),
+    );
+    assert.equal(
+      finishedThread.messages.some(m => m.content.includes("STEER_ACK_ONLY")),
+      false,
+    );
+
+    // Emit a shared ping and verify Bob NEVER received `Confidential Gateway Delta`!
+    await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: `ws://127.0.0.1:${port}`,
+          gatewayToken: "oc_edge_tok",
+          agentId: "roboclaw",
+        },
+      }),
+    );
+    let bobAll = "";
+    while (!bobAll.includes('"reason":"connection_updated"')) {
+      bobAll += decoder.decode((await bobReader.read()).value);
+    }
+    assert.doesNotMatch(bobAll, /Confidential Gateway Delta/);
+    bobAbort.abort();
+
+    // Test Gateway WS reconnect recovery: terminate socket -> GatewayClient reconnects & re-subscribes!
+    const subsBeforeDrop = subscribeLog.length;
+    mainWs.close();
+    const deadline = Date.now() + 5_000;
+    while (subscribeLog.length <= subsBeforeDrop && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 80));
+    }
+    assert.ok(
+      subscribeLog.length > subsBeforeDrop,
+      "Bridge must re-subscribe known sessions automatically after WS reconnect",
+    );
+  } finally {
+    await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: { action: "disconnect" },
+      }),
+    ).catch(() => {});
+    for (const c of wss.clients) c.terminate();
+    await new Promise(r => wss.close(() => r()));
   }
 });
