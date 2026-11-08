@@ -52,6 +52,7 @@ function createNativeRouteCtx({
   revisionsById = new Map(),
   sharedSettings = new Map(),
   sharedKv = new Map(),
+  httpFetch = async () => Response.json({ ok: true }),
 } = {}) {
   let revCounter = 1;
   return {
@@ -86,7 +87,7 @@ function createNativeRouteCtx({
       delete: async k => sharedKv.delete(k),
     },
     http: {
-      fetch: async () => Response.json({ ok: true }),
+      fetch: httpFetch,
     },
     log: { info() {}, warn() {}, error() {}, debug() {} },
   };
@@ -1257,4 +1258,225 @@ test("shared->personal toggle mid-setup isolates SSE, 65+ threads keep new user 
   } finally {
     globalThis.fetch = origStreamFetch;
   }
+});
+
+test("HTTP Gateway enforces Admin-only role, preserves conversation identity & history, parses HTTP proposals, and ensures personal defaults alongside shared threads", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+  const itemsByCollection = createStoreFixtures();
+  const httpRequests = [];
+
+  const mockHttpFetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    httpRequests.push({ url, headers: init.headers, body });
+    const latestUserMsg = body.messages.at(-1)?.content ?? "";
+    if (latestUserMsg.includes("Rewrite the Atelier Field Jacket")) {
+      return Response.json({
+        choices: [
+          {
+            message: {
+              content:
+                'Here is a crisp HTTP Gateway edit.\n\n```emdash-proposal\n{"collection":"products","entryId":"prod_01","summary":"HTTP agent wax-cotton rewrite","proposedFields":{"excerpt":"Hand-waxed organic cotton jacket built for coastal storms."}}\n```',
+            },
+          },
+        ],
+      });
+    }
+    return Response.json({
+      choices: [
+        {
+          message: {
+            content: "Continuing our exact conversation context cleanly.",
+          },
+        },
+      ],
+    });
+  };
+
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "https://completions.example.com/v1/chat/completions",
+        agentId: "blaze",
+        gatewayToken: "oc_http_owner_secret_777",
+        authorityMode: "propose_with_approval",
+      },
+    }),
+  );
+
+  // 1. Non-admin Editor (`role: 40`) MUST NOT invoke owner-authenticated HTTP Gateway
+  const editorBlocked = await chat(
+    createNativeRouteCtx({
+      userId: "u_editor",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      httpFetch: mockHttpFetch,
+      input: {
+        action: "send_message",
+        prompt: "Try running owner HTTP tools as an editor",
+      },
+    }),
+  );
+  assert.equal(editorBlocked.ok, false);
+  assert.equal(editorBlocked.error, "FORBIDDEN");
+  assert.equal(httpRequests.length, 0, "Editor must never trigger outbound HTTP Gateway fetch");
+
+  // 2. Admin (`role: 50`) turn 1 parses structured `emdash-proposal` from HTTP response (no heuristic mismatch)
+  const adminTurn1 = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      httpFetch: mockHttpFetch,
+      input: {
+        action: "send_message",
+        prompt: "Rewrite the Atelier Field Jacket excerpt for coastal weather",
+      },
+    }),
+  );
+  assert.equal(httpRequests.length, 1);
+  assert.ok(typeof httpRequests[0].body.user === "string" && httpRequests[0].body.user.length > 0);
+  assert.equal(adminTurn1.proposals.length, 1);
+  assert.equal(adminTurn1.proposals[0].summary, "HTTP agent wax-cotton rewrite");
+  assert.equal(
+    adminTurn1.proposals[0].diffs[0].after,
+    "Hand-waxed organic cotton jacket built for coastal storms.",
+  );
+
+  // 3. Admin turn 2 in same thread preserves stable `user` session key AND prior conversation messages
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      httpFetch: mockHttpFetch,
+      input: {
+        action: "send_message",
+        conversationId: adminTurn1.activeConversationId,
+        prompt: "Follow up on that coastal storm angle",
+      },
+    }),
+  );
+  assert.equal(httpRequests.length, 2);
+  assert.equal(httpRequests[1].body.user, httpRequests[0].body.user);
+  assert.ok(
+    httpRequests[1].body.messages.some(
+      m => m.role === "user" && m.content.includes("Rewrite the Atelier Field Jacket"),
+    ),
+    "Follow-up HTTP Gateway call must include prior user turn history",
+  );
+  assert.ok(
+    httpRequests[1].body.messages.some(
+      m => m.role === "assistant" && m.content.includes("Here is a crisp HTTP Gateway edit."),
+    ),
+    "Follow-up HTTP Gateway call must include prior assistant turn history",
+  );
+
+  // 4. Switch back to local paired-agent and verify personal defaults when shared threads already exist
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "https://agent-session.openclaw.local",
+      },
+    }),
+  );
+
+  // u_admin shares BOTH their overview thread AND a bound-entry thread
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "toggle_thread_visibility",
+        conversationId: adminTurn1.activeConversationId,
+      },
+    }),
+  );
+  const adminBoundSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "get_workspace",
+        boundEntry: { collection: "products", entryId: "prod_01", title: "Atelier Field Jacket" },
+      },
+    }),
+  );
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "toggle_thread_visibility",
+        conversationId: adminBoundSnap.activeConversationId,
+      },
+    }),
+  );
+
+  // First-time Editor `u_charlie` loads overview AND bound-entry panel -> gets personal defaults, NOT u_admin's shared threads!
+  const charlieOverview = await chat(
+    createNativeRouteCtx({
+      userId: "u_charlie",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  const charlieDefaultThread = charlieOverview.threads.find(
+    t => t.conversationId === charlieOverview.activeConversationId,
+  );
+  assert.ok(charlieDefaultThread);
+  assert.equal(charlieDefaultThread.ownerUserId, "u_charlie");
+  assert.equal(charlieDefaultThread.visibility, "personal");
+
+  const charlieBound = await chat(
+    createNativeRouteCtx({
+      userId: "u_charlie",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "get_workspace",
+        boundEntry: { collection: "products", entryId: "prod_01", title: "Atelier Field Jacket" },
+      },
+    }),
+  );
+  const charlieBoundThread = charlieBound.threads.find(
+    t => t.conversationId === charlieBound.activeConversationId,
+  );
+  assert.ok(charlieBoundThread);
+  assert.equal(charlieBoundThread.ownerUserId, "u_charlie");
+  assert.equal(charlieBoundThread.visibility, "personal");
 });

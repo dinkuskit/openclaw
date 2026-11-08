@@ -648,6 +648,10 @@ function isThreadVisibleToUser(thread: ConversationThread, userId: string): bool
   return thread.ownerUserId === userId;
 }
 
+function isOwnedPersonalThread(thread: ConversationThread, userId: string): boolean {
+  return (thread.visibility ?? "personal") === "personal" && thread.ownerUserId === userId;
+}
+
 function normalizeV2Proposals(rawV2: unknown): RevisionProposal[] {
   return Array.isArray(rawV2)
     ? (rawV2 as RevisionProposal[]).map(p => ({
@@ -1089,25 +1093,69 @@ function parseGatewayAgentProposals(
   return { cleanedText: cleanedText || replyText, proposals };
 }
 
+interface HttpGatewayTurnOptions {
+  userRole: number;
+  sessionKey: string;
+  priorMessages: ChatTurnMessage[];
+  systemContext: string;
+}
+
+interface HttpGatewayTurnResult {
+  ok: boolean;
+  replyText?: string;
+  errorMessage?: string;
+}
+
 async function tryExternalHttpGatewayTurn(
   ctx: PluginContext,
   connection: OpenClawConnection,
   prompt: string,
-  catalogSummaryText: string,
-): Promise<string | null> {
+  options: HttpGatewayTurnOptions,
+): Promise<HttpGatewayTurnResult> {
+  // OpenClaw's `/v1/chat/completions` HTTP endpoint authenticates with the site's shared Gateway secret,
+  // granting owner-sender semantics and full operator scopes. Restrict this transport to EmDash Administrators.
+  if (options.userRole < ADMIN) {
+    return {
+      ok: false,
+      errorMessage:
+        "Administrator role is required to invoke an owner-authenticated HTTP(S) OpenClaw Gateway.",
+    };
+  }
   if (
     !connection.gatewayUrl ||
     connection.gatewayUrl === "https://agent-session.openclaw.local" ||
     connection.gatewayUrl.startsWith("ws://") ||
     connection.gatewayUrl.startsWith("wss://")
   ) {
-    return null;
+    return {
+      ok: false,
+      errorMessage: "Configured Gateway URL is not an HTTP(S) completions endpoint.",
+    };
   }
   const base = connection.gatewayUrl.replace(/\/+$/, "");
   const endpoint = base.endsWith("/v1/chat/completions")
     ? base
     : `${base}/v1/chat/completions`;
-  if (!ctx.http) return null;
+  if (!ctx.http) {
+    return {
+      ok: false,
+      errorMessage: "HTTP client capability (`ctx.http`) is unavailable in this runtime.",
+    };
+  }
+  const historyMessages = options.priorMessages
+    .filter(
+      m =>
+        (m.role === "user" || m.role === "assistant") &&
+        m.status !== "streaming" &&
+        m.status !== "failed" &&
+        m.content.trim().length > 0,
+    )
+    .slice(-20)
+    .map(m => ({
+      role: m.role,
+      content: m.content,
+    }));
+
   try {
     const response = await ctx.http.fetch(endpoint, {
       method: "POST",
@@ -1117,27 +1165,43 @@ async function tryExternalHttpGatewayTurn(
       },
       body: JSON.stringify({
         model: `openclaw:${connection.agentId}`,
+        user: options.sessionKey,
         stream: false,
         messages: [
           {
             role: "system",
             content:
               `You are @${connection.agentId}, connected to an EmDash CMS store (${connection.authorityMode}). ` +
-              `Ground every answer strictly in the live EmDash collections below:\n${catalogSummaryText}`,
+              `Ground every answer strictly in the live EmDash collections below:\n${options.systemContext}`,
           },
+          ...historyMessages,
           { role: "user", content: prompt },
         ],
       }),
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      return {
+        ok: false,
+        errorMessage: `HTTP Gateway returned status ${response.status}.`,
+      };
+    }
     const json = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
       reply?: string;
     };
     const content = json.choices?.[0]?.message?.content ?? json.reply;
-    return typeof content === "string" && content.trim() ? content.trim() : null;
-  } catch {
-    return null;
+    if (typeof content === "string" && content.trim()) {
+      return { ok: true, replyText: content.trim() };
+    }
+    return {
+      ok: false,
+      errorMessage: "HTTP Gateway returned an empty completion response.",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      errorMessage: err instanceof Error ? err.message : "HTTP Gateway request failed.",
+    };
   }
 }
 
@@ -1161,7 +1225,7 @@ function ensureUserThreads(
   if (boundEntry) {
     const existingBound = next.find(
       t =>
-        isThreadVisibleToUser(t, currentUserId) &&
+        isOwnedPersonalThread(t, currentUserId) &&
         t.boundEntry?.collection === boundEntry.collection &&
         t.boundEntry?.entryId === boundEntry.entryId,
     );
@@ -1170,7 +1234,10 @@ function ensureUserThreads(
       const matched = entriesPreview.find(
         e => e.collection === boundEntry.collection && e.id === boundEntry.entryId,
       );
-      const convId = `conv_entry_${currentUserId}_${boundEntry.collection}_${boundEntry.entryId}`;
+      const baseConvId = `conv_entry_${currentUserId}_${boundEntry.collection}_${boundEntry.entryId}`;
+      const convId = next.some(t => t.conversationId === baseConvId)
+        ? `${baseConvId}_${csprngId("", 3)}`
+        : baseConvId;
       addedIds.push(convId);
       next = [
         {
@@ -1196,14 +1263,17 @@ function ensureUserThreads(
     }
   }
 
-  const visible = next.filter(t => isThreadVisibleToUser(t, currentUserId));
-  if (visible.length === 0) {
+  const ownedPersonal = next.filter(t => isOwnedPersonalThread(t, currentUserId));
+  if (ownedPersonal.length === 0) {
     const now = new Date().toISOString();
     const hasProducts = collections.some(c => c.slug === "products");
-    const convId =
+    const baseConvId =
       currentUserId === "u1" || currentUserId === "dev-admin"
         ? "conv_catalog_overview"
         : `conv_${currentUserId}_overview`;
+    const convId = next.some(t => t.conversationId === baseConvId)
+      ? `conv_${currentUserId}_personal_${csprngId("", 3)}`
+      : baseConvId;
     addedIds.push(convId);
     next = [
       {
@@ -1307,6 +1377,7 @@ export async function buildWorkspaceSnapshot(
   if (boundEntry && !activeConversationId) {
     activeConversationId = visibleThreads.find(
       t =>
+        isOwnedPersonalThread(t, currentUserId) &&
         t.boundEntry?.collection === boundEntry.collection &&
         t.boundEntry?.entryId === boundEntry.entryId,
     )?.conversationId;
@@ -1315,7 +1386,9 @@ export async function buildWorkspaceSnapshot(
     !activeConversationId ||
     !visibleThreads.some(t => t.conversationId === activeConversationId)
   ) {
-    activeConversationId = visibleThreads[0]!.conversationId;
+    activeConversationId =
+      visibleThreads.find(t => isOwnedPersonalThread(t, currentUserId))?.conversationId ??
+      visibleThreads[0]!.conversationId;
   }
 
   const bridge = getHostGatewayBridge();
@@ -2589,6 +2662,15 @@ export async function openclawChatRoute(
     const authorityMode = connection?.authorityMode ?? "read_only";
     const transportMode = connection ? classifyTransportMode(connection.gatewayUrl) : "paired-agent";
 
+    if (connection && transportMode === "live-gateway" && role < ADMIN) {
+      return {
+        ok: false,
+        error: "FORBIDDEN",
+        message:
+          "Administrator role is required to send prompts through an owner-authenticated HTTP(S) OpenClaw Gateway. Configure a Gateway WebSocket endpoint (ws:// or wss://) for Editor access.",
+      };
+    }
+
     const now = new Date().toISOString();
     const userMsgId = csprngId("msg_u_", 6);
     const assistantMsgId = csprngId("msg_a_", 6);
@@ -2621,7 +2703,16 @@ export async function openclawChatRoute(
       const targetThread =
         (preferredConversationId
           ? visible.find(t => t.conversationId === preferredConversationId)
-          : undefined) ?? visible[0]!;
+          : boundEntry
+            ? visible.find(
+                t =>
+                  isOwnedPersonalThread(t, currentUserId) &&
+                  t.boundEntry?.collection === boundEntry.collection &&
+                  t.boundEntry?.entryId === boundEntry.entryId,
+              )
+            : undefined) ??
+        visible.find(t => isOwnedPersonalThread(t, currentUserId)) ??
+        visible[0]!;
       const targetConvId = targetThread.conversationId;
       const sessionKey =
         targetThread.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
@@ -2864,8 +2955,40 @@ export async function openclawChatRoute(
           }
         }
       }
+    } else if (connection && transportMode === "live-gateway") {
+      // PATH B1: Administrator-authenticated OpenClaw HTTP(S) `/v1/chat/completions` endpoint
+      const httpResult = await tryExternalHttpGatewayTurn(ctx, connection, prompt, {
+        userRole: role,
+        sessionKey,
+        priorMessages: targetThread.messages,
+        systemContext: `${catalogDigest}${proposalInstruction}`,
+      });
+
+      if (!httpResult.ok || !httpResult.replyText) {
+        turnFinalStatus = "failed";
+        assistantReply = `**OpenClaw Gateway Error:** ${httpResult.errorMessage ?? "HTTP Gateway request failed."}\n\nOpen **Gateway & Pairing** in the bottom-left sidebar to verify your Gateway endpoint and token.`;
+      } else if (authorityMode === "propose_with_approval") {
+        const parsed = parseGatewayAgentProposals(
+          httpResult.replyText,
+          gatheredEntries,
+          targetConvId,
+          agentId,
+          undefined,
+        );
+        assistantReply = parsed.cleanedText;
+        for (const p of parsed.proposals) {
+          const targetEntry = gatheredEntries.find(
+            e => e.collection === p.collection && e.id === p.entryId,
+          );
+          if (canCollectionStageDraft(collections, p.collection, targetEntry?.status ?? "published")) {
+            createdProposals.push(p);
+          }
+        }
+      } else {
+        assistantReply = httpResult.replyText;
+      }
     } else {
-      // PATH B: Optional HTTPS completions endpoint OR Built-in EmDash Store Inspector
+      // PATH B2: Built-in EmDash Store Inspector / paired-agent fallback
       const isMutationIntent =
         /^\/propose\b/i.test(prompt) ||
         /\b(update|edit|change|rewrite|improve|tighten|draft|propose|rename|description|excerpt|copy|headline|tagline)\b/i.test(
@@ -2909,13 +3032,7 @@ export async function openclawChatRoute(
         }
       }
 
-      const httpReply = connection
-        ? await tryExternalHttpGatewayTurn(ctx, connection, prompt, catalogDigest)
-        : null;
-
-      if (httpReply) {
-        assistantReply = httpReply;
-      } else if (isMutationIntent && authorityMode === "read_only") {
+      if (isMutationIntent && authorityMode === "read_only") {
         assistantReply = [
           `I inspected **${matchedEntry?.title ?? "your store content"}**, but \`@${agentId}\` is currently in **Read-Only** authority mode.`,
           ``,
