@@ -251,6 +251,33 @@ function extractTextFromGatewayMessage(msg: unknown): string {
   return "";
 }
 
+function normalizeOpenClawAgentSegment(agentId: string | undefined | null): string {
+  const normalized = (agentId ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "")
+    .slice(0, 64);
+  return normalized || "openclaw";
+}
+
+function parseSessionKeyAgentSegment(sessionKey: string | undefined | null): string | undefined {
+  const raw = (sessionKey ?? "").trim();
+  if (!raw) return undefined;
+  const match = /^agent:([^:]+):(.+)$/i.exec(raw);
+  if (!match || !match[1] || !match[2]) return undefined;
+  return normalizeOpenClawAgentSegment(match[1]);
+}
+
+function resolveSessionRpcAgentId(sessionKey: string, configuredAgentId: string): string {
+  const keyAgent = parseSessionKeyAgentSegment(sessionKey);
+  if (keyAgent && keyAgent !== normalizeOpenClawAgentSegment(configuredAgentId)) {
+    return keyAgent;
+  }
+  return configuredAgentId;
+}
+
 interface ActiveRunCollector {
   conversationId: string;
   ownerUserId?: string;
@@ -584,13 +611,18 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
   }
 
   async #recoverSessionsAfterReconnect(agentId: string): Promise<void> {
+    const currentAgent = normalizeOpenClawAgentSegment(agentId);
     const sessionKeys = new Set<string>([
       ...this.#sessionToConversation.keys(),
       ...this.#activeCollectors.keys(),
     ]);
     for (const sessionKey of sessionKeys) {
-      await this.#ensureSubscribed(sessionKey, agentId);
       const collector = this.#activeCollectors.get(sessionKey);
+      const keyAgent = parseSessionKeyAgentSegment(sessionKey);
+      if (keyAgent && keyAgent !== currentAgent && (!collector || collector.settled)) {
+        continue;
+      }
+      await this.#ensureSubscribed(sessionKey, resolveSessionRpcAgentId(sessionKey, agentId));
       if (collector && !collector.settled) {
         this.#refreshCollectorTimer(collector);
       }
@@ -681,7 +713,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     try {
       const res = await this.#client.request<{ messages?: unknown[] }>("chat.history", {
         sessionKey: params.sessionKey,
-        agentId: params.connection.agentId,
+        agentId: resolveSessionRpcAgentId(params.sessionKey, params.connection.agentId),
         limit: params.limit ?? 40,
       });
       const rawList = Array.isArray(res?.messages) ? res.messages : [];
@@ -771,7 +803,10 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       };
     }
 
-    await this.#ensureSubscribed(req.sessionKey, req.connection.agentId);
+    const subscribeAgentId = req.steer
+      ? resolveSessionRpcAgentId(req.sessionKey, req.connection.agentId)
+      : req.connection.agentId;
+    await this.#ensureSubscribed(req.sessionKey, subscribeAgentId);
     const refreshedAudience = await req.resolveLatestAudience?.().catch(() => undefined);
     const effectiveAudience = this.#resolveEffectiveTurnAudience(req, seqAtStart, refreshedAudience);
     this.#sessionToConversation.set(req.sessionKey, {
@@ -791,7 +826,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         // Published 2026.11.1 ChatSendParamsSchema has additionalProperties: false and does NOT accept expectedRunId.
         const ack = await this.#client.request<{ runId?: string }>("chat.send", {
           sessionKey: req.sessionKey,
-          agentId: req.connection.agentId,
+          agentId: resolveSessionRpcAgentId(req.sessionKey, req.connection.agentId),
           message: req.prompt,
           queueMode: "steer",
           suppressCommandInterpretation: !canResolveApprovals,
@@ -891,7 +926,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         "chat.abort",
         {
           sessionKey: params.sessionKey,
-          agentId: params.connection.agentId,
+          agentId: resolveSessionRpcAgentId(params.sessionKey, params.connection.agentId),
           ...(targetRunId ? { runId: targetRunId } : {}),
         },
       );

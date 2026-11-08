@@ -1279,10 +1279,81 @@ async function tryExternalHttpGatewayTurn(
   }
 }
 
+function normalizeOpenClawAgentSegment(agentId: string | undefined | null): string {
+  const normalized = (agentId ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "")
+    .slice(0, 64);
+  return normalized || "openclaw";
+}
+
+function parseSessionKeyAgentSegment(sessionKey: string | undefined | null): string | undefined {
+  const raw = (sessionKey ?? "").trim();
+  if (!raw) return undefined;
+  const match = /^agent:([^:]+):(.+)$/i.exec(raw);
+  if (!match || !match[1] || !match[2]) return undefined;
+  return normalizeOpenClawAgentSegment(match[1]);
+}
+
 function buildCanonicalSessionKey(agentId: string, conversationId: string): string {
-  const safeAgent = agentId.replace(/[^a-zA-Z0-9_-]/g, "") || "openclaw";
+  const safeAgent = normalizeOpenClawAgentSegment(agentId);
   const safeConv = conversationId.replace(/[^a-zA-Z0-9_-]/g, "");
   return `agent:${safeAgent}:emdash:${safeConv}`;
+}
+
+function resolveThreadSessionKey(
+  thread: Pick<ConversationThread, "conversationId" | "sessionKey" | "agentSessionKeys">,
+  agentId: string,
+): string {
+  const targetAgent = normalizeOpenClawAgentSegment(agentId);
+  if (thread.sessionKey && parseSessionKeyAgentSegment(thread.sessionKey) === targetAgent) {
+    return thread.sessionKey;
+  }
+  const remembered = thread.agentSessionKeys?.[targetAgent];
+  if (remembered && parseSessionKeyAgentSegment(remembered) === targetAgent) {
+    return remembered;
+  }
+  return buildCanonicalSessionKey(targetAgent, thread.conversationId);
+}
+
+function bindThreadToAgentSession(
+  thread: ConversationThread,
+  agentId: string,
+  explicitSessionKey?: string,
+): ConversationThread {
+  const targetAgent = normalizeOpenClawAgentSegment(agentId);
+  const sessionKey = explicitSessionKey ?? resolveThreadSessionKey(thread, targetAgent);
+  const existingAgent = parseSessionKeyAgentSegment(thread.sessionKey);
+  const nextMap: Record<string, string> = {
+    ...(thread.agentSessionKeys ?? {}),
+    ...(thread.sessionKey && existingAgent ? { [existingAgent]: thread.sessionKey } : {}),
+    [targetAgent]: sessionKey,
+  };
+  return {
+    ...thread,
+    sessionKey,
+    agentSessionKeys: nextMap,
+  };
+}
+
+function formatPriorConversationContext(messages: ChatTurnMessage[]): string {
+  const completed = messages
+    .filter(
+      m =>
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.content === "string" &&
+        m.content.trim().length > 0 &&
+        m.status !== "streaming",
+    )
+    .slice(-12);
+  if (completed.length === 0) return "";
+  const lines = completed.map(
+    m => `[${m.role === "user" ? "User" : "Assistant"}]: ${m.content.trim().slice(0, 1200)}`,
+  );
+  return `\n\n<prior_conversation_transcript>\n${lines.join("\n\n")}\n</prior_conversation_transcript>`;
 }
 
 function ensureUserThreads(
@@ -1292,8 +1363,15 @@ function ensureUserThreads(
   collections: SiteCollectionSummary[],
   entriesPreview: CatalogEntrySummary[],
   boundEntry?: BoundEntryRef,
-): { threads: ConversationThread[]; addedIds: string[] } {
-  let next = [...allThreads];
+): { threads: ConversationThread[]; addedIds: string[]; reboundIds: string[] } {
+  const reboundIds: string[] = [];
+  let next = allThreads.map(t => {
+    if (t.status === "running") return t;
+    const expectedKey = resolveThreadSessionKey(t, agentId);
+    if (t.sessionKey === expectedKey) return t;
+    reboundIds.push(t.conversationId);
+    return bindThreadToAgentSession(t, agentId, expectedKey);
+  });
   const addedIds: string[] = [];
 
   if (boundEntry) {
@@ -1312,13 +1390,16 @@ function ensureUserThreads(
       const convId = next.some(t => t.conversationId === baseConvId)
         ? `${baseConvId}_${csprngId("", 3)}`
         : baseConvId;
+      const sessionKey = buildCanonicalSessionKey(agentId, convId);
+      const targetAgent = normalizeOpenClawAgentSegment(agentId);
       addedIds.push(convId);
       next = [
         {
           conversationId: convId,
           ownerUserId: currentUserId,
           visibility: "personal",
-          sessionKey: buildCanonicalSessionKey(agentId, convId),
+          sessionKey,
+          agentSessionKeys: { [targetAgent]: sessionKey },
           title:
             boundEntry.title ?? matched?.title ?? `${boundEntry.collection}/${boundEntry.entryId}`,
           scopeGroup: "editor entries",
@@ -1348,13 +1429,16 @@ function ensureUserThreads(
     const convId = next.some(t => t.conversationId === baseConvId)
       ? `conv_${currentUserId}_personal_${csprngId("", 3)}`
       : baseConvId;
+    const sessionKey = buildCanonicalSessionKey(agentId, convId);
+    const targetAgent = normalizeOpenClawAgentSegment(agentId);
     addedIds.push(convId);
     next = [
       {
         conversationId: convId,
         ownerUserId: currentUserId,
         visibility: "personal",
-        sessionKey: buildCanonicalSessionKey(agentId, convId),
+        sessionKey,
+        agentSessionKeys: { [targetAgent]: sessionKey },
         title: hasProducts ? "Catalog & Products Overview" : "Site Content Overview",
         scopeGroup: hasProducts ? "products" : "pages & storefront",
         status: "idle",
@@ -1365,7 +1449,7 @@ function ensureUserThreads(
       ...next,
     ];
   }
-  return { threads: next, addedIds };
+  return { threads: next, addedIds, reboundIds };
 }
 
 export async function buildWorkspaceSnapshot(
@@ -1412,10 +1496,10 @@ export async function buildWorkspaceSnapshot(
     entriesPreview,
     boundEntry,
   );
-  if (initialEnsure.addedIds.length > 0) {
+  if (initialEnsure.addedIds.length > 0 || initialEnsure.reboundIds.length > 0) {
     allThreads = await mutateThreads(
       ctx,
-      initialEnsure.addedIds,
+      [...initialEnsure.addedIds, ...initialEnsure.reboundIds],
       (current, protectedIds) => {
         const reEnsured = ensureUserThreads(
           current,
@@ -1428,7 +1512,9 @@ export async function buildWorkspaceSnapshot(
         const retained = retainThreads(reEnsured.threads, [
           ...protectedIds,
           ...initialEnsure.addedIds,
+          ...initialEnsure.reboundIds,
           ...reEnsured.addedIds,
+          ...reEnsured.reboundIds,
         ]);
         return { threads: retained, result: retained };
       },
@@ -1731,7 +1817,15 @@ export async function openclawChatRoute(
       };
     }
 
-    const agentId = cleanInputText(input.agentId, 80) ?? existing?.agentId ?? "openclaw";
+    const explicitAgentId = cleanInputText(input.agentId, 80);
+    if (explicitAgentId !== undefined && !/[a-z0-9]/i.test(explicitAgentId)) {
+      return {
+        ok: false,
+        error: "INVALID_AGENT_ID",
+        message: "OpenClaw agentId must contain at least one alphanumeric character.",
+      };
+    }
+    const agentId = explicitAgentId ?? existing?.agentId ?? "openclaw";
     const gatewayToken =
       extractedToken ?? existing?.gatewayToken ?? csprngId("oc_sess_", 20);
     const authorityMode =
@@ -1763,6 +1857,23 @@ export async function openclawChatRoute(
       enabledCollections,
     };
     await persistConnectionSettings(ctx, updated);
+
+    await mutateThreads(ctx, [], current => {
+      let changed = false;
+      const next = current.map(t => {
+        if (t.status === "running") return t;
+        const expectedKey = resolveThreadSessionKey(t, updated.agentId);
+        if (t.sessionKey === expectedKey) return t;
+        changed = true;
+        const rebound = bindThreadToAgentSession(t, updated.agentId, expectedKey);
+        bridge?.updateSessionAudience(expectedKey, {
+          ownerUserId: t.ownerUserId ?? currentUserId,
+          visibility: t.visibility ?? "personal",
+        });
+        return rebound;
+      });
+      return { threads: changed ? next : current, result: undefined };
+    });
 
     if (bridge && classifyTransportMode(gatewayUrl) === "gateway-ws") {
       await bridge.connect(updated, async patch => {
@@ -1861,11 +1972,14 @@ export async function openclawChatRoute(
       (collections.some(c => c.slug === "products") ? "products" : "pages & storefront");
     const now = new Date().toISOString();
     const convId = csprngId("conv_", 8);
+    const initialAgent = connection?.agentId ?? "openclaw";
+    const initialSessionKey = buildCanonicalSessionKey(initialAgent, convId);
     const newThread: ConversationThread = {
       conversationId: convId,
       ownerUserId: currentUserId,
       visibility,
-      sessionKey: buildCanonicalSessionKey(connection?.agentId ?? "openclaw", convId),
+      sessionKey: initialSessionKey,
+      agentSessionKeys: { [normalizeOpenClawAgentSegment(initialAgent)]: initialSessionKey },
       title,
       scopeGroup,
       boundEntry,
@@ -1900,14 +2014,20 @@ export async function openclawChatRoute(
           if (t.conversationId !== targetId) return t;
           const nextVis: "personal" | "shared" =
             t.visibility === "shared" ? "personal" : "shared";
-          const sessionKey =
-            t.sessionKey ??
-            buildCanonicalSessionKey(connection?.agentId ?? "openclaw", t.conversationId);
-          bridge?.updateSessionAudience(sessionKey, {
+          const audience = {
             ownerUserId: t.ownerUserId ?? currentUserId,
             visibility: nextVis,
-          });
-          return { ...t, sessionKey, visibility: nextVis, updatedAt: new Date().toISOString() };
+          };
+          if (t.status === "running" && t.sessionKey) {
+            bridge?.updateSessionAudience(t.sessionKey, audience);
+            return { ...t, visibility: nextVis, updatedAt: new Date().toISOString() };
+          }
+          const rebound = bindThreadToAgentSession(t, connection?.agentId ?? "openclaw");
+          if (t.sessionKey && t.sessionKey !== rebound.sessionKey) {
+            bridge?.updateSessionAudience(t.sessionKey, audience);
+          }
+          bridge?.updateSessionAudience(rebound.sessionKey!, audience);
+          return { ...rebound, visibility: nextVis, updatedAt: new Date().toISOString() };
         });
         return { threads: next, result: false };
       });
@@ -2667,7 +2787,9 @@ export async function openclawChatRoute(
       const abortRes = await bridge.abortTurn({
         connection,
         sessionKey:
-          target.sessionKey ?? buildCanonicalSessionKey(connection.agentId, target.conversationId),
+          target.status === "running" && target.sessionKey
+            ? target.sessionKey
+            : resolveThreadSessionKey(target, connection.agentId),
         runId: target.activeRunId,
       });
       if (!abortRes.ok) {
@@ -2811,8 +2933,18 @@ export async function openclawChatRoute(
         visible.find(t => isOwnedPersonalThread(t, currentUserId)) ??
         visible[0]!;
       const targetConvId = targetThread.conversationId;
+      const reboundTarget =
+        action === "steer_turn" && targetThread.status === "running" && targetThread.sessionKey
+          ? targetThread
+          : bindThreadToAgentSession(targetThread, agentId);
       const sessionKey =
-        targetThread.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
+        reboundTarget.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
+      const switchedAgentSession = Boolean(
+        action === "send_message" &&
+          targetThread.messages.length > 0 &&
+          targetThread.lastTurnSessionKey &&
+          targetThread.lastTurnSessionKey !== sessionKey,
+      );
       const next = ensured.threads.map(t => {
         if (t.conversationId !== targetConvId) return t;
         const autoTitle =
@@ -2822,6 +2954,9 @@ export async function openclawChatRoute(
         return {
           ...t,
           sessionKey,
+          ...(reboundTarget.agentSessionKeys
+            ? { agentSessionKeys: reboundTarget.agentSessionKeys }
+            : {}),
           title: autoTitle,
           status: "running" as const,
           updatedAt: now,
@@ -2832,6 +2967,7 @@ export async function openclawChatRoute(
         ...protectedIds,
         targetConvId,
         ...ensured.addedIds,
+        ...ensured.reboundIds,
       ]);
       return {
         threads: retained,
@@ -2839,6 +2975,7 @@ export async function openclawChatRoute(
           targetThread,
           targetConvId,
           sessionKey,
+          switchedAgentSession,
           initialAudience: {
             ownerUserId: targetThread.ownerUserId ?? currentUserId,
             visibility: targetThread.visibility ?? ("personal" as const),
@@ -2847,7 +2984,7 @@ export async function openclawChatRoute(
       };
     });
 
-    const { targetThread, targetConvId, sessionKey } = startedInfo;
+    const { targetThread, targetConvId, sessionKey, switchedAgentSession } = startedInfo;
     const readLiveAudience = async () =>
       resolveThreadAudience(await loadThreads(ctx), targetConvId, currentUserId);
 
@@ -2989,6 +3126,9 @@ export async function openclawChatRoute(
         turnFinalStatus = "failed";
       } else {
         const preSendAudience = await readLiveAudience();
+        const priorContext = switchedAgentSession
+          ? formatPriorConversationContext(targetThread.messages)
+          : "";
         const gwResult = await bridge.sendTurn({
           connection,
           conversationId: targetConvId,
@@ -2998,7 +3138,7 @@ export async function openclawChatRoute(
           messageId: assistantMsgId,
           sessionKey,
           prompt,
-          systemContext: `${catalogDigest}${proposalInstruction}`,
+          systemContext: `${catalogDigest}${proposalInstruction}${priorContext}`,
           steer: action === "steer_turn",
           callerIsAdmin: role >= ADMIN,
           expectedRunId: targetThread.activeRunId,
@@ -3247,6 +3387,9 @@ export async function openclawChatRoute(
       });
     }
 
+    const latestPostTurnConn = await readConnectionSettings(ctx);
+    const postTurnAgentId = latestPostTurnConn?.agentId ?? agentId;
+
     const updatedThreads = await mutateThreads(ctx, [targetConvId], current => {
       const hasTarget = current.some(t => t.conversationId === targetConvId);
       const source = hasTarget ? current : [{ ...targetThread, messages: [userMsg] }, ...current];
@@ -3268,14 +3411,18 @@ export async function openclawChatRoute(
             : turnFinalStatus === "stopped" || t.status === "stopped"
               ? ("stopped" as const)
               : ("idle" as const);
-        return {
+        const withTurnBinding: ConversationThread = {
           ...t,
           sessionKey,
+          ...(turnFinalStatus !== "failed" ? { lastTurnSessionKey: sessionKey } : {}),
           status: nextStatus,
           ...(stillStreaming ? {} : { activeRunId: undefined, runPhase: undefined }),
           updatedAt: new Date().toISOString(),
           messages: nextMessages,
         };
+        return stillStreaming
+          ? withTurnBinding
+          : bindThreadToAgentSession(withTurnBinding, postTurnAgentId);
       });
       return { threads: next, result: next };
     });

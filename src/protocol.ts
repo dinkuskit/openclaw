@@ -153,6 +153,8 @@ export interface ConversationThread {
   ownerUserId?: string;
   visibility?: "personal" | "shared";
   sessionKey?: string;
+  agentSessionKeys?: Record<string, string>;
+  lastTurnSessionKey?: string;
   activeRunId?: string;
   runPhase?: string;
   title: string;

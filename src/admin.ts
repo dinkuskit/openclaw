@@ -824,13 +824,13 @@ export async function openclawAdmin(
       );
     }
     const sanitizedGatewayUrl = sanitizeAdminPublicUrl(gatewayUrl);
-    if (!agentId) {
+    if (!agentId || !/[a-z0-9]/i.test(agentId)) {
       return setupPage(
         true,
         collections,
         siteOrigin,
         pairingCode,
-        "Enter the default OpenClaw agent ID.",
+        "Enter a valid OpenClaw agent ID containing letters or numbers.",
       );
     }
     if (!gatewayToken) {
@@ -1388,7 +1388,15 @@ export async function openclawPairRoute(
       rawGatewayUrl.startsWith("ws://localhost:"))
       ? sanitizeAdminPublicUrl(rawGatewayUrl)
       : "https://agent-session.openclaw.local";
-  const agentId = cleanText(input.agentId, 80) ?? "openclaw";
+  const explicitAgentId = cleanText(input.agentId, 80);
+  if (explicitAgentId !== undefined && !/[a-z0-9]/i.test(explicitAgentId)) {
+    return {
+      ok: false,
+      error: "INVALID_AGENT_ID",
+      message: "OpenClaw agentId must contain at least one alphanumeric character.",
+    };
+  }
+  const agentId = explicitAgentId ?? "openclaw";
   const sessionToken = cleanText(input.gatewayToken, 300) ?? csprngToken("oc_sess_", 20);
   const authorityMode =
     input.authorityMode === "read_only" ? "read_only" : "propose_with_approval";

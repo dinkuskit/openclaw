@@ -4,6 +4,27 @@ import { WebSocketServer } from "ws";
 import { createPlugin } from "../dist/native.mjs";
 import { GET as streamGet } from "../dist/stream-endpoint.mjs";
 
+function checkMockSessionRequestAgent(sessionKey, explicitAgentId) {
+  const keyMatch = /^agent:([^:]+):(.+)$/i.exec(String(sessionKey ?? "").trim());
+  const keyAgentId = keyMatch ? keyMatch[1].toLowerCase() : null;
+  if (explicitAgentId !== undefined) {
+    const normalizedExplicit = String(explicitAgentId)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+/, "")
+      .replace(/-+$/, "")
+      .slice(0, 64);
+    if (!normalizedExplicit) {
+      return `Unknown agent id "${explicitAgentId}"`;
+    }
+    if (keyAgentId && keyAgentId !== normalizedExplicit) {
+      return `agent "${explicitAgentId}" does not match session key agent "${keyAgentId}"`;
+    }
+  }
+  return null;
+}
+
 function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const receivedFrames = [];
@@ -79,12 +100,25 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
       }
 
       if (frame.method === "sessions.messages.subscribe") {
+        const keyVal = frame.params.key ?? frame.params.sessionKey;
+        const mismatch = checkMockSessionRequestAgent(keyVal, frame.params.agentId);
+        if (mismatch) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: { code: "INVALID_REQUEST", message: mismatch },
+            }),
+          );
+          return;
+        }
         ws.send(
           JSON.stringify({
             type: "res",
             id: frame.id,
             ok: true,
-            payload: { subscribed: true, sessionKey: frame.params.sessionKey },
+            payload: { subscribed: true, sessionKey: keyVal },
           }),
         );
         return;
@@ -96,6 +130,21 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
           false,
           "2026.11.1 ChatSendParamsSchema forbids expectedRunId",
         );
+        const mismatch = checkMockSessionRequestAgent(
+          frame.params.sessionKey,
+          frame.params.agentId,
+        );
+        if (mismatch) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: { code: "INVALID_REQUEST", message: mismatch },
+            }),
+          );
+          return;
+        }
         if (frame.params.queueMode === "steer") {
           steerSendPayload = frame.params;
           ws.send(
@@ -244,6 +293,21 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
       }
 
       if (frame.method === "chat.abort") {
+        const mismatch = checkMockSessionRequestAgent(
+          frame.params.sessionKey,
+          frame.params.agentId,
+        );
+        if (mismatch) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: { code: "INVALID_REQUEST", message: mismatch },
+            }),
+          );
+          return;
+        }
         chatAbortPayload = frame.params;
         ws.send(
           JSON.stringify({
@@ -1190,5 +1254,162 @@ test("Gateway bridge isolates steer terminal events, honours Gateway approval/ab
     ).catch(() => {});
     for (const c of wss.clients) c.terminate();
     await new Promise(r => wss.close(() => r()));
+  }
+});
+
+test("Rebinds pre-pairing and existing conversation session keys when selecting or switching agents", async () => {
+  const gw = await startMockOpenClawGateway({ grantApprovalsScope: false });
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+
+  try {
+    // 1. Open workspace BEFORE pairing: creates default conversation bound to `agent:openclaw:...`
+    const initialSnap = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: { action: "get_workspace" },
+      }),
+    );
+    assert.equal(initialSnap.paired, false);
+    const initialThread = initialSnap.threads[0];
+    assert.ok(initialThread);
+    assert.match(initialThread.sessionKey, /^agent:openclaw:emdash:/);
+
+    // 2. Reject unrepresentable punctuation-only agentId
+    const invalidAgent = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: `ws://127.0.0.1:${gw.port}`,
+          gatewayToken: "oc_tok_rebind",
+          agentId: "!!!",
+        },
+      }),
+    );
+    assert.equal(invalidAgent.ok, false);
+    assert.equal(invalidAgent.error, "INVALID_AGENT_ID");
+
+    // 3. Configure custom agent `roboclaw`: default conversation must rebind to `agent:roboclaw:...`
+    const configuredRoboclaw = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: `ws://127.0.0.1:${gw.port}`,
+          gatewayToken: "oc_tok_rebind",
+          agentId: "roboclaw",
+        },
+      }),
+    );
+    assert.equal(configuredRoboclaw.ok, true);
+    const reboundThread = configuredRoboclaw.threads.find(
+      t => t.conversationId === initialThread.conversationId,
+    );
+    assert.equal(
+      reboundThread.sessionKey,
+      `agent:roboclaw:emdash:${initialThread.conversationId}`,
+    );
+
+    // 4. Send message in the initial conversation: mock Gateway strictly enforces agentId === sessionKey agent!
+    const firstTurn = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          conversationId: initialThread.conversationId,
+          prompt: "Audit the field jacket copy.",
+        },
+      }),
+    );
+    const afterFirstTurn = firstTurn.threads.find(
+      t => t.conversationId === initialThread.conversationId,
+    );
+    assert.equal(afterFirstTurn.status, "idle");
+    assert.equal(
+      afterFirstTurn.messages.at(-1).status,
+      "completed",
+      "Initial pre-pairing conversation must succeed after configuring custom agentId",
+    );
+
+    // 5. Switch agent to `Shop Captain` (normalized `shop-captain`) and continue the SAME conversation
+    const switchedAgent = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          agentId: "Shop Captain",
+        },
+      }),
+    );
+    assert.equal(switchedAgent.ok, true);
+    const secondTurn = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          conversationId: initialThread.conversationId,
+          prompt: "Now make that summary even punchier.",
+        },
+      }),
+    );
+    const afterSecondTurn = secondTurn.threads.find(
+      t => t.conversationId === initialThread.conversationId,
+    );
+    assert.equal(
+      afterSecondTurn.sessionKey,
+      `agent:shop-captain:emdash:${initialThread.conversationId}`,
+    );
+    assert.equal(afterSecondTurn.messages.at(-1).status, "completed");
+
+    const chatSendFrames = gw.receivedFrames.filter(
+      f => f.type === "req" && f.method === "chat.send",
+    );
+    assert.equal(chatSendFrames.length, 2);
+    assert.equal(
+      chatSendFrames[0].params.sessionKey,
+      `agent:roboclaw:emdash:${initialThread.conversationId}`,
+    );
+    assert.equal(chatSendFrames[0].params.agentId, "roboclaw");
+    assert.equal(
+      chatSendFrames[1].params.sessionKey,
+      `agent:shop-captain:emdash:${initialThread.conversationId}`,
+    );
+    assert.equal(chatSendFrames[1].params.agentId, "Shop Captain");
+    assert.match(
+      chatSendFrames[1].params.message,
+      /<prior_conversation_transcript>/,
+      "First turn after switching agents should include prior EmDash transcript context",
+    );
+  } finally {
+    await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: { action: "disconnect" },
+      }),
+    ).catch(() => {});
+    await gw.close();
   }
 });
