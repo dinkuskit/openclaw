@@ -28,7 +28,31 @@ export interface PendingProposal {
   entryId?: string;
   summary: string;
   targetTool: string;
+  proposedFields?: Record<string, string>;
   createdAt: string;
+}
+
+const EXCLUDED_EXTERNAL_PATCH_FIELDS = new Set([
+  "seoTitle",
+  "seoDescription",
+  "seoImage",
+  "canonicalUrl",
+  "noindex",
+  "status",
+  "publishedAt",
+  "_rev",
+  "id",
+]);
+
+function extractSafeExternalFields(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!EXCLUDED_EXTERNAL_PATCH_FIELDS.has(k) && typeof v === "string") {
+      out[k] = v.slice(0, 4000);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 interface Action {
@@ -1112,6 +1136,7 @@ export async function openclawPairRoute(
                   targetTool: { type: "string" },
                   collection: { type: "string" },
                   entryId: { type: "string" },
+                  proposedFields: { type: "object" },
                 },
                 required: ["summary"],
               },
@@ -1152,17 +1177,26 @@ export async function openclawPairRoute(
       }
       if (toolName === "emdash_submit_proposal" && ctx.kv) {
         const proposals = await loadProposals(ctx);
+        const proposedFields = extractSafeExternalFields(args.proposedFields);
         const proposal: PendingProposal = {
-          proposalId: `prop_${Date.now()}`,
+          proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           agentId: connection?.agentId ?? "openclaw",
           collection: cleanText(args.collection, 60),
           entryId: cleanText(args.entryId, 80),
           summary: cleanText(args.summary, 300) ?? "Agent proposal",
           targetTool: cleanText(args.targetTool, 80) ?? "content:update",
+          ...(proposedFields ? { proposedFields } : {}),
           createdAt: new Date().toISOString(),
         };
         proposals.push(proposal);
         await ctx.kv.set("pending_proposals", proposals);
+        publishOpenClawEvent({
+          type: "workspace_sync",
+          conversationId: "conv_default",
+          reason: "external_agent_proposal",
+          timestamp: new Date().toISOString(),
+          visibility: "shared",
+        });
         return {
           jsonrpc: "2.0",
           id,
@@ -1233,20 +1267,22 @@ export async function openclawPairRoute(
     }
     if (action === "propose" && ctx.kv) {
       const proposals = await loadProposals(ctx);
+      const proposedFields = extractSafeExternalFields(input.proposedFields);
       const proposal: PendingProposal = {
-        proposalId: `prop_${Date.now()}`,
+        proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         agentId: connection.agentId,
         collection: cleanText(input.collection, 60),
         entryId: cleanText(input.entryId, 80),
         summary: cleanText(input.summary, 300) ?? "Proposed content update",
         targetTool: cleanText(input.targetTool, 80) ?? "content:update",
+        ...(proposedFields ? { proposedFields } : {}),
         createdAt: new Date().toISOString(),
       };
       proposals.push(proposal);
       await ctx.kv.set("pending_proposals", proposals);
       publishOpenClawEvent({
         type: "workspace_sync",
-        conversationId: "conv_catalog_overview",
+        conversationId: "conv_default",
         reason: "external_agent_proposal",
         timestamp: new Date().toISOString(),
         visibility: "shared",

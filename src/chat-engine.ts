@@ -431,47 +431,108 @@ function isThreadVisibleToUser(thread: ConversationThread, userId: string): bool
 
 export async function loadRevisionProposals(ctx: PluginContext): Promise<RevisionProposal[]> {
   if (!ctx.kv) return [];
-  const v2 = await ctx.kv.get("revision_proposals_v2");
-  if (Array.isArray(v2)) {
-    return (v2 as RevisionProposal[]).map(p => ({
-      ...p,
-      revisionNumber: typeof p.revisionNumber === "number" ? p.revisionNumber : 1,
-    }));
-  }
+  const rawV2 = await ctx.kv.get("revision_proposals_v2");
+  const v2List: RevisionProposal[] = Array.isArray(rawV2)
+    ? (rawV2 as RevisionProposal[]).map(p => ({
+        ...p,
+        revisionNumber: typeof p.revisionNumber === "number" ? p.revisionNumber : 1,
+      }))
+    : [];
 
   const legacy = await ctx.kv.get("pending_proposals");
-  if (Array.isArray(legacy) && legacy.length > 0) {
-    const migrated: RevisionProposal[] = legacy.map((item: Record<string, unknown>, idx) => ({
-      proposalId: typeof item.proposalId === "string" ? item.proposalId : `prop_legacy_${idx}`,
+  if (!Array.isArray(legacy) || legacy.length === 0) {
+    return v2List;
+  }
+
+  const existingIds = new Set(v2List.map(p => p.proposalId));
+  const newlyImported: RevisionProposal[] = [];
+
+  for (let idx = 0; idx < legacy.length; idx++) {
+    const item = legacy[idx] as Record<string, unknown>;
+    const proposalId =
+      typeof item.proposalId === "string" ? item.proposalId : `prop_legacy_${idx}`;
+    if (existingIds.has(proposalId)) continue;
+    existingIds.add(proposalId);
+
+    const collection = typeof item.collection === "string" ? item.collection : "pages";
+    const entryId = typeof item.entryId === "string" ? item.entryId : "current";
+    const summary =
+      typeof item.summary === "string" ? item.summary : "Proposed content change";
+
+    const proposedFields: Record<string, unknown> = {};
+    if (item.proposedFields && typeof item.proposedFields === "object") {
+      for (const [k, v] of Object.entries(item.proposedFields as Record<string, unknown>)) {
+        if (!EXCLUDED_DRAFT_ONLY_FIELDS.has(k) && typeof v === "string") {
+          proposedFields[k] = v;
+        }
+      }
+    }
+
+    let entrySlug = entryId;
+    let entryTitle = entryId === "current" ? "External Agent Proposal" : entryId;
+    let baseRev = "pending-browser-rev";
+    let diffs: ContentFieldDiff[] = [
+      {
+        field: "summary",
+        label: "External Summary (No Concrete Patch)",
+        before: "(current saved content)",
+        after: summary,
+        addedLines: 0,
+        removedLines: 0,
+      },
+    ];
+
+    if (entryId !== "current") {
+      const { item: stored } = await getSingleContentItem(ctx, collection, entryId);
+      if (stored) {
+        entrySlug = stored.slug;
+        entryTitle = stored.title;
+        if (stored._rev) baseRev = stored._rev;
+      }
+      if (Object.keys(proposedFields).length > 0) {
+        diffs = Object.entries(proposedFields).map(([field, val]) => {
+          const rawBefore = stored?.fields[field];
+          const beforeVal =
+            typeof rawBefore === "string"
+              ? rawBefore
+              : field === "title" || field === "name"
+                ? (stored?.title ?? "")
+                : "";
+          return {
+            field,
+            label: field,
+            before: beforeVal || "(empty)",
+            after: String(val),
+            ...countDiffLines(beforeVal, String(val)),
+          };
+        });
+      }
+    }
+
+    newlyImported.push({
+      proposalId,
       revisionNumber: 1,
-      conversationId: "conv_catalog_overview",
+      conversationId: "conv_default",
       agentId: typeof item.agentId === "string" ? item.agentId : "openclaw",
-      collection: typeof item.collection === "string" ? item.collection : "pages",
-      entryId: typeof item.entryId === "string" ? item.entryId : "current",
-      entrySlug: typeof item.entryId === "string" ? item.entryId : "current",
-      entryTitle: typeof item.entryId === "string" ? item.entryId : "Store Entry",
-      baseRev: "pending-browser-rev",
-      summary: typeof item.summary === "string" ? item.summary : "Proposed content change",
+      collection,
+      entryId,
+      entrySlug,
+      entryTitle,
+      baseRev,
+      summary,
       targetTool: typeof item.targetTool === "string" ? item.targetTool : "content:update",
-      proposedFields: {},
-      diffs: [
-        {
-          field: "summary",
-          label: "Proposed Change",
-          before: "(current saved content)",
-          after: typeof item.summary === "string" ? item.summary : "Proposed update",
-          addedLines: 1,
-          removedLines: 0,
-        },
-      ],
+      proposedFields: entryId === "current" ? {} : proposedFields,
+      diffs,
       status: "pending",
       createdAt: typeof item.createdAt === "string" ? item.createdAt : new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    }));
-    await ctx.kv.set("revision_proposals_v2", migrated);
-    return migrated;
+    });
   }
-  return [];
+
+  const merged = [...newlyImported, ...v2List].slice(0, 80);
+  await ctx.kv.set("revision_proposals_v2", merged);
+  await ctx.kv.delete("pending_proposals");
+  return merged;
 }
 
 export async function saveRevisionProposals(
@@ -923,7 +984,7 @@ export async function buildWorkspaceSnapshot(
 
   const allProposals = await loadRevisionProposals(ctx);
   const visibleProposals = allProposals.filter(
-    p => visibleConvIds.has(p.conversationId) || (isAdmin && p.conversationId === "conv_default"),
+    p => visibleConvIds.has(p.conversationId) || p.conversationId === "conv_default",
   );
 
   const allExecApprovals = await mergeExecApprovals(ctx);
@@ -1007,6 +1068,12 @@ async function verifyFieldsOnStoredEntry(
   ctx: PluginContext,
   proposal: RevisionProposal,
 ): Promise<{ checked: boolean; matches: boolean }> {
+  const fieldEntries = Object.entries(proposal.proposedFields ?? {}).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+  if (fieldEntries.length === 0 || proposal.entryId === "current") {
+    return { checked: true, matches: false };
+  }
   const ext = ctx as unknown as ExtendedPluginContext;
   const { item, raw, hasContentGet } = await getSingleContentItem(
     ctx,
@@ -1020,8 +1087,8 @@ async function verifyFieldsOnStoredEntry(
   if (!item) {
     return { checked: true, matches: false };
   }
-  for (const [key, expectedVal] of Object.entries(proposal.proposedFields)) {
-    if (typeof expectedVal === "string" && item.fields[key] !== expectedVal) {
+  for (const [key, expectedVal] of fieldEntries) {
+    if (item.fields[key] !== expectedVal) {
       if (
         !ext.content?.getRevision &&
         raw?.status === "published" &&
@@ -1042,6 +1109,9 @@ function resolveThreadAudience(
   conversationId: string,
   fallbackUserId: string,
 ): { ownerUserId?: string; visibility: "personal" | "shared" } {
+  if (conversationId === "conv_default") {
+    return { visibility: "shared" };
+  }
   const thread = threads.find(t => t.conversationId === conversationId);
   if (!thread) {
     return { ownerUserId: fallbackUserId, visibility: "personal" };
@@ -1325,13 +1395,21 @@ export async function openclawChatRoute(
   if (action === "toggle_thread_visibility") {
     const targetId = preferredConversationId;
     if (targetId) {
+      const connection = await readConnectionSettings(ctx);
+      const bridge = getHostGatewayBridge();
       const threads = await loadThreads(ctx);
       const next = threads.map(t => {
         if (t.conversationId !== targetId) return t;
         if (t.ownerUserId && t.ownerUserId !== currentUserId && role < ADMIN) return t;
         const nextVis: "personal" | "shared" =
           t.visibility === "shared" ? "personal" : "shared";
-        return { ...t, visibility: nextVis, updatedAt: new Date().toISOString() };
+        const sessionKey =
+          t.sessionKey ?? buildCanonicalSessionKey(connection?.agentId ?? "openclaw", t.conversationId);
+        bridge?.updateSessionAudience(sessionKey, {
+          ownerUserId: t.ownerUserId ?? currentUserId,
+          visibility: nextVis,
+        });
+        return { ...t, sessionKey, visibility: nextVis, updatedAt: new Date().toISOString() };
       });
       await saveThreads(ctx, next);
     }
@@ -1472,23 +1550,66 @@ export async function openclawChatRoute(
             sanitizedPatch[k] = v;
           }
         }
+        if (Object.keys(sanitizedPatch).length === 0 || parent.entryId === "current") {
+          return {
+            ok: false,
+            error: "NO_CONCRETE_PATCH",
+            message:
+              "Provide at least one draft-safe field edit on a concrete EmDash entry before revising.",
+          };
+        }
         const now = new Date().toISOString();
         const nextProposalId = csprngId("prop_", 8);
         const mergedFields = { ...parent.proposedFields, ...sanitizedPatch };
-        const nextDiffs = parent.diffs.map(d =>
-          d.field in sanitizedPatch
-            ? {
-                ...d,
-                after: sanitizedPatch[d.field] as string,
-                ...countDiffLines(d.before, sanitizedPatch[d.field] as string),
-              }
-            : d,
+        const { item: storedEntry } = await getSingleContentItem(
+          ctx,
+          parent.collection,
+          parent.entryId,
+          parent.locale,
         );
+        const existingDiffFields = new Set(parent.diffs.map(d => d.field));
+        const updatedExistingDiffs = parent.diffs
+          .filter(d => d.field in mergedFields)
+          .map(d =>
+            d.field in sanitizedPatch
+              ? {
+                  ...d,
+                  after: sanitizedPatch[d.field] as string,
+                  ...countDiffLines(
+                    d.before === "(empty)" ? "" : d.before,
+                    sanitizedPatch[d.field] as string,
+                  ),
+                }
+              : d,
+          );
+        const addedDiffs: ContentFieldDiff[] = Object.entries(sanitizedPatch)
+          .filter(([field]) => !existingDiffFields.has(field))
+          .map(([field, val]) => {
+            const rawBefore = storedEntry?.fields[field];
+            const beforeVal =
+              typeof rawBefore === "string"
+                ? rawBefore
+                : field === "title" || field === "name"
+                  ? (storedEntry?.title ?? "")
+                  : "";
+            return {
+              field,
+              label: field,
+              before: beforeVal || "(empty)",
+              after: String(val),
+              ...countDiffLines(beforeVal, String(val)),
+            };
+          });
+        const nextDiffs = [...updatedExistingDiffs, ...addedDiffs];
         const revised: RevisionProposal = {
           ...parent,
           proposalId: nextProposalId,
           revisionNumber: (parent.revisionNumber ?? 1) + 1,
           supersedesProposalId: parent.proposalId,
+          baseRev:
+            parent.baseRev === "pending-browser-rev" && storedEntry?._rev
+              ? storedEntry._rev
+              : parent.baseRev,
           proposedFields: mergedFields,
           diffs: nextDiffs,
           status: "pending",
@@ -1580,6 +1701,18 @@ export async function openclawChatRoute(
           action === "reconcile_proposal" ? target.status : (statusRaw ?? target.status);
         let reconciledServerSide = target.reconciledServerSide;
         let finalError = errorMessage;
+
+        if (
+          (verifiedStatus === "applied" || verifiedStatus === "outcome_unknown") &&
+          Object.keys(target.proposedFields ?? {}).length === 0
+        ) {
+          return {
+            ok: false,
+            error: "NO_CONCRETE_PATCH",
+            message:
+              "Summary-only proposal has no concrete field patch and cannot be marked applied.",
+          };
+        }
 
         // Server-side content reconciliation: never trust a browser `applied` claim if stored CMS fields disagree,
         // and recover `outcome_unknown` automatically if the PUT landed before the network dropped!
@@ -2021,7 +2154,10 @@ export async function openclawChatRoute(
 
         if (!gwResult.ok && gwResult.status === "failed") {
           turnFinalStatus = "failed";
-          assistantReply = `**OpenClaw Gateway Error:** ${gwResult.errorMessage ?? "Connection failed."}\n\nOpen **Gateway & Pairing** in the bottom-left sidebar to verify your Gateway WebSocket endpoint (\`ws://127.0.0.1:18789\` / \`ws://127.0.0.1:19301\` or \`wss://...\`) and token/device pairing.`;
+          const partialPrefix = gwResult.replyText.trim()
+            ? `${gwResult.replyText.trim()}\n\n---\n`
+            : "";
+          assistantReply = `${partialPrefix}**OpenClaw Gateway Error:** ${gwResult.errorMessage ?? "Connection failed."}\n\nOpen **Gateway & Pairing** in the bottom-left sidebar to verify your Gateway WebSocket endpoint (\`ws://127.0.0.1:18789\` / \`ws://127.0.0.1:19301\` or \`wss://...\`) and token/device pairing.`;
         } else {
           turnFinalStatus = gwResult.status;
           if (action === "steer_turn" && !gwResult.replyText) {
@@ -2134,6 +2270,8 @@ export async function openclawChatRoute(
         ].join("\n");
       }
 
+      const streamThreads = await loadThreads(ctx);
+      const streamAudience = resolveThreadAudience(streamThreads, targetConvId, currentUserId);
       const chunks = assistantReply.match(/.{1,80}(\s|$)/gs) ?? [assistantReply];
       let acc = "";
       for (const chunk of chunks) {
@@ -2145,7 +2283,7 @@ export async function openclawChatRoute(
           delta: chunk,
           content: acc,
           timestamp: new Date().toISOString(),
-          ...audience,
+          ...streamAudience,
         });
       }
     }

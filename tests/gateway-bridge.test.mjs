@@ -532,6 +532,89 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     );
     assert.ok(authMcp.result);
 
+    // 7. External `/pair` proposals submitted AFTER `revision_proposals_v2` exists are ingested,
+    //    visible to any admin via `conv_default`, and summary-only imports cannot vacuously apply!
+    await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          jsonrpc: "2.0",
+          id: 79,
+          method: "tools/call",
+          params: {
+            name: "emdash_submit_proposal",
+            arguments: { summary: "Summary-only note from external CLI" },
+          },
+        },
+      }),
+    );
+
+    const otherAdminSnap = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_other_admin",
+        sharedSettings,
+        sharedKv,
+        input: { action: "get_workspace" },
+      }),
+    );
+    const summaryOnlyProp = otherAdminSnap.proposals.find(
+      p => p.summary === "Summary-only note from external CLI",
+    );
+    assert.ok(summaryOnlyProp, "External proposal must ingest even after v2 store exists");
+    assert.equal(summaryOnlyProp.conversationId, "conv_default");
+    assert.deepEqual(summaryOnlyProp.proposedFields, {});
+
+    const vacuousApplyAttempt = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_other_admin",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "record_proposal_receipt",
+          proposalId: summaryOnlyProp.proposalId,
+          status: "applied",
+        },
+      }),
+    );
+    assert.equal(vacuousApplyAttempt.ok, false);
+    assert.equal(vacuousApplyAttempt.error, "NO_CONCRETE_PATCH");
+
+    await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          action: "propose",
+          collection: "products",
+          entryId: "prod_01",
+          summary: "Concrete external patch",
+          proposedFields: { excerpt: "External agent waxed cotton copy", seoTitle: "Ignored SEO" },
+        },
+      }),
+    );
+    const afterConcreteSnap = await chat(
+      makeCtx({
+        role: 50,
+        userId: "u_other_admin",
+        sharedSettings,
+        sharedKv,
+        input: { action: "get_workspace" },
+      }),
+    );
+    const concreteExt = afterConcreteSnap.proposals.find(
+      p => p.summary === "Concrete external patch",
+    );
+    assert.ok(concreteExt);
+    assert.equal(concreteExt.proposedFields.excerpt, "External agent waxed cotton copy");
+    assert.equal("seoTitle" in concreteExt.proposedFields, false);
+
     // Cleanly disconnect Gateway client before closing server
     await chat(
       makeCtx({

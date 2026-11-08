@@ -107,6 +107,7 @@ export async function ensureProposalBaseRevs(
   let latestSnapshot: OpenClawWorkspaceSnapshot | null = null;
   for (const prop of proposals) {
     if (prop.status !== "pending") continue;
+    if (Object.keys(prop.proposedFields ?? {}).length === 0) continue;
     if (prop.baseRev && !prop.baseRev.startsWith("v") && prop.baseRev !== "pending-browser-rev") {
       continue;
     }
@@ -164,6 +165,12 @@ export async function applyRevisionProposal(
     if (nextProp) {
       activeProposal = nextProp;
     }
+  }
+
+  if (Object.keys(activeProposal.proposedFields ?? {}).length === 0) {
+    throw new Error(
+      "Summary-only external proposal has no concrete field patch. Edit & Approve on a bound entry or create a concrete draft proposal first.",
+    );
   }
 
   const live = await fetchLiveEntryWithRev(

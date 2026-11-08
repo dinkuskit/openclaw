@@ -66,6 +66,10 @@ export interface HostGatewayBridge {
     }) => Promise<void>,
   ): Promise<GatewayBridgeStatus>;
   disconnect(): Promise<void>;
+  updateSessionAudience(
+    sessionKey: string,
+    audience: { ownerUserId?: string; visibility: "personal" | "shared" },
+  ): void;
   sendTurn(req: GatewayTurnRequest): Promise<GatewayTurnResult>;
   abortTurn(params: {
     connection: OpenClawConnection;

@@ -176,7 +176,8 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   const [theme, setTheme] = createSignal<"dark" | "light">("dark");
   const [snapshot, setSnapshot] = createSignal<OpenClawWorkspaceSnapshot | null>(null);
   const [loading, setLoading] = createSignal(true);
-  const [sending, setSending] = createSignal(false);
+  const [activeTurnRequests, setActiveTurnRequests] = createSignal(0);
+  const [steeringInFlight, setSteeringInFlight] = createSignal(false);
   const [streamingText, setStreamingText] = createSignal("");
   const [streamingTools, setStreamingTools] = createSignal<ToolCallTrace[]>([]);
   const [streamState, setStreamState] = createSignal<"live" | "reconnecting" | "buffered">("live");
@@ -236,6 +237,19 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       snap.threads.find(t => t.conversationId === snap.activeConversationId) ?? snap.threads[0]
     );
   });
+
+  const sending = createMemo(
+    () => activeTurnRequests() > 0 || activeThread()?.status === "running",
+  );
+
+  const renderedMessages = createMemo(() =>
+    (activeThread()?.messages ?? []).filter(
+      m => !(m.role === "assistant" && m.status === "streaming" && !m.content),
+    ),
+  );
+
+  const hasConcretePatch = (p: RevisionProposal) =>
+    Object.keys(p.proposedFields ?? {}).length > 0 && p.entryId !== "current";
 
   const groupedThreads = createMemo(() => {
     const snap = snapshot();
@@ -374,12 +388,15 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       onStatus: status => setStreamState(status),
       onEvent: event => {
         if (event.type === "assistant_delta") {
+          if (event.conversationId !== snapshot()?.activeConversationId) return;
           setStreamingText(event.content);
           setRunStartupPhase(null);
           scrollTranscriptToBottom();
         } else if (event.type === "run_status") {
+          if (event.conversationId !== snapshot()?.activeConversationId) return;
           setRunStartupPhase(event.phase);
         } else if (event.type === "tool_call") {
+          if (event.conversationId !== snapshot()?.activeConversationId) return;
           setStreamingTools(prev => {
             const idx = prev.findIndex(t => t.callId === event.toolCall.callId);
             if (idx >= 0) {
@@ -477,35 +494,50 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       return;
     }
 
+    const targetConversationId = snapshot()?.activeConversationId;
     setComposerText("");
     if (textareaRef) textareaRef.style.height = "38px";
-    setSending(true);
-    setStreamingText("");
-    setStreamingTools([]);
     stickToBottom = true;
+
+    if (isSteer) {
+      setSteeringInFlight(true);
+    } else {
+      setActiveTurnRequests(n => n + 1);
+      setStreamingText("");
+      setStreamingTools([]);
+    }
 
     try {
       const snap = await callOpenClawChat({
         action: isSteer ? "steer_turn" : "send_message",
         prompt: text,
-        conversationId: snapshot()?.activeConversationId,
+        conversationId: targetConversationId,
         ...(effectiveBoundEntry() ? { boundEntry: effectiveBoundEntry() } : {}),
       });
       setSnapshot(snap);
       const stamped = await ensureProposalBaseRevs(snap.proposals, snap.activeConversationId);
       if (stamped) setSnapshot(stamped);
       const latestTurnCount =
-        (stamped ?? snap).threads.find(t => t.conversationId === snap.activeConversationId)
-          ?.messages.length ?? 1;
+        (stamped ?? snap).threads
+          .find(t => t.conversationId === snap.activeConversationId)
+          ?.messages.filter(m => !(m.role === "assistant" && m.status === "streaming" && !m.content))
+          .length ?? 1;
       setActiveTurnIdx(Math.max(0, latestTurnCount - 1));
       scrollTranscriptToBottom(true);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Failed to send message");
     } finally {
-      setSending(false);
-      setStreamingText("");
-      setStreamingTools([]);
-      setRunStartupPhase(null);
+      if (isSteer) {
+        setSteeringInFlight(false);
+      } else {
+        const remaining = Math.max(0, activeTurnRequests() - 1);
+        setActiveTurnRequests(remaining);
+        if (remaining === 0) {
+          setStreamingText("");
+          setStreamingTools([]);
+          setRunStartupPhase(null);
+        }
+      }
     }
   };
 
@@ -515,6 +547,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         action: "create_thread",
         title: "New Store Conversation",
       });
+      setStreamingText("");
+      setStreamingTools([]);
+      setRunStartupPhase(null);
       setSnapshot(snap);
       setActiveTurnIdx(0);
       textareaRef?.focus();
@@ -524,6 +559,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   };
 
   const handleSelectThread = async (conversationId: string) => {
+    setStreamingText("");
+    setStreamingTools([]);
+    setRunStartupPhase(null);
     await refreshWorkspace(conversationId);
     scrollTranscriptToBottom(true);
   };
@@ -650,8 +688,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
   const beginEditProposal = (proposal: RevisionProposal) => {
     const init: Record<string, string> = {};
-    for (const d of proposal.diffs) {
-      init[d.field] = d.after;
+    if (Object.keys(proposal.proposedFields ?? {}).length === 0) {
+      init.description = proposal.summary;
+    } else {
+      for (const d of proposal.diffs) {
+        init[d.field] = d.after;
+      }
     }
     setEditFieldDrafts(init);
     setEditingProposalId(proposal.proposalId);
@@ -959,9 +1001,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         </header>
 
         {/* ANTIGRAVITY LEFT-GUTTER VERTICAL TURN-NAVIGATION MINIMAP DOTS */}
-        <Show when={(activeThread()?.messages.length ?? 0) > 0}>
+        <Show when={renderedMessages().length > 0}>
           <nav class="oc-turn-minimap" aria-label="Conversation turns">
-            <For each={activeThread()?.messages ?? []}>
+            <For each={renderedMessages()}>
               {(msg, idx) => (
                 <button
                   type="button"
@@ -995,7 +1037,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
               </div>
             </Show>
 
-            <Show when={!loading() && (activeThread()?.messages.length ?? 0) === 0 && !sending()}>
+            <Show when={!loading() && renderedMessages().length === 0 && !sending()}>
               <div class="oc-empty-hero">
                 <h2>
                   {isEditorPanel()
@@ -1038,7 +1080,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
               </div>
             </Show>
 
-            <For each={activeThread()?.messages ?? []}>
+            <For each={renderedMessages()}>
               {(msg: ChatTurnMessage, idx) => (
                 <div data-turn-idx={idx()}>
                   <Show
@@ -1287,30 +1329,57 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                   </div>
 
                                   <div class="oc-diff-box">
-                                    <For each={p().diffs}>
-                                      {diff => (
-                                        <div>
-                                          <div class="oc-diff-field-name">{diff.label}</div>
-                                          <div class="oc-diff-minus">- {diff.before}</div>
-                                          <Show
-                                            when={editingProposalId() === p().proposalId}
-                                            fallback={<div class="oc-diff-plus">+ {diff.after}</div>}
-                                          >
+                                    <Show
+                                      when={
+                                        editingProposalId() === p().proposalId &&
+                                        Object.keys(p().proposedFields ?? {}).length === 0
+                                      }
+                                      fallback={
+                                        <For each={p().diffs}>
+                                          {diff => (
+                                            <div>
+                                              <div class="oc-diff-field-name">{diff.label}</div>
+                                              <div class="oc-diff-minus">- {diff.before}</div>
+                                              <Show
+                                                when={editingProposalId() === p().proposalId}
+                                                fallback={<div class="oc-diff-plus">+ {diff.after}</div>}
+                                              >
+                                                <input
+                                                  type="text"
+                                                  class="oc-edit-input"
+                                                  value={editFieldDrafts()[diff.field] ?? diff.after}
+                                                  onInput={e =>
+                                                    setEditFieldDrafts(prev => ({
+                                                      ...prev,
+                                                      [diff.field]: e.currentTarget.value,
+                                                    }))
+                                                  }
+                                                />
+                                              </Show>
+                                            </div>
+                                          )}
+                                        </For>
+                                      }
+                                    >
+                                      <For each={Object.entries(editFieldDrafts())}>
+                                        {([field, val]) => (
+                                          <div>
+                                            <div class="oc-diff-field-name">{field}</div>
                                             <input
                                               type="text"
                                               class="oc-edit-input"
-                                              value={editFieldDrafts()[diff.field] ?? diff.after}
+                                              value={val}
                                               onInput={e =>
                                                 setEditFieldDrafts(prev => ({
                                                   ...prev,
-                                                  [diff.field]: e.currentTarget.value,
+                                                  [field]: e.currentTarget.value,
                                                 }))
                                               }
                                             />
-                                          </Show>
-                                        </div>
-                                      )}
-                                    </For>
+                                          </div>
+                                        )}
+                                      </For>
+                                    </Show>
                                   </div>
 
                                   <Show when={p().errorMessage}>
@@ -1333,18 +1402,31 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                           <Show
                                             when={p().status === "conflict"}
                                             fallback={
-                                              <button
-                                                type="button"
-                                                class="oc-btn oc-btn-primary"
-                                                disabled={applyingProposalId() === p().proposalId}
-                                                onClick={() => void handleApproveProposal(p())}
+                                              <Show
+                                                when={
+                                                  hasConcretePatch(p()) ||
+                                                  (editingProposalId() === p().proposalId &&
+                                                    p().entryId !== "current")
+                                                }
+                                                fallback={
+                                                  <span class="oc-badge">
+                                                    Summary-only · no concrete patch
+                                                  </span>
+                                                }
                                               >
-                                                {applyingProposalId() === p().proposalId
-                                                  ? "Applying to EmDash…"
-                                                  : editingProposalId() === p().proposalId
-                                                    ? `Save as rev #${(p().revisionNumber ?? 1) + 1}`
-                                                    : "Approve & Save Draft"}
-                                              </button>
+                                                <button
+                                                  type="button"
+                                                  class="oc-btn oc-btn-primary"
+                                                  disabled={applyingProposalId() === p().proposalId}
+                                                  onClick={() => void handleApproveProposal(p())}
+                                                >
+                                                  {applyingProposalId() === p().proposalId
+                                                    ? "Applying to EmDash…"
+                                                    : editingProposalId() === p().proposalId
+                                                      ? `Save as rev #${(p().revisionNumber ?? 1) + 1}`
+                                                      : "Approve & Save Draft"}
+                                                </button>
+                                              </Show>
                                             }
                                           >
                                             <button
@@ -1370,7 +1452,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                         </button>
                                       </Show>
 
-                                      <Show when={p().status === "pending" && editingProposalId() !== p().proposalId}>
+                                      <Show
+                                        when={
+                                          p().status === "pending" &&
+                                          editingProposalId() !== p().proposalId &&
+                                          p().entryId !== "current"
+                                        }
+                                      >
                                         <button
                                           type="button"
                                           class="oc-btn"
@@ -1687,7 +1775,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     type="button"
                     class="oc-send-circle"
                     aria-label={sending() ? "Steer agent" : "Send message"}
-                    disabled={!composerText().trim()}
+                    disabled={!composerText().trim() || steeringInFlight()}
                     onClick={() => void sendPrompt(undefined, sending())}
                   >
                     ↑
@@ -2054,16 +2142,25 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     )}
                   </For>
                   <Show when={sel().status === "pending"}>
-                    <div style={{ display: "flex", gap: "6px" }}>
-                      <button
-                        type="button"
-                        class="oc-btn oc-btn-primary"
-                        style={{ flex: "1", "justify-content": "center" }}
-                        disabled={applyingProposalId() === sel().proposalId}
-                        onClick={() => void handleApproveProposal(sel())}
+                    <div style={{ display: "flex", gap: "6px", "align-items": "center" }}>
+                      <Show
+                        when={hasConcretePatch(sel())}
+                        fallback={
+                          <span class="oc-badge" style={{ flex: "1" }}>
+                            Summary-only · no concrete patch
+                          </span>
+                        }
                       >
-                        Approve & Save
-                      </button>
+                        <button
+                          type="button"
+                          class="oc-btn oc-btn-primary"
+                          style={{ flex: "1", "justify-content": "center" }}
+                          disabled={applyingProposalId() === sel().proposalId}
+                          onClick={() => void handleApproveProposal(sel())}
+                        >
+                          Approve & Save
+                        </button>
+                      </Show>
                       <button
                         type="button"
                         class="oc-btn"

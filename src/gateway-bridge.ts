@@ -184,6 +184,7 @@ interface ActiveRunCollector {
   messageId: string;
   sessionKey: string;
   runId?: string;
+  timeoutMs: number;
   accumulatedText: string;
   toolCalls: ToolCallTrace[];
   approvals: GatewayExecApproval[];
@@ -459,6 +460,63 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     this.#emitStatus();
   }
 
+  updateSessionAudience(
+    sessionKey: string,
+    audience: { ownerUserId?: string; visibility: "personal" | "shared" },
+  ): void {
+    const binding = this.#sessionToConversation.get(sessionKey);
+    if (binding) {
+      this.#sessionToConversation.set(sessionKey, {
+        ...binding,
+        ownerUserId: audience.ownerUserId ?? binding.ownerUserId,
+        visibility: audience.visibility,
+      });
+    }
+    const collector = this.#activeCollectors.get(sessionKey);
+    if (collector) {
+      collector.ownerUserId = audience.ownerUserId ?? collector.ownerUserId;
+      collector.visibility = audience.visibility;
+    }
+  }
+
+  #createCollectorTimer(collector: ActiveRunCollector): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      if (collector.settled) return;
+      const now = Date.now();
+      const awaitingHumanApproval = Array.from(this.#approvals.values()).some(
+        a =>
+          a.sessionKey === collector.sessionKey &&
+          (a.status === "pending" || a.status === "resolving") &&
+          (!a.expiresAtMs || a.expiresAtMs > now),
+      );
+      if (awaitingHumanApproval) {
+        collector.timer = this.#createCollectorTimer(collector);
+        return;
+      }
+      collector.settled = true;
+      this.#activeCollectors.delete(collector.sessionKey);
+      collector.resolve({
+        ok: false,
+        runId: collector.runId,
+        replyText: collector.accumulatedText,
+        status: "failed",
+        toolCalls: collector.toolCalls,
+        approvals: collector.approvals,
+        errorMessage: collector.accumulatedText
+          ? "Gateway turn timed out before reaching a terminal event."
+          : "Gateway run timed out waiting for terminal event.",
+      });
+    }, collector.timeoutMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  #refreshCollectorTimer(collector: ActiveRunCollector): void {
+    if (collector.settled) return;
+    clearTimeout(collector.timer);
+    collector.timer = this.#createCollectorTimer(collector);
+  }
+
   async #ensureSubscribed(sessionKey: string, agentId: string): Promise<void> {
     if (!this.#client || this.#status.state !== "connected") return;
     const coordinator = getGatewaySessionMessageSubscriptionCoordinator(this.#client);
@@ -571,7 +629,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       }
     }
 
-    const timeoutMs = req.timeoutMs ?? 45_000;
+    const timeoutMs = req.timeoutMs ?? 60_000;
 
     return await new Promise<GatewayTurnResult>(resolve => {
       const collector: ActiveRunCollector = {
@@ -580,29 +638,15 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         visibility: req.visibility,
         messageId: req.messageId,
         sessionKey: req.sessionKey,
+        timeoutMs,
         accumulatedText: "",
         toolCalls: [],
         approvals: [],
         settled: false,
         resolve,
-        timer: setTimeout(() => {
-          if (collector.settled) return;
-          collector.settled = true;
-          this.#activeCollectors.delete(req.sessionKey);
-          resolve({
-            ok: Boolean(collector.accumulatedText),
-            runId: collector.runId,
-            replyText: collector.accumulatedText,
-            status: collector.accumulatedText ? "completed" : "failed",
-            toolCalls: collector.toolCalls,
-            approvals: collector.approvals,
-            errorMessage: collector.accumulatedText
-              ? undefined
-              : "Gateway run timed out waiting for terminal event.",
-          });
-        }, timeoutMs),
+        timer: undefined as unknown as NodeJS.Timeout,
       };
-      collector.timer.unref?.();
+      collector.timer = this.#createCollectorTimer(collector);
       this.#activeCollectors.set(req.sessionKey, collector);
 
       this.#client!
@@ -817,8 +861,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         visibility: collector?.visibility ?? binding?.visibility ?? ("personal" as const),
       };
 
-      if (collector && runId) {
-        collector.runId = runId;
+      if (collector) {
+        if (runId) collector.runId = runId;
+        if (state === "status" || state === "delta") {
+          this.#refreshCollectorTimer(collector);
+        }
       }
 
       if (state === "status" && conversationId && runId && typeof payload.phase === "string") {
@@ -894,6 +941,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       const sessionKey = typeof payload.sessionKey === "string" ? payload.sessionKey : "";
       const collector = this.#activeCollectors.get(sessionKey);
       if (!collector) return;
+      this.#refreshCollectorTimer(collector);
       const stream = typeof payload.stream === "string" ? payload.stream : "";
       const data =
         payload.data && typeof payload.data === "object"
@@ -1027,8 +1075,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     };
 
     this.#approvals.set(approvalId, approval);
-    if (collector && !collector.approvals.some(a => a.approvalId === approvalId)) {
-      collector.approvals.push(approval);
+    if (collector) {
+      this.#refreshCollectorTimer(collector);
+      if (!collector.approvals.some(a => a.approvalId === approvalId)) {
+        collector.approvals.push(approval);
+      }
     }
     const ownerUserId = collector?.ownerUserId ?? binding?.ownerUserId;
     publishOpenClawEvent({
