@@ -294,6 +294,68 @@ interface ActiveRunCollector {
   timer: NodeJS.Timeout;
 }
 
+const GATEWAY_LITERAL_USER_PREFIX = "User message:\n";
+const APPROVE_DECISION_TOKEN_RE =
+  /^(?:allow|once|allow-once|allowonce|always|allow-always|allowalways|deny|reject|block)$/i;
+
+/**
+ * OpenClaw 2026.11.1 `chat.send` rejects `suppressCommandInterpretation: true` without
+ * `operator.admin` (`system provenance fields require admin scope`). Because our Gateway
+ * bridge pairs with least-privilege scopes (`operator.read`, `operator.write`, and optional
+ * `operator.approvals`), ordinary prompts and steers neutralize command/directive tokens in
+ * the message body instead of setting admin-only system provenance flags:
+ *  - Prepend `User message:\n` so `message.trim()` never starts with `/`, `!`, `approve`,
+ *    `/btw`, or a standalone abort trigger word.
+ *  - Insert U+2060 (`\S` Word Joiner) before whitespace/line-leading `/` and `!` tokens so
+ *    inline directive/shortcut parsers (`(?<!\S)\/...` and `(?:^|\s)\/\s+[a-z]`) never match.
+ *  - Backslash-escape unescaped `$skill` tokens (`isEscapedReference` in `chat-command-invocation`).
+ */
+function neutralizeGatewayCommandTokens(text: string): string {
+  return text
+    .replace(/(^|\s)([/!])(?=\S)/gu, "$1\u2060$2")
+    .replace(/(^|\s)\/(?=\s+[A-Za-z])/gu, "$1\u2060/")
+    .replace(/(?<!\\)((?:\\\\)*)\$(?=[A-Za-z0-9_:]*[A-Za-z])/gu, "$1\\$");
+}
+
+function formatLiteralGatewayChatMessage(rawPrompt: string, systemContext?: string): string {
+  const trimmed = rawPrompt.trim();
+  const proposeMatch = /^\/propose(?:\s+([\s\S]*))?$/i.exec(trimmed);
+  const effectivePrompt = proposeMatch
+    ? proposeMatch[1]?.trim()
+      ? `Propose an EmDash CMS draft update: ${proposeMatch[1].trim()}`
+      : "Propose an EmDash CMS draft update for the current store content."
+    : rawPrompt;
+  const composed = systemContext
+    ? `${effectivePrompt}\n\n<emdash_store_context>\n${systemContext}\n</emdash_store_context>`
+    : effectivePrompt;
+  return `${GATEWAY_LITERAL_USER_PREFIX}${neutralizeGatewayCommandTokens(composed)}`;
+}
+
+function unwrapLiteralGatewayUserMessage(content: string): string {
+  let text = content;
+  if (text.startsWith(GATEWAY_LITERAL_USER_PREFIX)) {
+    text = text.slice(GATEWAY_LITERAL_USER_PREFIX.length);
+  }
+  const ctxIdx = text.indexOf("\n\n<emdash_store_context>\n");
+  if (ctxIdx >= 0) {
+    text = text.slice(0, ctxIdx);
+  }
+  return text
+    .replace(/\u2060([/!])/gu, "$1")
+    .replace(/\\(\$[-A-Za-z0-9_:]*[A-Za-z])/gu, "$1");
+}
+
+function canonicalizeApproveCommand(trimmedPrompt: string): string | null {
+  const match = /^\/?approve\s+([^\s/!$]+)\s+([^\s/!$]+)$/i.exec(trimmedPrompt);
+  if (!match) return null;
+  const [, first, second] = match;
+  if (!first || !second) return null;
+  if (!APPROVE_DECISION_TOKEN_RE.test(first) && !APPROVE_DECISION_TOKEN_RE.test(second)) {
+    return null;
+  }
+  return `/approve ${first} ${second}`;
+}
+
 class NodeOpenClawGatewayBridge implements HostGatewayBridge {
   #client: GatewayClient | null = null;
   #fingerprint = "";
@@ -722,7 +784,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           if (!item || typeof item !== "object") return null;
           const r = item as Record<string, unknown>;
           const role = r.role === "user" ? ("user" as const) : r.role === "assistant" ? ("assistant" as const) : null;
-          const content = extractTextFromGatewayMessage(r);
+          const rawContent = extractTextFromGatewayMessage(r);
+          const content = role === "user" ? unwrapLiteralGatewayUserMessage(rawContent) : rawContent;
           if (!role || !content.trim()) return null;
           return {
             role,
@@ -761,9 +824,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
   }
 
   async sendTurn(req: GatewayTurnRequest): Promise<GatewayTurnResult> {
+    const trimmedPrompt = req.prompt.trim();
+    const isApproveAttempt = /^\/?approve(?:@[^\s]+)?(?:\s|$)/i.test(trimmedPrompt);
     const canResolveApprovals =
       Boolean(req.callerIsAdmin) && Boolean(req.connection.allowGatewayExecApprovals);
-    if (/^\/?approve(?:@[^\s]+)?(?:\s|$)/i.test(req.prompt.trim()) && !canResolveApprovals) {
+    if (isApproveAttempt && !canResolveApprovals) {
       return {
         ok: false,
         replyText: "",
@@ -773,6 +838,17 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         errorMessage: !req.callerIsAdmin
           ? "Only EmDash Administrators can resolve OpenClaw Gateway execution approvals."
           : "Inline Gateway approvals are disabled. Enable allowGatewayExecApprovals in Gateway settings or approve in OpenClaw Control UI.",
+      };
+    }
+    if (isApproveAttempt && req.steer) {
+      return {
+        ok: false,
+        replyText: "",
+        status: "failed",
+        toolCalls: [],
+        approvals: [],
+        errorMessage:
+          "Gateway execution approvals cannot be resolved via mid-run steer. Use the approval card or send /approve as a standalone message.",
       };
     }
 
@@ -803,6 +879,35 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       };
     }
 
+    const canonicalApproveCommand =
+      canResolveApprovals && !req.steer ? canonicalizeApproveCommand(trimmedPrompt) : null;
+    if (isApproveAttempt && /^\/approve/i.test(trimmedPrompt) && !canonicalApproveCommand) {
+      return {
+        ok: false,
+        replyText: "",
+        status: "failed",
+        toolCalls: [],
+        approvals: [],
+        errorMessage:
+          "Invalid /approve syntax. Expected: /approve <approval-id> <allow-once|allow-always|deny>.",
+      };
+    }
+    if (
+      canonicalApproveCommand &&
+      !status.grantedScopes.includes("operator.approvals") &&
+      !status.grantedScopes.includes("operator.admin")
+    ) {
+      return {
+        ok: false,
+        replyText: "",
+        status: "failed",
+        toolCalls: [],
+        approvals: [],
+        errorMessage:
+          "Gateway connection was not granted operator.approvals scope. Re-pair or approve scope upgrade in OpenClaw Control UI.",
+      };
+    }
+
     const subscribeAgentId = req.steer
       ? resolveSessionRpcAgentId(req.sessionKey, req.connection.agentId)
       : req.connection.agentId;
@@ -815,21 +920,17 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       visibility: effectiveAudience.visibility,
     });
 
-    const composedMessage = req.systemContext
-      ? `${req.prompt}\n\n<emdash_store_context>\n${req.systemContext}\n</emdash_store_context>`
-      : req.prompt;
-
     if (req.steer) {
       const activeCollector = this.#activeCollectors.get(req.sessionKey);
       const originatingRunId = req.expectedRunId ?? activeCollector?.runId;
       try {
-        // Published 2026.11.1 ChatSendParamsSchema has additionalProperties: false and does NOT accept expectedRunId.
+        // Published 2026.11.1 ChatSendParamsSchema has additionalProperties: false, forbids expectedRunId,
+        // and rejects suppressCommandInterpretation: true without operator.admin scope.
         const ack = await this.#client.request<{ runId?: string }>("chat.send", {
           sessionKey: req.sessionKey,
           agentId: resolveSessionRpcAgentId(req.sessionKey, req.connection.agentId),
-          message: req.prompt,
+          message: formatLiteralGatewayChatMessage(req.prompt),
           queueMode: "steer",
-          suppressCommandInterpretation: !canResolveApprovals,
           idempotencyKey: `emdash_steer_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         });
         if (
@@ -860,6 +961,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       }
     }
 
+    const outboundMessage =
+      canonicalApproveCommand ?? formatLiteralGatewayChatMessage(req.prompt, req.systemContext);
     const timeoutMs = req.timeoutMs ?? 60_000;
 
     return await new Promise<GatewayTurnResult>(resolve => {
@@ -885,8 +988,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         .request<{ runId?: string; status?: string }>("chat.send", {
           sessionKey: req.sessionKey,
           agentId: req.connection.agentId,
-          message: composedMessage,
-          suppressCommandInterpretation: !canResolveApprovals,
+          message: outboundMessage,
           idempotencyKey: `emdash_turn_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         })
         .then(ack => {

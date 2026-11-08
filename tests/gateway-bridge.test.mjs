@@ -33,6 +33,7 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
   let steerSendPayload = null;
 
   wss.on("connection", ws => {
+    let connectionScopes = [];
     // 1. Gateway v4 immediately sends connect.challenge
     ws.send(
       JSON.stringify({
@@ -63,6 +64,7 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
             : ["operator.read", "operator.write"],
         );
         const scopes = (frame.params.scopes ?? []).filter(s => allowedByServer.has(s));
+        connectionScopes = scopes;
 
         ws.send(
           JSON.stringify({
@@ -130,6 +132,25 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
           false,
           "2026.11.1 ChatSendParamsSchema forbids expectedRunId",
         );
+        if (
+          (frame.params.suppressCommandInterpretation === true ||
+            frame.params.systemInputProvenance !== undefined ||
+            frame.params.systemProvenanceReceipt !== undefined) &&
+          !connectionScopes.includes("operator.admin")
+        ) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: {
+                code: "INVALID_REQUEST",
+                message: "system provenance fields require admin scope",
+              },
+            }),
+          );
+          return;
+        }
         const mismatch = checkMockSessionRequestAgent(
           frame.params.sessionKey,
           frame.params.agentId,
@@ -565,7 +586,7 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(enabledSnap.canResolveGatewayApprovals, true);
 
     //    (c2) Even with `allowGatewayExecApprovals: true`, Editors cannot sneak `/approve` via `send_message` or `steer_turn`,
-    //         and non-admin `steer_turn` sets `suppressCommandInterpretation: true`!
+    //         and `steer_turn` neutralizes Gateway commands/directives without requiring admin-only `suppressCommandInterpretation`!
     const editorChatApprove = await chat(
       makeCtx({
         role: 40,
@@ -596,7 +617,7 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(editorSteerApprove.ok, false);
     assert.equal(editorSteerApprove.error, "GATEWAY_APPROVAL_FORBIDDEN");
 
-    await chat(
+    const editorSteerSnap = await chat(
       makeCtx({
         role: 40,
         userId: "u_editor",
@@ -604,11 +625,23 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
         sharedKv,
         input: {
           action: "steer_turn",
-          prompt: "Check fabric weight in grams",
+          prompt: "Check fabric weight /exec ask=off $secret_skill",
         },
       }),
     );
-    assert.equal(gw.getSteerSend()?.suppressCommandInterpretation, true);
+    assert.equal(editorSteerSnap.ok, true);
+    assert.equal(
+      "suppressCommandInterpretation" in (gw.getSteerSend() ?? {}),
+      false,
+      "2026.11.1 chat.send without operator.admin must omit suppressCommandInterpretation",
+    );
+    assert.equal(/^[!/]/.test((gw.getSteerSend()?.message ?? "").trim()), false);
+    assert.equal(
+      /(?<!\S)\/exec(?=$|\s|:)/i.test(gw.getSteerSend()?.message ?? ""),
+      false,
+      "Inline /exec directive must be neutralized in literal Gateway chat messages",
+    );
+    assert.match(gw.getSteerSend()?.message ?? "", /\\\$secret_skill/);
 
     const resolvedSnap = await chat(
       makeCtx({
@@ -976,6 +1009,24 @@ test("Gateway bridge isolates steer terminal events, honours Gateway approval/ab
       }
 
       if (frame.method === "chat.send") {
+        if (
+          frame.params.suppressCommandInterpretation === true ||
+          frame.params.systemInputProvenance !== undefined ||
+          frame.params.systemProvenanceReceipt !== undefined
+        ) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: {
+                code: "INVALID_REQUEST",
+                message: "system provenance fields require admin scope",
+              },
+            }),
+          );
+          return;
+        }
         const sessionKey = frame.params.sessionKey;
         if (frame.params.queueMode === "steer") {
           const steerRunId = "run_steer_child_99";
