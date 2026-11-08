@@ -357,7 +357,7 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(rawStoredConn.deviceToken, "oc_dev_tok_issued_by_gateway");
     assert.ok(rawStoredConn.deviceIdentity?.deviceId);
 
-    // 2. Reject plaintext ws:// to non-loopback remote hosts!
+    // 2. Reject plaintext ws:// to non-loopback remote hosts AND reject URL-embedded credentials!
     const badRemote = await chat(
       makeCtx({
         role: 50,
@@ -371,6 +371,20 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     );
     assert.equal(badRemote.ok, false);
     assert.equal(badRemote.error, "INVALID_GATEWAY_URL");
+
+    const badUserinfo = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: "wss://admin:top_secret_pass@gateway.evil.example:18789",
+        },
+      }),
+    );
+    assert.equal(badUserinfo.ok, false);
+    assert.equal(badUserinfo.error, "INVALID_GATEWAY_URL");
 
     // 3. Send a live chat turn over OpenClaw Gateway Protocol v4 WebSocket
     const turnSnap = await chat(

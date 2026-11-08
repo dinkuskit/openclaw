@@ -183,6 +183,91 @@ function isSupportedGatewayUrl(url: string): boolean {
   );
 }
 
+const PUBLIC_URL_SENSITIVE_QUERY_KEYS = [
+  "token",
+  "bootstrapToken",
+  "deviceToken",
+  "password",
+  "secret",
+  "apiKey",
+  "api_key",
+  "access_token",
+  "auth",
+] as const;
+
+export function sanitizePublicGatewayUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    for (const key of PUBLIC_URL_SENSITIVE_QUERY_KEYS) {
+      parsed.searchParams.delete(key);
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return rawUrl.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s"']+)@/gi, "$1");
+  }
+}
+
+function validateDirectGatewayUrlInput(rawUrl: string): {
+  ok: boolean;
+  sanitizedUrl?: string;
+  extractedToken?: string;
+  error?: string;
+} {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return {
+      ok: false,
+      error: "Invalid OpenClaw Gateway URL. Use ws://127.0.0.1:18789, wss://, or https://.",
+    };
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error:
+        "Gateway URL must not embed username or password credentials. Enter secrets in the Gateway token field.",
+    };
+  }
+  const hostClean = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const isLoopback = hostClean === "127.0.0.1" || hostClean === "localhost" || hostClean === "::1";
+  if ((parsed.protocol === "http:" || parsed.protocol === "ws:") && !isLoopback) {
+    return {
+      ok: false,
+      error:
+        "Plaintext ws:// / http:// is restricted to loopback (127.0.0.1 / localhost). Use wss:// or https:// for remote endpoints.",
+    };
+  }
+  if (
+    parsed.protocol !== "ws:" &&
+    parsed.protocol !== "wss:" &&
+    parsed.protocol !== "http:" &&
+    parsed.protocol !== "https:"
+  ) {
+    return {
+      ok: false,
+      error: `Unsupported Gateway URL scheme "${parsed.protocol}". Use ws:// (loopback), wss://, or https://.`,
+    };
+  }
+  const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ""));
+  const extractedToken =
+    (
+      hashParams.get("token") ??
+      hashParams.get("bootstrapToken") ??
+      parsed.searchParams.get("token") ??
+      parsed.searchParams.get("bootstrapToken") ??
+      ""
+    ).trim() || undefined;
+  return {
+    ok: true,
+    sanitizedUrl: sanitizePublicGatewayUrl(parsed.toString()),
+    extractedToken,
+  };
+}
+
 function classifyTransportMode(
   gatewayUrl: string,
 ): "gateway-ws" | "live-gateway" | "paired-agent" {
@@ -1262,7 +1347,7 @@ export async function buildWorkspaceSnapshot(
     ...(connState.error ? { settingsError: connState.error } : {}),
     connection: connection
       ? {
-          gatewayUrl: connection.gatewayUrl,
+          gatewayUrl: sanitizePublicGatewayUrl(connection.gatewayUrl),
           agentId: connection.agentId,
           authorityMode: connection.authorityMode,
           allowGatewayExecApprovals: Boolean(connection.allowGatewayExecApprovals),
@@ -1444,30 +1529,46 @@ export async function openclawChatRoute(
     const collections = await listSiteCollections(ctx);
     const bridge = getHostGatewayBridge();
 
-    const rawGatewayUrl =
-      cleanInputText(input.gatewayUrl, 400) ??
-      existing?.gatewayUrl ??
-      "https://agent-session.openclaw.local";
+    const explicitGatewayUrl = cleanInputText(input.gatewayUrl, 400);
     const rawToken = cleanInputText(input.gatewayToken, 400);
 
-    let gatewayUrl = rawGatewayUrl;
+    let gatewayUrl: string;
     let extractedToken = rawToken;
 
-    if (bridge && rawGatewayUrl !== "https://agent-session.openclaw.local") {
-      const normalized = bridge.normalizeGatewayInput(rawGatewayUrl, rawToken);
-      if (!normalized.ok) {
-        return {
-          ok: false,
-          error: "INVALID_GATEWAY_URL",
-          message: normalized.error ?? "Invalid OpenClaw Gateway URL.",
-        };
+    if (explicitGatewayUrl) {
+      if (explicitGatewayUrl === "https://agent-session.openclaw.local") {
+        gatewayUrl = explicitGatewayUrl;
+      } else if (bridge) {
+        const normalized = bridge.normalizeGatewayInput(explicitGatewayUrl, rawToken);
+        if (!normalized.ok) {
+          return {
+            ok: false,
+            error: "INVALID_GATEWAY_URL",
+            message: normalized.error ?? "Invalid OpenClaw Gateway URL.",
+          };
+        }
+        gatewayUrl = normalized.wsUrl ?? normalized.httpUrl ?? sanitizePublicGatewayUrl(explicitGatewayUrl);
+        if (normalized.extractedToken) {
+          extractedToken = normalized.extractedToken;
+        }
+      } else {
+        const checked = validateDirectGatewayUrlInput(explicitGatewayUrl);
+        if (!checked.ok || !checked.sanitizedUrl) {
+          return {
+            ok: false,
+            error: "INVALID_GATEWAY_URL",
+            message: checked.error ?? "Invalid OpenClaw Gateway URL.",
+          };
+        }
+        gatewayUrl = checked.sanitizedUrl;
+        if (!extractedToken && checked.extractedToken) {
+          extractedToken = checked.extractedToken;
+        }
       }
-      if (normalized.wsUrl) {
-        gatewayUrl = normalized.wsUrl;
-      }
-      if (normalized.extractedToken) {
-        extractedToken = normalized.extractedToken;
-      }
+    } else if (existing?.gatewayUrl) {
+      gatewayUrl = sanitizePublicGatewayUrl(existing.gatewayUrl);
+    } else {
+      gatewayUrl = "https://agent-session.openclaw.local";
     }
 
     if (existingState.error && !extractedToken) {

@@ -58,9 +58,41 @@ export function signEd25519DevicePayload(privateKeyPem: string, payload: string)
 
 export function redactGatewaySecrets(text: string): string {
   return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s"']+)@/gi, "$1[REDACTED]@")
     .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
-    .replace(/([?&#](?:token|bootstrapToken|deviceToken|password|secret)=)[^&#\s"']+/gi, "$1[REDACTED]")
+    .replace(
+      /([?&#](?:token|bootstrapToken|deviceToken|password|secret|apiKey|api_key|access_token|auth)=)[^&#\s"']+/gi,
+      "$1[REDACTED]",
+    )
     .replace(/\boc_(?:live|sess|tok|pair)_[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]");
+}
+
+const SENSITIVE_QUERY_KEYS = [
+  "token",
+  "bootstrapToken",
+  "deviceToken",
+  "password",
+  "secret",
+  "apiKey",
+  "api_key",
+  "access_token",
+  "auth",
+] as const;
+
+export function sanitizePublicEndpointUrl(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    const u = new URL(rawUrl);
+    u.username = "";
+    u.password = "";
+    u.hash = "";
+    for (const k of SENSITIVE_QUERY_KEYS) {
+      u.searchParams.delete(k);
+    }
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return redactGatewaySecrets(rawUrl);
+  }
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -74,6 +106,7 @@ export function normalizeGatewayEndpoint(
 ): {
   ok: boolean;
   wsUrl?: string;
+  httpUrl?: string;
   controlUiOrigin?: string;
   extractedToken?: string;
   isWebSocketGateway: boolean;
@@ -84,6 +117,7 @@ export function normalizeGatewayEndpoint(
     return {
       ok: true,
       wsUrl: undefined,
+      httpUrl: trimmed || undefined,
       controlUiOrigin: undefined,
       extractedToken: rawToken?.trim() || undefined,
       isWebSocketGateway: false,
@@ -101,21 +135,58 @@ export function normalizeGatewayEndpoint(
     };
   }
 
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      isWebSocketGateway: false,
+      error:
+        "Gateway URL must not embed username or password credentials. Enter secrets in the Gateway token field.",
+    };
+  }
+
   // Extract one-time pairing fragment or query token if operator pasted `openclaw dashboard` browserUrl,
   // stripping it immediately so credentials never stay in stored URLs.
   let extractedToken = rawToken?.trim() || undefined;
   const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ""));
   const hashToken = hashParams.get("token") ?? hashParams.get("bootstrapToken");
   const queryToken = parsed.searchParams.get("token") ?? parsed.searchParams.get("bootstrapToken");
+  const hasControlUiHandoffToken = Boolean(hashToken || queryToken);
   if (!extractedToken && (hashToken || queryToken)) {
     extractedToken = (hashToken ?? queryToken ?? "").trim() || undefined;
   }
   parsed.hash = "";
-  parsed.searchParams.delete("token");
-  parsed.searchParams.delete("bootstrapToken");
-  parsed.searchParams.delete("password");
+  for (const k of SENSITIVE_QUERY_KEYS) {
+    parsed.searchParams.delete(k);
+  }
 
   const loopback = isLoopbackHostname(parsed.hostname);
+  const isControlUiBrowserUrl =
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    (parsed.pathname === "/chat" ||
+      parsed.pathname.startsWith("/chat/") ||
+      hasControlUiHandoffToken);
+
+  if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+    if (parsed.protocol === "http:" && !loopback) {
+      return {
+        ok: false,
+        isWebSocketGateway: false,
+        error:
+          "Plaintext http:// is restricted to loopback (127.0.0.1 / localhost). Use https:// or wss:// for remote endpoints.",
+      };
+    }
+    if (!isControlUiBrowserUrl) {
+      return {
+        ok: true,
+        wsUrl: undefined,
+        httpUrl: parsed.toString().replace(/\/$/, ""),
+        controlUiOrigin: undefined,
+        extractedToken,
+        isWebSocketGateway: false,
+      };
+    }
+  }
+
   let wsProtocol: "ws:" | "wss:";
   let httpProtocol: "http:" | "https:";
 
@@ -136,14 +207,16 @@ export function normalizeGatewayEndpoint(
     return {
       ok: false,
       isWebSocketGateway: false,
-      error: `Unsupported Gateway URL scheme "${parsed.protocol}". Use ws:// (loopback) or wss:// (remote).`,
+      error: `Unsupported Gateway URL scheme "${parsed.protocol}". Use ws:// (loopback), wss://, or https://.`,
     };
   }
 
   const wsUrlObj = new URL(parsed.toString());
   wsUrlObj.protocol = wsProtocol;
+  wsUrlObj.username = "";
+  wsUrlObj.password = "";
   // Strip Control UI `/chat/...` path if operator pasted a Control UI browser URL
-  if (wsUrlObj.pathname.startsWith("/chat/")) {
+  if (wsUrlObj.pathname === "/chat" || wsUrlObj.pathname.startsWith("/chat/")) {
     wsUrlObj.pathname = "/";
   }
 
@@ -247,8 +320,10 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     }
     return {
       ...this.#status,
-      gatewayUrl: normalized.wsUrl ?? this.#status.gatewayUrl,
-      gatewayControlUiOrigin: normalized.controlUiOrigin ?? this.#status.gatewayControlUiOrigin,
+      gatewayUrl: sanitizePublicEndpointUrl(normalized.wsUrl ?? this.#status.gatewayUrl),
+      gatewayControlUiOrigin: sanitizePublicEndpointUrl(
+        normalized.controlUiOrigin ?? this.#status.gatewayControlUiOrigin,
+      ),
       deviceId: connection.deviceIdentity?.deviceId ?? this.#status.deviceId,
     };
   }

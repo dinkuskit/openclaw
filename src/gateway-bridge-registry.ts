@@ -56,6 +56,7 @@ export interface HostGatewayBridge {
   ): {
     ok: boolean;
     wsUrl?: string;
+    httpUrl?: string;
     controlUiOrigin?: string;
     extractedToken?: string;
     isWebSocketGateway: boolean;

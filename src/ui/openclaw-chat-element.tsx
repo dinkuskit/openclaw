@@ -518,13 +518,38 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         void refreshWorkspace(snapshot()?.activeConversationId);
       },
       onEvent: event => {
+        const markSnapshotThreadStatus = (
+          convId: string,
+          nextStatus: ConversationThread["status"],
+        ): boolean => {
+          let found = false;
+          setSnapshot(prev => {
+            if (!prev) return prev;
+            const idx = prev.threads.findIndex(t => t.conversationId === convId);
+            if (idx < 0) return prev;
+            found = true;
+            if (prev.threads[idx]!.status === nextStatus) return prev;
+            const threads = [...prev.threads];
+            threads[idx] = { ...threads[idx]!, status: nextStatus };
+            return { ...prev, threads };
+          });
+          return found;
+        };
+
         if (event.type === "turn_started") {
           updateConversationStream(event.conversationId, () => ({
             text: "",
             tools: [],
             phase: null,
           }));
+          const found = markSnapshotThreadStatus(event.conversationId, "running");
+          if (!found) {
+            void refreshWorkspace(snapshot()?.activeConversationId);
+          } else if (event.conversationId === activeConvKey()) {
+            scrollTranscriptToBottom();
+          }
         } else if (event.type === "assistant_delta") {
+          markSnapshotThreadStatus(event.conversationId, "running");
           updateConversationStream(event.conversationId, prev => ({
             ...prev,
             text: event.content,
@@ -534,11 +559,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
             scrollTranscriptToBottom();
           }
         } else if (event.type === "run_status") {
+          markSnapshotThreadStatus(event.conversationId, "running");
           updateConversationStream(event.conversationId, prev => ({
             ...prev,
             phase: event.phase,
           }));
         } else if (event.type === "tool_call") {
+          markSnapshotThreadStatus(event.conversationId, "running");
           updateConversationStream(event.conversationId, prev => {
             const idx = prev.tools.findIndex(t => t.callId === event.toolCall.callId);
             if (idx >= 0) {
@@ -558,9 +585,16 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           event.type === "exec_approval_updated" ||
           event.type === "workspace_sync"
         ) {
-          if (event.type === "workspace_sync" && event.reason === "turn_completed") {
+          if (
+            event.type === "workspace_sync" &&
+            (event.reason === "turn_completed" || event.reason === "turn_stopped")
+          ) {
             if ((activeTurnRequestsByConv()[event.conversationId] ?? 0) === 0) {
               clearConversationStream(event.conversationId);
+              markSnapshotThreadStatus(
+                event.conversationId,
+                event.reason === "turn_stopped" ? "stopped" : "idle",
+              );
             }
           }
           void refreshWorkspace(snapshot()?.activeConversationId);

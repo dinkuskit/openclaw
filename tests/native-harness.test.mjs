@@ -953,6 +953,74 @@ test("shared->personal toggle mid-setup isolates SSE, 65+ threads keep new user 
   assert.equal(partialSaveBlocked.error, "SETTINGS_READ_ERROR");
   assert.match(sharedSettings.get("connection").value, /secret_preserved_tok/);
 
+  // 1b. HTTPS completion endpoints stay `https://` (`live-gateway`) across unrelated settings updates,
+  //     and legacy stored URL userinfo is never exposed to Editors!
+  const httpsSaved = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        gatewayUrl: "https://completions.example.com/v1/chat/completions",
+        gatewayToken: "http_bearer_tok",
+        agentId: "roboclaw",
+        authorityMode: "read_only",
+      },
+    }),
+  );
+  assert.equal(httpsSaved.connection.gatewayUrl, "https://completions.example.com/v1/chat/completions");
+  assert.equal(httpsSaved.connection.transportMode, "live-gateway");
+
+  const httpsAfterAuthorityToggle = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "configure_connection",
+        authorityMode: "propose_with_approval",
+      },
+    }),
+  );
+  assert.equal(
+    httpsAfterAuthorityToggle.connection.gatewayUrl,
+    "https://completions.example.com/v1/chat/completions",
+    "Toggling authorityMode must not convert an HTTPS completion endpoint into wss://",
+  );
+  assert.equal(httpsAfterAuthorityToggle.connection.transportMode, "live-gateway");
+
+  // Simulate legacy pre-existing stored URL containing userinfo + query token and verify Editor snapshot scrubs it
+  sharedSettings.set("connection", {
+    revision: "99",
+    value: JSON.stringify({
+      gatewayUrl: "https://legacy_user:legacy_secret@completions.example.com/v1/chat/completions?token=secret_q",
+      agentId: "roboclaw",
+      gatewayToken: "http_bearer_tok",
+      authorityMode: "propose_with_approval",
+      enabledCollections: ["products", "pages"],
+    }),
+  });
+  const editorScrubbedSnap = await chat(
+    createNativeRouteCtx({
+      userId: "u_editor",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.equal(
+    editorScrubbedSnap.connection.gatewayUrl,
+    "https://completions.example.com/v1/chat/completions",
+    "Editor workspace snapshot must strip URL userinfo and token query params",
+  );
+
   // Reset to local inspector mode for turn tests
   await chat(
     createNativeRouteCtx({

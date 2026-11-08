@@ -193,4 +193,21 @@ test("supports live mid-task steer and configurable editor side-panel collaborat
   );
   assert.doesNotThrow(() => validateBlockResponse(postsPanel));
   assert.equal(postsPanel.blocks.some(b => b.type === "form"), false);
+
+  // Reject URL-embedded credentials on Block Kit save_connection
+  const rejectedUserinfo = await admin(
+    route({
+      type: "form_submit",
+      action_id: "save_connection",
+      values: {
+        gatewayUrl: "https://user:secret@openclaw.example.test",
+        agentId: "openclaw",
+        gatewayToken: "oc_tok",
+        authorityMode: "read_only",
+      },
+    }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(rejectedUserinfo));
+  assert.equal(rejectedUserinfo.blocks[1].type, "banner");
 });

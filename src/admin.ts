@@ -410,6 +410,40 @@ export function setupPage(
   return { blocks, ...(toast ? { toast } : {}) };
 }
 
+function sanitizeAdminPublicUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    for (const k of [
+      "token",
+      "bootstrapToken",
+      "deviceToken",
+      "password",
+      "secret",
+      "apiKey",
+      "api_key",
+      "access_token",
+      "auth",
+    ]) {
+      parsed.searchParams.delete(k);
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return rawUrl.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s"']+)@/gi, "$1");
+  }
+}
+
+function hasEmbeddedUrlCredentials(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return Boolean(parsed.username || parsed.password);
+  } catch {
+    return /:\/\/[^/@\s]+@/.test(rawUrl);
+  }
+}
+
 export function workspacePage(
   connection: OpenClawConnection,
   collections: Array<{ slug: string; label: string }>,
@@ -419,11 +453,12 @@ export function workspacePage(
   replyText?: string,
   toast?: BlockResponse["toast"],
 ): BlockResponse {
-  let gatewayHost = connection.gatewayUrl;
+  const safeGatewayUrl = sanitizeAdminPublicUrl(connection.gatewayUrl);
+  let gatewayHost = safeGatewayUrl;
   try {
-    gatewayHost = new URL(connection.gatewayUrl).host;
+    gatewayHost = new URL(safeGatewayUrl).host;
   } catch {
-    // Keep full URL if parsing fails.
+    // Keep sanitized URL if parsing fails.
   }
 
   const blocks: Block[] = [
@@ -592,7 +627,7 @@ export function workspacePage(
             ],
             [
               fields(
-                ["Gateway", connection.gatewayUrl],
+                ["Gateway", safeGatewayUrl],
                 ["Agent ID", `@${connection.agentId}`],
                 [
                   "Authority Mode",
@@ -777,15 +812,18 @@ export async function openclawAdmin(
         ? "propose_with_approval"
         : "read_only";
 
-    if (!gatewayUrl || !gatewayUrl.startsWith("https://")) {
+    if (!gatewayUrl || !gatewayUrl.startsWith("https://") || hasEmbeddedUrlCredentials(gatewayUrl)) {
       return setupPage(
         true,
         collections,
         siteOrigin,
         pairingCode,
-        "Enter an HTTPS OpenClaw gateway URL.",
+        gatewayUrl && hasEmbeddedUrlCredentials(gatewayUrl)
+          ? "Gateway URL must not embed username or password credentials; use the Gateway bearer token field."
+          : "Enter an HTTPS OpenClaw gateway URL.",
       );
     }
+    const sanitizedGatewayUrl = sanitizeAdminPublicUrl(gatewayUrl);
     if (!agentId) {
       return setupPage(
         true,
@@ -810,7 +848,7 @@ export async function openclawAdmin(
       : collections.filter(col => event.values[`col_${col.slug}`] !== false).map(col => col.slug);
 
     const nextConnection: OpenClawConnection = {
-      gatewayUrl,
+      gatewayUrl: sanitizedGatewayUrl,
       agentId,
       gatewayToken,
       authorityMode,
@@ -1335,13 +1373,20 @@ export async function openclawPairRoute(
   }
 
   const rawGatewayUrl = cleanText(input.gatewayUrl, 300);
+  if (rawGatewayUrl && hasEmbeddedUrlCredentials(rawGatewayUrl)) {
+    return {
+      ok: false,
+      error: "INVALID_GATEWAY_URL",
+      message: "Gateway URL must not embed username or password credentials.",
+    };
+  }
   const gatewayUrl =
     rawGatewayUrl &&
     (rawGatewayUrl.startsWith("https://") ||
       rawGatewayUrl.startsWith("wss://") ||
       rawGatewayUrl.startsWith("ws://127.0.0.1:") ||
       rawGatewayUrl.startsWith("ws://localhost:"))
-      ? rawGatewayUrl
+      ? sanitizeAdminPublicUrl(rawGatewayUrl)
       : "https://agent-session.openclaw.local";
   const agentId = cleanText(input.agentId, 80) ?? "openclaw";
   const sessionToken = cleanText(input.gatewayToken, 300) ?? csprngToken("oc_sess_", 20);
