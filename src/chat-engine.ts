@@ -1919,17 +1919,20 @@ export async function steerPairedAgentTurn(
 
 export async function stopPairedAgentTurns(
   ctx: PluginContext,
-  conversationId?: string,
+  conversationId: string,
+  viewerUserId?: string,
 ): Promise<string[]> {
-  if (!ctx.kv) return [];
+  if (!ctx.kv || !conversationId) return [];
   return withOpenClawStorageLock("paired_turns", async () => {
+    const threads = viewerUserId ? await loadThreads(ctx) : [];
     const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
     const stoppedIds = new Set<string>();
     const updated = prunePairedAgentTurns(
       existing.map(r => {
         if (
           (r.status === "running" || r.status === "steered") &&
-          (!conversationId || r.conversationId === conversationId)
+          r.conversationId === conversationId &&
+          (!viewerUserId || isPairedRecordVisibleToViewer(r, threads, viewerUserId))
         ) {
           stoppedIds.add(r.turnId);
           return {
@@ -1944,9 +1947,6 @@ export async function stopPairedAgentTurns(
     );
     if (stoppedIds.size > 0) {
       await ctx.kv!.set("paired_agent_turns_v1", updated);
-    }
-    if (!conversationId) {
-      await ctx.kv!.delete("active_turn");
     }
     return [...stoppedIds];
   });
@@ -2687,7 +2687,10 @@ export async function openclawChatRoute(
       const bridge = getHostGatewayBridge();
       const forbidden = await mutateThreads(ctx, [targetId], current => {
         const existing = current.find(t => t.conversationId === targetId);
-        if (existing && existing.ownerUserId && existing.ownerUserId !== currentUserId && role < ADMIN) {
+        if (!existing || !isThreadVisibleToUser(existing, currentUserId)) {
+          return { threads: current, result: true };
+        }
+        if (existing.ownerUserId && existing.ownerUserId !== currentUserId && role < ADMIN) {
           return { threads: current, result: true };
         }
         const next = current.map(t => {
@@ -3480,7 +3483,22 @@ export async function openclawChatRoute(
         isThreadVisibleToUser(t, currentUserId) &&
         (!preferredConversationId || t.conversationId === preferredConversationId),
     );
-    if (target && connection && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
+    if (!target) {
+      if (preferredConversationId) {
+        return {
+          ok: false,
+          error: "NOT_FOUND",
+          message: "Conversation not found or not accessible.",
+        };
+      }
+      return (await buildWorkspaceSnapshot(
+        route,
+        ctx,
+        preferredConversationId,
+        boundEntry,
+      )) as unknown as Record<string, unknown>;
+    }
+    if (connection && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
       if (!bridge) {
         return {
           ok: false,
@@ -3505,12 +3523,11 @@ export async function openclawChatRoute(
       }
     }
 
-    const targetId = target?.conversationId ?? preferredConversationId;
-    await stopPairedAgentTurns(ctx, targetId);
-    await mutateThreads(ctx, targetId ? [targetId] : [], current => {
+    const targetId = target.conversationId;
+    await stopPairedAgentTurns(ctx, targetId, currentUserId);
+    await mutateThreads(ctx, [targetId], current => {
       const next = current.map(t => {
-        if (!isThreadVisibleToUser(t, currentUserId)) return t;
-        if (targetId && t.conversationId !== targetId) return t;
+        if (t.conversationId !== targetId || !isThreadVisibleToUser(t, currentUserId)) return t;
         return {
           ...t,
           status: "stopped" as const,

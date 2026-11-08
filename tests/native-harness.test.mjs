@@ -1821,6 +1821,20 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
     }),
   );
 
+  // Another editor cannot stop `u_admin`'s personal paired-agent turn by guessing its conversationId
+  const unauthStop = await chat(
+    createNativeRouteCtx({
+      userId: "u_editor_2",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "stop_turn", conversationId: convId },
+    }),
+  );
+  assert.equal(unauthStop.ok, false);
+  assert.equal(unauthStop.error, "NOT_FOUND");
+
   const secondPoll = await pair(
     createNativeRouteCtx({
       userId: "anon",
