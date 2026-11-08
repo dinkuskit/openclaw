@@ -66,11 +66,12 @@ function parseInteraction(input: unknown): Interaction | null {
 }
 
 function cleanText(value: unknown, max = 500): string | undefined {
-  return typeof value === "string" &&
-    value.trim().length > 0 &&
-    value.trim().length <= max &&
-    !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)
-    ? value.trim()
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.replace(/\r\n?/g, "\n").trim();
+  return trimmed.length > 0 &&
+    trimmed.length <= max &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(trimmed)
+    ? trimmed
     : undefined;
 }
 
@@ -410,9 +411,8 @@ export function workspacePage(
         {
           type: "text_input",
           action_id: "prompt",
-          label: `Ask @${connection.agentId}`,
-          placeholder: "Audit draft pages, suggest headlines, or summarize content...",
-          multiline: true,
+          label: `Message @${connection.agentId} (press Enter or click Send)`,
+          placeholder: "Can you see my product collection? Suggest headlines...",
         },
       ],
       submit: { label: "Send to OpenClaw", action_id: "ask_agent" },
@@ -847,11 +847,12 @@ export async function openclawAdmin(
         "Enter a prompt for your OpenClaw agent.",
       );
     }
+    const colSummary = collections.map(c => `${c.label} (${c.slug})`).join(", ");
     const turn: ActiveTurn = {
       turnId: `turn_${Date.now()}`,
       prompt,
       status: "running",
-      lastUpdate: "Dispatched to OpenClaw gateway; press Check status or Steer agent below.",
+      lastUpdate: `Site collections visible to @${connection.agentId}: ${colSummary}. Waiting for agent turn completion (or press Steer / Check status).`,
     };
     if (ctx.kv) {
       await ctx.kv.set("active_turn", turn);
@@ -862,7 +863,7 @@ export async function openclawAdmin(
       proposals,
       turn,
       isAdmin,
-      `Started task on @${connection.agentId} (${connection.authorityMode}): "${prompt}"`,
+      `@${connection.agentId} connected to collections [${colSummary}] (${connection.authorityMode}) — queued: "${prompt}"`,
     );
   }
 
