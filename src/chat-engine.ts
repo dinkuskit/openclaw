@@ -617,12 +617,64 @@ function retainThreads(
   return filtered.filter(t => finalAllowed.has(t.conversationId));
 }
 
+function isProposalUnresolved(status: ProposalLifecycleStatus): boolean {
+  return status !== "applied" && status !== "rejected" && status !== "superseded";
+}
+
+async function collectProtectedConversationIds(ctx: PluginContext): Promise<Set<string>> {
+  const protectedIds = new Set<string>();
+  if (ctx.kv) {
+    const v2Proposals = normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
+    for (const p of v2Proposals) {
+      if (
+        typeof p.conversationId === "string" &&
+        p.conversationId &&
+        isProposalUnresolved(p.status)
+      ) {
+        protectedIds.add(p.conversationId);
+      }
+    }
+    const legacyPending = await ctx.kv.get("pending_proposals");
+    if (Array.isArray(legacyPending)) {
+      for (const item of legacyPending) {
+        if (
+          item &&
+          typeof item === "object" &&
+          typeof (item as Record<string, unknown>).conversationId === "string" &&
+          ((item as Record<string, unknown>).conversationId as string).length > 0
+        ) {
+          protectedIds.add((item as Record<string, unknown>).conversationId as string);
+        }
+      }
+    }
+    const persistedApprovals = await ctx.kv.get("gateway_exec_approvals_v1");
+    if (Array.isArray(persistedApprovals)) {
+      for (const a of persistedApprovals as GatewayExecApproval[]) {
+        if (a?.status === "pending" && typeof a.conversationId === "string" && a.conversationId) {
+          protectedIds.add(a.conversationId);
+        }
+      }
+    }
+  }
+  const bridge = getHostGatewayBridge();
+  if (bridge) {
+    for (const a of bridge.listLiveApprovals()) {
+      if (a.status === "pending" && typeof a.conversationId === "string" && a.conversationId) {
+        protectedIds.add(a.conversationId);
+      }
+    }
+  }
+  return protectedIds;
+}
+
 async function saveThreads(
   ctx: PluginContext,
   threads: ConversationThread[],
   preserveIds: Iterable<string> = [],
 ): Promise<ConversationThread[]> {
-  const retained = retainThreads(threads, preserveIds);
+  const protectedIds = await collectProtectedConversationIds(ctx);
+  for (const id of preserveIds) protectedIds.add(id);
+  const retained = retainThreads(threads, protectedIds);
   if (ctx.kv) {
     await ctx.kv.set("chat_threads_v2", retained);
   }
@@ -632,12 +684,19 @@ async function saveThreads(
 async function mutateThreads<T>(
   ctx: PluginContext,
   preserveIds: Iterable<string>,
-  mutator: (current: ConversationThread[]) => Promise<{ threads: ConversationThread[]; result: T }> | { threads: ConversationThread[]; result: T },
+  mutator: (
+    current: ConversationThread[],
+    protectedIds: ReadonlySet<string>,
+  ) =>
+    | Promise<{ threads: ConversationThread[]; result: T }>
+    | { threads: ConversationThread[]; result: T },
 ): Promise<T> {
   return await withOpenClawStorageLock("threads", async () => {
     const current = await loadThreads(ctx);
-    const { threads: next, result } = await mutator(current);
-    await saveThreads(ctx, next, preserveIds);
+    const protectedIds = await collectProtectedConversationIds(ctx);
+    for (const id of preserveIds) protectedIds.add(id);
+    const { threads: next, result } = await mutator(current, protectedIds);
+    await saveThreads(ctx, next, protectedIds);
     return result;
   });
 }
@@ -818,7 +877,10 @@ export async function saveRevisionProposals(
   proposals: RevisionProposal[],
 ): Promise<void> {
   if (!ctx.kv) return;
-  await ctx.kv.set("revision_proposals_v2", proposals.slice(0, 80));
+  const unresolved = proposals.filter(p => isProposalUnresolved(p.status));
+  const resolved = proposals.filter(p => !isProposalUnresolved(p.status));
+  const retained = [...unresolved, ...resolved.slice(0, Math.max(0, 80 - unresolved.length))];
+  await ctx.kv.set("revision_proposals_v2", retained);
 }
 
 async function loadPersistedExecApprovals(ctx: PluginContext): Promise<GatewayExecApproval[]> {
@@ -832,7 +894,10 @@ async function savePersistedExecApprovals(
   approvals: GatewayExecApproval[],
 ): Promise<void> {
   if (!ctx.kv) return;
-  await ctx.kv.set("gateway_exec_approvals_v1", approvals.slice(0, 50));
+  const pending = approvals.filter(a => a.status === "pending");
+  const resolved = approvals.filter(a => a.status !== "pending");
+  const retained = [...pending, ...resolved.slice(0, Math.max(0, 50 - pending.length))];
+  await ctx.kv.set("gateway_exec_approvals_v1", retained);
 }
 
 async function upsertPersistedExecApprovals(
@@ -1339,21 +1404,26 @@ export async function buildWorkspaceSnapshot(
     boundEntry,
   );
   if (initialEnsure.addedIds.length > 0) {
-    allThreads = await mutateThreads(ctx, initialEnsure.addedIds, current => {
-      const reEnsured = ensureUserThreads(
-        current,
-        currentUserId,
-        agentId,
-        enrichedCollections,
-        entriesPreview,
-        boundEntry,
-      );
-      const retained = retainThreads(reEnsured.threads, [
-        ...initialEnsure.addedIds,
-        ...reEnsured.addedIds,
-      ]);
-      return { threads: retained, result: retained };
-    });
+    allThreads = await mutateThreads(
+      ctx,
+      initialEnsure.addedIds,
+      (current, protectedIds) => {
+        const reEnsured = ensureUserThreads(
+          current,
+          currentUserId,
+          agentId,
+          enrichedCollections,
+          entriesPreview,
+          boundEntry,
+        );
+        const retained = retainThreads(reEnsured.threads, [
+          ...protectedIds,
+          ...initialEnsure.addedIds,
+          ...reEnsured.addedIds,
+        ]);
+        return { threads: retained, result: retained };
+      },
+    );
   }
 
   const visibleThreads = allThreads.filter(t => isThreadVisibleToUser(t, currentUserId));
@@ -2690,7 +2760,7 @@ export async function openclawChatRoute(
       status: "streaming",
     };
 
-    const startedInfo = await mutateThreads(ctx, [], current => {
+    const startedInfo = await mutateThreads(ctx, [], (current, protectedIds) => {
       const ensured = ensureUserThreads(
         current,
         currentUserId,
@@ -2731,7 +2801,11 @@ export async function openclawChatRoute(
           messages: [...t.messages, userMsg, placeholderAssistantMsg],
         };
       });
-      const retained = retainThreads(next, [targetConvId, ...ensured.addedIds]);
+      const retained = retainThreads(next, [
+        ...protectedIds,
+        targetConvId,
+        ...ensured.addedIds,
+      ]);
       return {
         threads: retained,
         result: {
@@ -3135,6 +3209,16 @@ export async function openclawChatRoute(
       execApprovalIds: createdExecApprovals.map(a => a.approvalId),
     };
 
+    if (createdProposals.length > 0) {
+      await loadRevisionProposals(ctx);
+      await withOpenClawStorageLock("proposals", async () => {
+        const fresh = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        await saveRevisionProposals(ctx, [...createdProposals, ...fresh]);
+      });
+    }
+
     const updatedThreads = await mutateThreads(ctx, [targetConvId], current => {
       const hasTarget = current.some(t => t.conversationId === targetConvId);
       const source = hasTarget ? current : [{ ...targetThread, messages: [userMsg] }, ...current];
@@ -3171,13 +3255,6 @@ export async function openclawChatRoute(
     const finalAudience = resolveThreadAudience(updatedThreads, targetConvId, currentUserId);
 
     if (createdProposals.length > 0) {
-      await loadRevisionProposals(ctx);
-      await withOpenClawStorageLock("proposals", async () => {
-        const fresh = ctx.kv
-          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
-          : [];
-        await saveRevisionProposals(ctx, [...createdProposals, ...fresh]);
-      });
       for (const proposal of createdProposals) {
         publishOpenClawEvent({
           type: "proposal_updated",

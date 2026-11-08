@@ -1479,4 +1479,58 @@ test("HTTP Gateway enforces Admin-only role, preserves conversation identity & h
   assert.ok(charlieBoundThread);
   assert.equal(charlieBoundThread.ownerUserId, "u_charlie");
   assert.equal(charlieBoundThread.visibility, "personal");
+
+  // 5. Eviction protection: an older idle personal thread with an unresolved proposal survives >40 newer personal threads
+  const charliePropTurn = await chat(
+    createNativeRouteCtx({
+      userId: "u_charlie",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "send_message",
+        conversationId: charlieDefaultThread.conversationId,
+        prompt: "/propose tighten Atelier Field Jacket copy",
+      },
+    }),
+  );
+  const unresolvedProp = charliePropTurn.proposals.find(
+    p => p.conversationId === charlieDefaultThread.conversationId,
+  );
+  assert.ok(unresolvedProp, "Expected pending proposal on charlieDefaultThread");
+
+  for (let i = 0; i < 45; i++) {
+    await chat(
+      createNativeRouteCtx({
+        userId: "u_charlie",
+        role: 40,
+        sharedSettings,
+        sharedKv,
+        itemsByCollection,
+        input: { action: "create_thread", title: `Newer Charlie Thread ${i}` },
+      }),
+    );
+  }
+
+  const charlieAfterEviction = await chat(
+    createNativeRouteCtx({
+      userId: "u_charlie",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.ok(
+    charlieAfterEviction.threads.some(
+      t => t.conversationId === charlieDefaultThread.conversationId,
+    ),
+    "Conversation holding unresolved proposal must never be evicted at the 40-thread cap",
+  );
+  assert.ok(
+    charlieAfterEviction.proposals.some(p => p.proposalId === unresolvedProp.proposalId),
+    "Unresolved proposal must remain visible in snapshot after creating >40 newer threads",
+  );
 });
