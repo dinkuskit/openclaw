@@ -356,6 +356,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         ? normalized.extractedToken
         : undefined;
 
+    const allowInlineApprovals = Boolean(connection.allowGatewayExecApprovals);
+    const requestedScopes = allowInlineApprovals
+      ? ["operator.read", "operator.write", "operator.approvals"]
+      : ["operator.read", "operator.write"];
+
     const computeFingerprint = (devToken?: string) =>
       crypto
         .createHash("sha256")
@@ -366,6 +371,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             token: tokenCandidate ?? "",
             deviceToken: devToken ?? "",
             deviceId: identity.deviceId,
+            allowInlineApprovals,
           }),
         )
         .digest("hex");
@@ -419,7 +425,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         clientVersion: "0.1.0",
         mode: "backend",
         role: "operator",
-        scopes: ["operator.read", "operator.write", "operator.approvals"],
+        scopes: requestedScopes,
         caps: [GATEWAY_CLIENT_CAPS.TOOL_EVENTS],
         minProtocol: PROTOCOL_VERSION,
         maxProtocol: PROTOCOL_VERSION,
@@ -723,6 +729,21 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
   }
 
   async sendTurn(req: GatewayTurnRequest): Promise<GatewayTurnResult> {
+    const canResolveApprovals =
+      Boolean(req.callerIsAdmin) && Boolean(req.connection.allowGatewayExecApprovals);
+    if (/^\/?approve(?:@[^\s]+)?(?:\s|$)/i.test(req.prompt.trim()) && !canResolveApprovals) {
+      return {
+        ok: false,
+        replyText: "",
+        status: "failed",
+        toolCalls: [],
+        approvals: [],
+        errorMessage: !req.callerIsAdmin
+          ? "Only EmDash Administrators can resolve OpenClaw Gateway execution approvals."
+          : "Inline Gateway approvals are disabled. Enable allowGatewayExecApprovals in Gateway settings or approve in OpenClaw Control UI.",
+      };
+    }
+
     const seqAtStart = this.#audienceSeq.get(req.sessionKey) ?? 0;
     const priorBinding = this.#sessionToConversation.get(req.sessionKey);
     if (!priorBinding) {
@@ -773,6 +794,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           agentId: req.connection.agentId,
           message: req.prompt,
           queueMode: "steer",
+          suppressCommandInterpretation: !canResolveApprovals,
           idempotencyKey: `emdash_steer_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         });
         if (
@@ -829,6 +851,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           sessionKey: req.sessionKey,
           agentId: req.connection.agentId,
           message: composedMessage,
+          suppressCommandInterpretation: !canResolveApprovals,
           idempotencyKey: `emdash_turn_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`,
         })
         .then(ack => {

@@ -17,6 +17,7 @@ export interface GatewayTurnRequest {
   prompt: string;
   systemContext?: string;
   steer?: boolean;
+  callerIsAdmin?: boolean;
   expectedRunId?: string;
   timeoutMs?: number;
   resolveLatestAudience?: () => Promise<{

@@ -617,11 +617,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       lastBoundEntryKey = key;
       return;
     }
-    if (key && key !== lastBoundEntryKey) {
+    if (key !== lastBoundEntryKey) {
       lastBoundEntryKey = key;
       void refreshWorkspace();
-    } else {
-      lastBoundEntryKey = key;
     }
   });
 
@@ -2718,10 +2716,10 @@ export function registerOpenClawChatElement(): void {
       setProps(prev => ({
         ...prev,
         surface: surfaceAttr === "editor-panel" ? "editor-panel" : "admin-page",
-        collection: this.getAttribute("collection") ?? prev.collection,
-        entryId: this.getAttribute("entry-id") ?? prev.entryId,
-        locale: this.getAttribute("locale") ?? prev.locale,
-        entryTitle: this.getAttribute("entry-title") ?? prev.entryTitle,
+        collection: this.getAttribute("collection") ?? undefined,
+        entryId: this.getAttribute("entry-id") ?? undefined,
+        locale: this.getAttribute("locale") ?? undefined,
+        entryTitle: this.getAttribute("entry-title") ?? undefined,
         emdashNavOpen: this.getAttribute("emdash-nav-open") === "true",
         onToggleEmdashNav: this.onToggleEmdashNav,
       }));

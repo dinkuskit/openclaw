@@ -802,6 +802,19 @@ async function hydrateLegacyPendingProposal(
   };
 }
 
+function retainRevisionProposals(proposals: RevisionProposal[]): RevisionProposal[] {
+  const deduped: RevisionProposal[] = [];
+  const seen = new Set<string>();
+  for (const p of proposals) {
+    if (!p?.proposalId || seen.has(p.proposalId)) continue;
+    seen.add(p.proposalId);
+    deduped.push(p);
+  }
+  const unresolved = deduped.filter(p => isProposalUnresolved(p.status));
+  const resolved = deduped.filter(p => !isProposalUnresolved(p.status));
+  return [...unresolved, ...resolved.slice(0, Math.max(0, 80 - unresolved.length))];
+}
+
 export async function loadRevisionProposals(ctx: PluginContext): Promise<RevisionProposal[]> {
   if (!ctx.kv) return [];
 
@@ -814,14 +827,12 @@ export async function loadRevisionProposals(ctx: PluginContext): Promise<Revisio
     const v2Snapshot = normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
     const knownIds = new Set(v2Snapshot.map(p => p.proposalId));
     const hydratedById = new Map<string, RevisionProposal>();
-    const processedIds = new Set<string>();
 
     for (let idx = 0; idx < legacySnapshot.length; idx++) {
       const rawItem = legacySnapshot[idx];
       if (!rawItem || typeof rawItem !== "object") continue;
       const rec = rawItem as Record<string, unknown>;
       const id = typeof rec.proposalId === "string" ? rec.proposalId : `prop_legacy_${idx}`;
-      processedIds.add(id);
       if (knownIds.has(id) || hydratedById.has(id)) continue;
       hydratedById.set(id, await hydrateLegacyPendingProposal(ctx, rec, idx));
     }
@@ -841,16 +852,17 @@ export async function loadRevisionProposals(ctx: PluginContext): Promise<Revisio
       }
 
       const nextV2 =
-        toPrepend.length > 0 ? [...toPrepend, ...freshV2].slice(0, 80) : freshV2;
+        toPrepend.length > 0 ? retainRevisionProposals([...toPrepend, ...freshV2]) : freshV2;
       if (toPrepend.length > 0) {
         await ctx.kv!.set("revision_proposals_v2", nextV2);
       }
+      const retainedIds = new Set(nextV2.map(p => p.proposalId));
 
       const remainingLegacy = freshLegacy.filter((rawItem, idx) => {
         if (!rawItem || typeof rawItem !== "object") return false;
         const rec = rawItem as Record<string, unknown>;
         const id = typeof rec.proposalId === "string" ? rec.proposalId : `prop_legacy_${idx}`;
-        return !processedIds.has(id) && !freshExistingIds.has(id);
+        return !retainedIds.has(id);
       });
 
       if (remainingLegacy.length === 0) {
@@ -877,10 +889,7 @@ export async function saveRevisionProposals(
   proposals: RevisionProposal[],
 ): Promise<void> {
   if (!ctx.kv) return;
-  const unresolved = proposals.filter(p => isProposalUnresolved(p.status));
-  const resolved = proposals.filter(p => !isProposalUnresolved(p.status));
-  const retained = [...unresolved, ...resolved.slice(0, Math.max(0, 80 - unresolved.length))];
-  await ctx.kv.set("revision_proposals_v2", retained);
+  await ctx.kv.set("revision_proposals_v2", retainRevisionProposals(proposals));
 }
 
 async function loadPersistedExecApprovals(ctx: PluginContext): Promise<GatewayExecApproval[]> {
@@ -2741,6 +2750,24 @@ export async function openclawChatRoute(
       };
     }
 
+    if (/^\/?approve(?:@[^\s]+)?(?:\s|$)/i.test(prompt.trim())) {
+      if (role < ADMIN) {
+        return {
+          ok: false,
+          error: "GATEWAY_APPROVAL_FORBIDDEN",
+          message: "Only EmDash Administrators can resolve OpenClaw Gateway execution approvals.",
+        };
+      }
+      if (!connection?.allowGatewayExecApprovals) {
+        return {
+          ok: false,
+          error: "GATEWAY_APPROVAL_DISABLED",
+          message:
+            "Inline Gateway approvals are disabled. Enable allowGatewayExecApprovals in Gateway settings or approve in OpenClaw Control UI.",
+        };
+      }
+    }
+
     const now = new Date().toISOString();
     const userMsgId = csprngId("msg_u_", 6);
     const assistantMsgId = csprngId("msg_a_", 6);
@@ -2973,6 +3000,7 @@ export async function openclawChatRoute(
           prompt,
           systemContext: `${catalogDigest}${proposalInstruction}`,
           steer: action === "steer_turn",
+          callerIsAdmin: role >= ADMIN,
           expectedRunId: targetThread.activeRunId,
           onDeviceCredentialsUpdated: async patch => {
             const latestState = await readConnectionSettingsState(ctx);

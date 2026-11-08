@@ -1533,4 +1533,38 @@ test("HTTP Gateway enforces Admin-only role, preserves conversation identity & h
     charlieAfterEviction.proposals.some(p => p.proposalId === unresolvedProp.proposalId),
     "Unresolved proposal must remain visible in snapshot after creating >40 newer threads",
   );
+
+  // 6. Importing external `/pair` proposals when 80 pending proposals already exist preserves ALL unresolved proposals
+  const eightyPending = Array.from({ length: 80 }, (_, idx) => ({
+    ...unresolvedProp,
+    proposalId: `prop_bulk_pending_${idx}`,
+    conversationId: charlieDefaultThread.conversationId,
+    status: "pending",
+  }));
+  sharedKv.set("revision_proposals_v2", eightyPending);
+  sharedKv.set("pending_proposals", [
+    {
+      proposalId: "prop_external_81st",
+      collection: "products",
+      entryId: "prod_01",
+      summary: "81st external submission must not drop oldest pending proposal",
+      proposedFields: { excerpt: "Preserved 81st copy" },
+    },
+  ]);
+
+  const charlieWith81 = await chat(
+    createNativeRouteCtx({
+      userId: "u_charlie",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.ok(charlieWith81.proposals.some(p => p.proposalId === "prop_external_81st"));
+  assert.ok(
+    charlieWith81.proposals.some(p => p.proposalId === "prop_bulk_pending_79"),
+    "Oldest unresolved pending proposal must not be truncated when importing external submissions",
+  );
 });

@@ -36,9 +36,12 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
         assert.ok(frame.params.device?.id, "Ed25519 device identity must be sent");
         assert.ok(frame.params.device?.signature, "Ed25519 challenge signature must be sent");
 
-        const scopes = grantApprovalsScope
-          ? ["operator.read", "operator.write", "operator.approvals"]
-          : ["operator.read", "operator.write"];
+        const allowedByServer = new Set(
+          grantApprovalsScope
+            ? ["operator.read", "operator.write", "operator.approvals"]
+            : ["operator.read", "operator.write"],
+        );
+        const scopes = (frame.params.scopes ?? []).filter(s => allowedByServer.has(s));
 
         ws.send(
           JSON.stringify({
@@ -460,6 +463,29 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(adminDisabledAttempt.ok, false);
     assert.equal(adminDisabledAttempt.error, "GATEWAY_APPROVAL_DISABLED");
 
+    //    (b2) Before opt-in, initial `connect` must NOT even request `operator.approvals`
+    const initialConnect = gw.receivedFrames.find(f => f.method === "connect");
+    assert.ok(initialConnect);
+    assert.equal(
+      initialConnect.params.scopes.includes("operator.approvals"),
+      false,
+      "GatewayClient must not request operator.approvals while allowGatewayExecApprovals is disabled",
+    );
+    const disabledChatApprove = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          conversationId: configured.activeConversationId,
+          prompt: "/approve appr_exec_99 allow-once",
+        },
+      }),
+    );
+    assert.equal(disabledChatApprove.ok, false);
+    assert.equal(disabledChatApprove.error, "GATEWAY_APPROVAL_DISABLED");
+
     //    (c) Site Admin enables `allowGatewayExecApprovals: true` -> resolves `allow-once` over Gateway v4!
     const enabledSnap = await chat(
       makeCtx({
@@ -473,6 +499,52 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
       }),
     );
     assert.equal(enabledSnap.canResolveGatewayApprovals, true);
+
+    //    (c2) Even with `allowGatewayExecApprovals: true`, Editors cannot sneak `/approve` via `send_message` or `steer_turn`,
+    //         and non-admin `steer_turn` sets `suppressCommandInterpretation: true`!
+    const editorChatApprove = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_editor",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          prompt: "/approve appr_exec_99 allow-once",
+        },
+      }),
+    );
+    assert.equal(editorChatApprove.ok, false);
+    assert.equal(editorChatApprove.error, "GATEWAY_APPROVAL_FORBIDDEN");
+
+    const editorSteerApprove = await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_editor",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "steer_turn",
+          prompt: "approve appr_exec_99 allow-once",
+        },
+      }),
+    );
+    assert.equal(editorSteerApprove.ok, false);
+    assert.equal(editorSteerApprove.error, "GATEWAY_APPROVAL_FORBIDDEN");
+
+    await chat(
+      makeCtx({
+        role: 40,
+        userId: "u_editor",
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "steer_turn",
+          prompt: "Check fabric weight in grams",
+        },
+      }),
+    );
+    assert.equal(gw.getSteerSend()?.suppressCommandInterpretation, true);
 
     const resolvedSnap = await chat(
       makeCtx({
