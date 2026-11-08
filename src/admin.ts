@@ -163,37 +163,31 @@ async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
 }
 
 export function buildAgentPairingCommand(siteOrigin: string, pairingCode: string): string {
-  return `npx --yes @dinkuskit/openclaw pair "${siteOrigin}" "${pairingCode}"`;
+  return `curl -sS -X POST "${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair" -H "content-type: application/json" -d '{"pairingCode":"${pairingCode}","agentId":"openclaw","authorityMode":"propose_with_approval"}'`;
 }
 
 export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string): string {
   const pairEndpoint = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
-  const mcpEndpoint = `${siteOrigin}/_emdash/mcp`;
   return [
-    `Connect yourself to my EmDash CMS site (${siteOrigin})`,
-    `with pairing code: ${pairingCode}`,
+    `Pair yourself with my EmDash CMS site (${siteOrigin})`,
+    `using one-time pairing code: ${pairingCode}`,
     ``,
-    `Option A (Fastest — npx helper):`,
-    `  npx --yes @dinkuskit/openclaw pair \\`,
-    `    "${siteOrigin}" \\`,
-    `    "${pairingCode}"`,
+    `1. Run this curl command (no npm package or`,
+    `   secret gateway token needed):`,
+    `   curl -sS -X POST \\`,
+    `     "${pairEndpoint}" \\`,
+    `     -H "content-type: application/json" \\`,
+    `     -d '{`,
+    `       "pairingCode": "${pairingCode}",`,
+    `       "agentId": "openclaw",`,
+    `       "authorityMode": "propose_with_approval"`,
+    `     }'`,
     ``,
-    `Option B (Fallback — curl + MCP registration):`,
-    `  1. Register MCP server in OpenClaw config:`,
-    `     ${mcpEndpoint}`,
-    `  2. POST gateway credentials to:`,
-    `     ${pairEndpoint}`,
-    `     curl -X POST "${pairEndpoint}" \\`,
-    `       -H "content-type: application/json" \\`,
-    `       -d '{`,
-    `         "pairingCode": "${pairingCode}",`,
-    `         "gatewayUrl": "<YOUR_GATEWAY_HTTPS_URL>",`,
-    `         "agentId": "<YOUR_AGENT_ID>",`,
-    `         "gatewayToken": "<YOUR_GATEWAY_BEARER_TOKEN>",`,
-    `         "authorityMode": "propose_with_approval"`,
-    `       }'`,
-    `  3. Reply once paired so I can click`,
-    `     "Check pairing status" in EmDash.`,
+    `2. The JSON response returns your sessionToken`,
+    `   and built-in MCP / agent endpoint at:`,
+    `   ${pairEndpoint}`,
+    `3. Reply once paired so I can click`,
+    `   "Check pairing status" in EmDash.`,
   ].join("\n");
 }
 
@@ -226,9 +220,9 @@ export function setupPage(
         description: `POST ${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`,
       },
       {
-        label: "Site Native MCP",
-        value: "/_emdash/mcp",
-        description: "Zero OpenClaw daemon plugins required",
+        label: "Built-In Agent & MCP Route",
+        value: "/_emdash/api/.../pair",
+        description: "Zero npm packages or secrets required",
         trend: "up",
       },
     ],
@@ -245,9 +239,9 @@ export function setupPage(
     {
       type: "empty",
       size: "sm",
-      title: "Option 1 — 1-Click Copy Command for Your OpenClaw Agent",
+      title: "Option 1 — 1-Click Copy Command for Your Agent",
       description:
-        "Click the copy icon on the right of the command pill and drop it into your OpenClaw chat (Signal, Discord, Telegram, or Web).",
+        "Click the copy icon on the command pill (or copy the prompt block below) and paste it into OpenClaw, Codex, Claude Code, or any agent chat.",
       command_line: buildAgentPairingCommand(siteOrigin, pairingCode),
       actions: [
         {
@@ -285,12 +279,12 @@ export function setupPage(
         {
           step: "1. Copy",
           surface: "Left panel",
-          detail: "Copy the pairing prompt block",
+          detail: "Click copy icon on command pill",
         },
         {
           step: "2. Send",
-          surface: "Signal / Discord / Web",
-          detail: "npx @dinkuskit/openclaw pair ...",
+          surface: "OpenClaw / Codex / Chat",
+          detail: "Agent POSTs pairingCode via curl",
         },
         {
           step: "3. Verify",
@@ -428,6 +422,10 @@ export function workspacePage(
   const assistantRight: Block[] = [];
   if (replyText) {
     assistantRight.push(banner("default", `Response from @${connection.agentId}`, replyText));
+  } else if (activeTurn && activeTurn.status === "completed") {
+    assistantRight.push(
+      banner("default", `Response from @${connection.agentId}`, activeTurn.lastUpdate),
+    );
   }
   if (activeTurn && activeTurn.status !== "completed") {
     assistantRight.push(
@@ -965,9 +963,10 @@ export async function openclawEditorPanel(
 }
 
 /**
- * Public 1-step pairing route (`POST /_emdash/api/plugins/dinkus-openclaw/pair`).
- * Allows an OpenClaw agent to pair itself using the one-time `pairingCode` shown
- * in the EmDash admin prompt.
+ * Public 1-step pairing & built-in MCP/Agent endpoint (`POST /_emdash/api/plugins/dinkus-openclaw/pair`).
+ * - Accepts 1-step pairing with ONLY `pairingCode` (no npm package, no external gateway URL, and no 1Password secret needed).
+ * - Mints a scoped `sessionToken` (`oc_sess_...`) and serves MCP JSON-RPC (`initialize`, `tools/list`, `tools/call`)
+ *   and REST actions (`poll_turn`, `complete_turn`, `propose`) at the same URL.
  */
 export async function openclawPairRoute(
   route: SandboxedRouteContext,
@@ -977,6 +976,156 @@ export async function openclawPairRoute(
     typeof route.input === "object" && route.input !== null
       ? (route.input as Record<string, unknown>)
       : {};
+  const siteOrigin = resolveSiteOrigin(route);
+  const endpointUrl = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
+  const collections = await discoverSiteCollections(ctx);
+
+  // 1. Built-in MCP JSON-RPC 2.0 handler so agents never hit a 404 on MCP initialization
+  if (input.jsonrpc === "2.0" && typeof input.method === "string") {
+    const id = input.id ?? 1;
+    if (input.method === "initialize") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "dinkus-openclaw-emdash", version: "0.1.0" },
+        },
+      };
+    }
+    if (input.method === "notifications/initialized") {
+      return { jsonrpc: "2.0", id, result: {} };
+    }
+    if (input.method === "tools/list") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: [
+            {
+              name: "emdash_status",
+              description: "Inspect paired EmDash site collections and active turn.",
+              inputSchema: { type: "object", properties: {} },
+            },
+            {
+              name: "emdash_submit_proposal",
+              description: "Queue a WAITING_FOR_HUMAN approval card in EmDash.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  summary: { type: "string" },
+                  targetTool: { type: "string" },
+                  collection: { type: "string" },
+                  entryId: { type: "string" },
+                },
+                required: ["summary"],
+              },
+            },
+          ],
+        },
+      };
+    }
+    if (input.method === "tools/call") {
+      const params =
+        typeof input.params === "object" && input.params !== null
+          ? (input.params as Record<string, unknown>)
+          : {};
+      const toolName = cleanText(params.name, 80);
+      const args =
+        typeof params.arguments === "object" && params.arguments !== null
+          ? (params.arguments as Record<string, unknown>)
+          : {};
+      const connection = await loadConnection(ctx);
+      if (toolName === "emdash_submit_proposal" && ctx.kv) {
+        const proposals = await loadProposals(ctx);
+        const proposal: PendingProposal = {
+          proposalId: `prop_${Date.now()}`,
+          agentId: connection?.agentId ?? "openclaw",
+          collection: cleanText(args.collection, 60),
+          entryId: cleanText(args.entryId, 80),
+          summary: cleanText(args.summary, 300) ?? "Agent proposal",
+          targetTool: cleanText(args.targetTool, 80) ?? "content:update",
+          createdAt: new Date().toISOString(),
+        };
+        proposals.push(proposal);
+        await ctx.kv.set("pending_proposals", proposals);
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: JSON.stringify({ ok: true, proposal }) }],
+          },
+        };
+      }
+      const activeTurn = await loadActiveTurn(ctx);
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ok: true,
+                collections,
+                activeTurn,
+                paired: Boolean(connection),
+              }),
+            },
+          ],
+        },
+      };
+    }
+  }
+
+  // 2. Agent REST actions (poll_turn / complete_turn / propose) using minted sessionToken
+  const action = cleanText(input.action, 40);
+  if (action) {
+    const connection = await loadConnection(ctx);
+    const token = cleanText(input.sessionToken, 300) ?? cleanText(input.gatewayToken, 300);
+    if (!connection || !token || token !== connection.gatewayToken) {
+      return {
+        ok: false,
+        error: "UNAUTHORIZED_SESSION",
+        message: "Pass the sessionToken returned when pairing.",
+      };
+    }
+    if (action === "poll_turn") {
+      const activeTurn = await loadActiveTurn(ctx);
+      return { ok: true, agentId: connection.agentId, activeTurn, collections };
+    }
+    if (action === "complete_turn") {
+      const reply = cleanText(input.reply, 2000) ?? "Completed.";
+      const activeTurn = await loadActiveTurn(ctx);
+      if (ctx.kv) {
+        await ctx.kv.set("active_turn", {
+          turnId: activeTurn?.turnId ?? `turn_${Date.now()}`,
+          prompt: activeTurn?.prompt ?? "",
+          status: "completed",
+          lastUpdate: reply,
+        });
+      }
+      return { ok: true, status: "completed", reply };
+    }
+    if (action === "propose" && ctx.kv) {
+      const proposals = await loadProposals(ctx);
+      const proposal: PendingProposal = {
+        proposalId: `prop_${Date.now()}`,
+        agentId: connection.agentId,
+        collection: cleanText(input.collection, 60),
+        entryId: cleanText(input.entryId, 80),
+        summary: cleanText(input.summary, 300) ?? "Proposed content update",
+        targetTool: cleanText(input.targetTool, 80) ?? "content:update",
+        createdAt: new Date().toISOString(),
+      };
+      proposals.push(proposal);
+      await ctx.kv.set("pending_proposals", proposals);
+      return { ok: true, proposal };
+    }
+  }
+
+  // 3. 1-Step Pairing via one-time pairingCode (gatewayUrl and gatewayToken are optional!)
   const pairingCode = cleanText(input.pairingCode, 120);
   const expectedCode = await loadOrCreatePairingCode(ctx);
   if (!pairingCode || pairingCode !== expectedCode) {
@@ -987,25 +1136,22 @@ export async function openclawPairRoute(
     };
   }
 
-  const gatewayUrl = cleanText(input.gatewayUrl, 300);
-  const agentId = cleanText(input.agentId, 80) ?? "blaze";
-  const gatewayToken = cleanText(input.gatewayToken, 300);
+  const rawGatewayUrl = cleanText(input.gatewayUrl, 300);
+  const gatewayUrl =
+    rawGatewayUrl && rawGatewayUrl.startsWith("https://")
+      ? rawGatewayUrl
+      : "https://agent-session.openclaw.local";
+  const agentId = cleanText(input.agentId, 80) ?? "openclaw";
+  const sessionToken =
+    cleanText(input.gatewayToken, 300) ??
+    `oc_sess_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
   const authorityMode =
-    input.authorityMode === "propose_with_approval" ? "propose_with_approval" : "read_only";
+    input.authorityMode === "read_only" ? "read_only" : "propose_with_approval";
 
-  if (!gatewayUrl || !gatewayUrl.startsWith("https://") || !gatewayToken) {
-    return {
-      ok: false,
-      error: "INVALID_GATEWAY_CREDENTIALS",
-      message: "Provide an HTTPS gatewayUrl and non-empty gatewayToken.",
-    };
-  }
-
-  const collections = await discoverSiteCollections(ctx);
   const nextConnection: OpenClawConnection = {
     gatewayUrl,
     agentId,
-    gatewayToken,
+    gatewayToken: sessionToken,
     authorityMode,
     enabledCollections: collections.map(col => col.slug),
   };
@@ -1018,11 +1164,14 @@ export async function openclawPairRoute(
   );
   await rotatePairingCode(ctx);
 
-  const siteOrigin = resolveSiteOrigin(route);
   return {
     ok: true,
+    status: "paired",
     agentId,
     authorityMode,
-    mcpEndpoint: `${siteOrigin}/_emdash/mcp`,
+    sessionToken,
+    mcpEndpoint: endpointUrl,
+    agentEndpoint: endpointUrl,
+    collections: collections.map(col => col.slug),
   };
 }

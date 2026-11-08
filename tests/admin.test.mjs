@@ -94,19 +94,30 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   assert.ok(checkboxField);
   assert.equal(checkboxField.options.some(o => o.value === "articles"), true);
 
-  // Also verify 1-step agent pairing via the public pair route
+  // Also verify 1-step agent pairing via the public pair route (zero gatewayUrl/token needed)
   const pairingCode = await ctx.kv.get("pairing_code");
   const pairResp = await pairRoute(
     route({
       pairingCode,
-      gatewayUrl: "https://gateway.example.com",
       agentId: "blaze",
-      gatewayToken: "oc_paired_token_123",
       authorityMode: "propose_with_approval",
     }),
     ctx,
   );
   assert.equal(pairResp.ok, true);
+  assert.equal(typeof pairResp.sessionToken, "string");
+
+  // Also verify built-in MCP JSON-RPC initialize on the pair route never returns 404
+  const mcpInit = await pairRoute(
+    route({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+    }),
+    ctx,
+  );
+  assert.equal(mcpInit.jsonrpc, "2.0");
+  assert.ok(mcpInit.result);
 
   const connected = await admin(
     route({
