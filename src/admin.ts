@@ -1,23 +1,28 @@
 import type { Block, BlockResponse, FormField } from "@emdash-cms/blocks/server";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
+import {
+  cancelAllPairedAgentTurns,
+  completePairedAgentTurn,
+  pollPairedAgentTurn,
+  steerPairedAgentTurn,
+} from "./chat-engine.js";
+import type { OpenClawConnection } from "./protocol.js";
 import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
+
+export type { OpenClawConnection };
 
 /** EmDash Editor role (40) and Administrator role (50). */
 const EDITOR = 40;
 const ADMIN = 50;
 
-export interface OpenClawConnection {
-  gatewayUrl: string;
-  agentId: string;
-  gatewayToken: string;
-  authorityMode: "read_only" | "propose_with_approval";
-  enabledCollections: string[];
-}
-
 export interface ActiveTurn {
   turnId: string;
+  conversationId?: string;
+  sessionKey?: string;
   prompt: string;
-  status: "running" | "steered" | "completed";
+  steers?: string[];
+  systemContext?: string;
+  status: "running" | "steered" | "completed" | "stopped";
   lastUpdate: string;
 }
 
@@ -176,10 +181,21 @@ async function loadConnectionState(
           gatewayUrl: parsed.gatewayUrl,
           agentId: parsed.agentId,
           gatewayToken: parsed.gatewayToken,
+          ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
+            ? { deviceToken: parsed.deviceToken }
+            : {}),
+          ...(parsed.deviceIdentity &&
+          typeof parsed.deviceIdentity.deviceId === "string" &&
+          typeof parsed.deviceIdentity.publicKeyPem === "string" &&
+          typeof parsed.deviceIdentity.privateKeyPem === "string"
+            ? { deviceIdentity: parsed.deviceIdentity }
+            : {}),
           authorityMode:
             parsed.authorityMode === "propose_with_approval"
               ? "propose_with_approval"
               : "read_only",
+          allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
+          ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
           enabledCollections: Array.isArray(parsed.enabledCollections)
             ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
             : ["pages", "posts"],
@@ -207,10 +223,7 @@ async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
 }
 
 async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
-  if (!ctx.kv) return null;
-  const raw = await ctx.kv.get("active_turn");
-  if (!raw || typeof raw !== "object") return null;
-  return raw as ActiveTurn;
+  return (await pollPairedAgentTurn(ctx)) as ActiveTurn | null;
 }
 
 export function buildAgentPairingCommand(siteOrigin: string, pairingCode: string): string {
@@ -847,11 +860,14 @@ export async function openclawAdmin(
       ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
       : collections.filter(col => event.values[`col_${col.slug}`] !== false).map(col => col.slug);
 
+    const pairedAgentPoll = sanitizedGatewayUrl === "https://agent-session.openclaw.local";
     const nextConnection: OpenClawConnection = {
       gatewayUrl: sanitizedGatewayUrl,
       agentId,
       gatewayToken,
       authorityMode,
+      allowGatewayExecApprovals: false,
+      ...(pairedAgentPoll ? { pairedAgentPoll: true } : {}),
       enabledCollections,
     };
     const existing = await ctx.settings.getVersioned("connection");
@@ -860,6 +876,12 @@ export async function openclawAdmin(
       existing?.revision ?? null,
       JSON.stringify(nextConnection),
     );
+    if (!pairedAgentPoll) {
+      await cancelAllPairedAgentTurns(
+        ctx,
+        "Gateway connection updated; pending paired-agent turn was cancelled.",
+      );
+    }
     const proposals = await loadProposals(ctx);
     const activeTurn = await loadActiveTurn(ctx);
     return workspacePage(
@@ -889,6 +911,10 @@ export async function openclawAdmin(
   }
 
   if (event.type === "block_action" && event.action_id === "disconnect" && isAdmin) {
+    await cancelAllPairedAgentTurns(
+      ctx,
+      "OpenClaw connection disconnected before paired agent completed the turn.",
+    );
     await ctx.settings.delete("connection");
     const freshCode = await rotatePairingCode(ctx);
     return setupPage(true, collections, siteOrigin, freshCode);
@@ -952,13 +978,26 @@ export async function openclawAdmin(
   if (event.type === "form_submit" && event.action_id === "steer_agent" && activeTurn) {
     const steerMessage = cleanText(event.values.steerMessage, 500);
     if (steerMessage) {
-      activeTurn = {
-        ...activeTurn,
-        status: "steered",
-        lastUpdate: `Queued mid-task steer: "${steerMessage}"`,
-      };
-      if (ctx.kv) {
-        await ctx.kv.set("active_turn", activeTurn);
+      const steeredNative = await steerPairedAgentTurn(ctx, undefined, steerMessage);
+      if (steeredNative) {
+        activeTurn = {
+          turnId: steeredNative.turnId,
+          conversationId: steeredNative.conversationId,
+          sessionKey: steeredNative.sessionKey,
+          prompt: steeredNative.prompt,
+          steers: steeredNative.steers,
+          status: "steered",
+          lastUpdate: steeredNative.lastUpdate,
+        };
+      } else {
+        activeTurn = {
+          ...activeTurn,
+          status: "steered",
+          lastUpdate: `Queued mid-task steer: "${steerMessage}"`,
+        };
+        if (ctx.kv) {
+          await ctx.kv.set("active_turn", activeTurn);
+        }
       }
     }
     return workspacePage(
@@ -1224,6 +1263,18 @@ export async function openclawPairRoute(
               inputSchema: { type: "object", properties: {} },
             },
             {
+              name: "emdash_complete_turn",
+              description: "Complete an active native chat or Block Kit turn with the agent reply.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  turnId: { type: "string" },
+                  reply: { type: "string" },
+                },
+                required: ["reply"],
+              },
+            },
+            {
               name: "emdash_submit_proposal",
               description: "Queue a WAITING_FOR_HUMAN approval card in EmDash.",
               inputSchema: {
@@ -1269,6 +1320,29 @@ export async function openclawPairRoute(
           error: {
             code: -32001,
             message: "UNAUTHORIZED_SESSION: Pass Authorization: Bearer <sessionToken> or sessionToken.",
+          },
+        };
+      }
+      if (toolName === "emdash_complete_turn") {
+        const completed = await completePairedAgentTurn(ctx, connection, {
+          turnId: cleanText(args.turnId, 120),
+          reply: args.reply,
+        });
+        if (!completed.ok) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32004,
+              message: `${String(completed.error ?? "COMPLETE_TURN_FAILED")}: ${String(completed.message ?? "Could not complete turn.")}`,
+            },
+          };
+        }
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: JSON.stringify(completed) }],
           },
         };
       }
@@ -1363,7 +1437,7 @@ export async function openclawPairRoute(
       };
     }
     if (action === "poll_turn") {
-      const activeTurn = await loadActiveTurn(ctx);
+      const activeTurn = await pollPairedAgentTurn(ctx);
       const scopedCollections = collections.filter(c =>
         connection.enabledCollections.includes(c.slug),
       );
@@ -1376,24 +1450,10 @@ export async function openclawPairRoute(
       };
     }
     if (action === "complete_turn") {
-      const reply = cleanText(input.reply, 2000) ?? "Completed.";
-      const activeTurn = await loadActiveTurn(ctx);
-      if (ctx.kv) {
-        await ctx.kv.set("active_turn", {
-          turnId: activeTurn?.turnId ?? `turn_${Date.now()}`,
-          prompt: activeTurn?.prompt ?? "",
-          status: "completed",
-          lastUpdate: reply,
-        });
-      }
-      publishOpenClawEvent({
-        type: "workspace_sync",
-        conversationId: "conv_catalog_overview",
-        reason: "external_agent_turn_completed",
-        timestamp: new Date().toISOString(),
-        visibility: "shared",
+      return completePairedAgentTurn(ctx, connection, {
+        turnId: cleanText(input.turnId, 120),
+        reply: input.reply,
       });
-      return { ok: true, status: "completed", reply };
     }
     if (action === "propose" && ctx.kv) {
       const targetCollection = cleanText(input.collection, 60);
@@ -1485,11 +1545,14 @@ export async function openclawPairRoute(
   const authorityMode =
     input.authorityMode === "read_only" ? "read_only" : "propose_with_approval";
 
+  const pairedAgentPoll = gatewayUrl === "https://agent-session.openclaw.local";
   const nextConnection: OpenClawConnection = {
     gatewayUrl,
     agentId,
     gatewayToken: sessionToken,
     authorityMode,
+    allowGatewayExecApprovals: false,
+    ...(pairedAgentPoll ? { pairedAgentPoll: true } : {}),
     enabledCollections: collections.map(col => col.slug),
   };
 
@@ -1499,6 +1562,12 @@ export async function openclawPairRoute(
     existing?.revision ?? null,
     JSON.stringify(nextConnection),
   );
+  if (!pairedAgentPoll) {
+    await cancelAllPairedAgentTurns(
+      ctx,
+      "Paired direct Gateway URL; pending polling turns were cancelled.",
+    );
+  }
   await rotatePairingCode(ctx);
   publishOpenClawEvent({
     type: "workspace_sync",

@@ -1632,14 +1632,16 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                         </For>
                                       }
                                     >
-                                      <For each={Object.entries(editDraftForProposal(p().proposalId))}>
-                                        {([field, val]) => (
+                                      <For each={Object.keys(editDraftForProposal(p().proposalId))}>
+                                        {field => (
                                           <div>
                                             <div class="oc-diff-field-name">{field}</div>
                                             <input
                                               type="text"
                                               class="oc-edit-input"
-                                              value={val}
+                                              value={
+                                                editDraftForProposal(p().proposalId)[field] ?? ""
+                                              }
                                               onInput={e =>
                                                 setEditDraftField(
                                                   p().proposalId,

@@ -145,6 +145,7 @@ export function buildPairingPromptString(siteOrigin: string, pairingCode: string
     `   ${buildPairingCommandString(siteOrigin, pairingCode)}`,
     `2. Use the returned sessionToken (Authorization: Bearer <sessionToken>) with MCP / REST at:`,
     `   ${pairEndpoint}`,
+    `3. Poll native chat prompts with {"action":"poll_turn"} (or MCP emdash_status) and deliver replies with {"action":"complete_turn","turnId":"<turnId>","reply":"..."} (or MCP emdash_complete_turn).`,
   ].join("\n");
 }
 
@@ -328,6 +329,7 @@ export async function readConnectionSettingsState(
               ? "propose_with_approval"
               : "read_only",
           allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
+          ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
           enabledCollections: Array.isArray(parsed.enabledCollections)
             ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
             : ["pages", "products"],
@@ -1748,6 +1750,628 @@ async function doesStoredEntryMatchProposalBase(
   return { checked: true, matches: true, item };
 }
 
+export interface PairedAgentTurnRecord {
+  turnId: string;
+  conversationId: string;
+  assistantMessageId: string;
+  sessionKey: string;
+  agentId: string;
+  ownerUserId?: string;
+  visibility: "personal" | "shared";
+  requestedByUserId: string;
+  requestedByRole: number;
+  prompt: string;
+  steers?: string[];
+  systemContext: string;
+  gatheredSnapshot?: CatalogEntrySummary[];
+  status: "running" | "steered" | "completed" | "stopped";
+  lastUpdate: string;
+  createdAt: string;
+}
+
+export interface PolledPairedAgentTurn {
+  turnId: string;
+  conversationId?: string;
+  sessionKey?: string;
+  requestedByRole?: number;
+  prompt: string;
+  steers?: string[];
+  systemContext?: string;
+  status: "running" | "steered" | "completed" | "stopped";
+  lastUpdate: string;
+}
+
+const MAX_ACTIVE_PAIRED_TURNS = 50;
+const MAX_TERMINAL_PAIRED_TURNS = 16;
+
+function normalizePairedAgentTurns(raw: unknown): PairedAgentTurnRecord[] {
+  if (!Array.isArray(raw)) return [];
+  const out: PairedAgentTurnRecord[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Partial<PairedAgentTurnRecord>;
+    if (
+      typeof rec.turnId !== "string" ||
+      typeof rec.conversationId !== "string" ||
+      typeof rec.assistantMessageId !== "string" ||
+      typeof rec.prompt !== "string"
+    ) {
+      continue;
+    }
+    const status =
+      rec.status === "steered" || rec.status === "completed" || rec.status === "stopped"
+        ? rec.status
+        : "running";
+    out.push({
+      turnId: rec.turnId,
+      conversationId: rec.conversationId,
+      assistantMessageId: rec.assistantMessageId,
+      sessionKey: typeof rec.sessionKey === "string" ? rec.sessionKey : `agent:openclaw:emdash:${rec.conversationId}`,
+      agentId: typeof rec.agentId === "string" ? rec.agentId : "openclaw",
+      ...(typeof rec.ownerUserId === "string" ? { ownerUserId: rec.ownerUserId } : {}),
+      visibility: rec.visibility === "shared" ? "shared" : "personal",
+      requestedByUserId: typeof rec.requestedByUserId === "string" ? rec.requestedByUserId : "u1",
+      requestedByRole: typeof rec.requestedByRole === "number" ? rec.requestedByRole : EDITOR,
+      prompt: rec.prompt,
+      ...(Array.isArray(rec.steers)
+        ? { steers: rec.steers.filter((s): s is string => typeof s === "string") }
+        : {}),
+      systemContext: typeof rec.systemContext === "string" ? rec.systemContext : "",
+      ...(Array.isArray(rec.gatheredSnapshot) ? { gatheredSnapshot: rec.gatheredSnapshot } : {}),
+      status,
+      lastUpdate: typeof rec.lastUpdate === "string" ? rec.lastUpdate : "",
+      createdAt: typeof rec.createdAt === "string" ? rec.createdAt : new Date().toISOString(),
+    });
+  }
+  return out;
+}
+
+function prunePairedAgentTurns(records: PairedAgentTurnRecord[]): PairedAgentTurnRecord[] {
+  const active = records.filter(r => r.status === "running" || r.status === "steered");
+  const terminal = records
+    .filter(r => r.status === "completed" || r.status === "stopped")
+    .slice(-MAX_TERMINAL_PAIRED_TURNS);
+  return [...terminal, ...active];
+}
+
+function projectPolledTurn(rec: PairedAgentTurnRecord): PolledPairedAgentTurn {
+  return {
+    turnId: rec.turnId,
+    conversationId: rec.conversationId,
+    sessionKey: rec.sessionKey,
+    requestedByRole: rec.requestedByRole,
+    prompt: rec.prompt,
+    ...(rec.steers && rec.steers.length > 0 ? { steers: rec.steers } : {}),
+    systemContext: rec.systemContext,
+    status: rec.status,
+    lastUpdate: rec.lastUpdate,
+  };
+}
+
+async function syncLegacyActiveTurnPointer(
+  ctx: PluginContext,
+  records: PairedAgentTurnRecord[],
+  clearedTurnIds?: Set<string>,
+): Promise<void> {
+  if (!ctx.kv) return;
+  const nextActive = records.find(r => r.status === "running" || r.status === "steered");
+  if (nextActive) {
+    await ctx.kv.set("active_turn", projectPolledTurn(nextActive));
+    return;
+  }
+  const currentActive = (await ctx.kv.get("active_turn")) as Partial<PolledPairedAgentTurn> | null;
+  if (
+    currentActive &&
+    typeof currentActive === "object" &&
+    typeof currentActive.turnId === "string" &&
+    clearedTurnIds?.has(currentActive.turnId)
+  ) {
+    await ctx.kv.delete("active_turn");
+  }
+}
+
+async function enqueuePairedAgentTurn(
+  ctx: PluginContext,
+  record: PairedAgentTurnRecord,
+): Promise<{ queued: boolean; error?: string }> {
+  if (!ctx.kv) {
+    return {
+      queued: false,
+      error: "Plugin KV storage is unavailable to queue paired-agent turns.",
+    };
+  }
+  return withOpenClawStorageLock("paired_turns", async () => {
+    const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+    const activeCount = existing.filter(
+      r => r.status === "running" || r.status === "steered",
+    ).length;
+    if (activeCount >= MAX_ACTIVE_PAIRED_TURNS) {
+      return {
+        queued: false,
+        error: `Paired agent queue already has ${MAX_ACTIVE_PAIRED_TURNS} pending turns. Wait for your paired OpenClaw agent to poll or stop stalled turns.`,
+      };
+    }
+    const updated = prunePairedAgentTurns([...existing, record]);
+    await ctx.kv!.set("paired_agent_turns_v1", updated);
+    await syncLegacyActiveTurnPointer(ctx, updated);
+    return { queued: true };
+  });
+}
+
+export async function steerPairedAgentTurn(
+  ctx: PluginContext,
+  conversationId: string | undefined,
+  steerPrompt: string,
+): Promise<PairedAgentTurnRecord | null> {
+  if (!ctx.kv) return null;
+  return withOpenClawStorageLock("paired_turns", async () => {
+    const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+    const targetIdx = existing.findIndex(
+      r =>
+        (r.status === "running" || r.status === "steered") &&
+        (!conversationId || r.conversationId === conversationId),
+    );
+    if (targetIdx === -1) return null;
+    const target = existing[targetIdx]!;
+    const steered: PairedAgentTurnRecord = {
+      ...target,
+      steers: [...(target.steers ?? []), steerPrompt],
+      status: "steered",
+      lastUpdate: `Queued mid-task steer: "${steerPrompt}"`,
+    };
+    const updated = existing.map((r, i) => (i === targetIdx ? steered : r));
+    await ctx.kv!.set("paired_agent_turns_v1", updated);
+    await syncLegacyActiveTurnPointer(ctx, updated);
+    return steered;
+  });
+}
+
+export async function stopPairedAgentTurns(
+  ctx: PluginContext,
+  conversationId?: string,
+): Promise<string[]> {
+  if (!ctx.kv) return [];
+  return withOpenClawStorageLock("paired_turns", async () => {
+    const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+    const stoppedIds = new Set<string>();
+    const updated = prunePairedAgentTurns(
+      existing.map(r => {
+        if (
+          (r.status === "running" || r.status === "steered") &&
+          (!conversationId || r.conversationId === conversationId)
+        ) {
+          stoppedIds.add(r.turnId);
+          return {
+            ...r,
+            status: "stopped" as const,
+            gatheredSnapshot: undefined,
+            lastUpdate: "Stopped by operator in EmDash.",
+          };
+        }
+        return r;
+      }),
+    );
+    if (stoppedIds.size > 0) {
+      await ctx.kv!.set("paired_agent_turns_v1", updated);
+    }
+    if (!conversationId) {
+      await ctx.kv!.delete("active_turn");
+    } else {
+      await syncLegacyActiveTurnPointer(ctx, updated, stoppedIds);
+    }
+    return [...stoppedIds];
+  });
+}
+
+export async function cancelAllPairedAgentTurns(
+  ctx: PluginContext,
+  reasonMessage: string,
+): Promise<void> {
+  const activeRecords = ctx.kv
+    ? await withOpenClawStorageLock("paired_turns", async () => {
+        const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+        const cancelled: PairedAgentTurnRecord[] = [];
+        const updated = prunePairedAgentTurns(
+          existing.map(r => {
+            if (r.status === "running" || r.status === "steered") {
+              cancelled.push(r);
+              return {
+                ...r,
+                status: "stopped" as const,
+                gatheredSnapshot: undefined,
+                lastUpdate: reasonMessage,
+              };
+            }
+            return r;
+          }),
+        );
+        if (cancelled.length > 0) {
+          await ctx.kv!.set("paired_agent_turns_v1", updated);
+        }
+        await ctx.kv!.delete("active_turn");
+        return cancelled;
+      })
+    : [];
+
+  if (activeRecords.length === 0) return;
+  const affectedConvIds = [...new Set(activeRecords.map(r => r.conversationId))];
+  const cancelledMsgIds = new Set(activeRecords.map(r => r.assistantMessageId));
+
+  const updatedThreads = await mutateThreads(ctx, affectedConvIds, current => {
+    const next = current.map(t => {
+      if (!affectedConvIds.includes(t.conversationId)) return t;
+      const messages = t.messages.map(m =>
+        cancelledMsgIds.has(m.messageId) && m.status === "streaming"
+          ? { ...m, content: m.content || reasonMessage, status: "failed" as const }
+          : m,
+      );
+      const stillStreaming = messages.some(m => m.status === "streaming");
+      return {
+        ...t,
+        status: stillStreaming ? ("running" as const) : ("failed" as const),
+        ...(stillStreaming ? {} : { activeRunId: undefined, runPhase: undefined }),
+        updatedAt: new Date().toISOString(),
+        messages,
+      };
+    });
+    return { threads: next, result: next };
+  });
+
+  for (const convId of affectedConvIds) {
+    const aud = resolveThreadAudience(updatedThreads, convId, "u1");
+    publishOpenClawEvent({
+      type: "workspace_sync",
+      conversationId: convId,
+      reason: "turn_cancelled",
+      timestamp: new Date().toISOString(),
+      ...aud,
+    });
+  }
+}
+
+export async function pollPairedAgentTurn(
+  ctx: PluginContext,
+): Promise<PolledPairedAgentTurn | null> {
+  if (!ctx.kv) return null;
+  const records = normalizePairedAgentTurns(await ctx.kv.get("paired_agent_turns_v1"));
+  const active = records.find(r => r.status === "running" || r.status === "steered");
+  if (active) {
+    return projectPolledTurn(active);
+  }
+  const legacyRaw = await ctx.kv.get("active_turn");
+  if (legacyRaw && typeof legacyRaw === "object") {
+    const legacy = legacyRaw as Partial<PolledPairedAgentTurn>;
+    if (typeof legacy.turnId === "string" && typeof legacy.prompt === "string") {
+      return {
+        turnId: legacy.turnId,
+        prompt: legacy.prompt,
+        status:
+          legacy.status === "steered" ||
+          legacy.status === "completed" ||
+          legacy.status === "stopped"
+            ? legacy.status
+            : "running",
+        lastUpdate: typeof legacy.lastUpdate === "string" ? legacy.lastUpdate : "",
+        ...(Array.isArray(legacy.steers) ? { steers: legacy.steers } : {}),
+        ...(typeof legacy.conversationId === "string"
+          ? { conversationId: legacy.conversationId }
+          : {}),
+        ...(typeof legacy.sessionKey === "string" ? { sessionKey: legacy.sessionKey } : {}),
+        ...(typeof legacy.systemContext === "string"
+          ? { systemContext: legacy.systemContext }
+          : {}),
+      };
+    }
+  }
+  return null;
+}
+
+export async function completePairedAgentTurn(
+  ctx: PluginContext,
+  connection: OpenClawConnection,
+  params: { turnId?: string; reply?: unknown },
+): Promise<Record<string, unknown>> {
+  const reply = cleanInputText(params.reply, 8000) ?? "Completed.";
+  const requestedTurnId = cleanInputText(params.turnId, 120);
+
+  if (!ctx.kv) {
+    return {
+      ok: false,
+      error: "STORAGE_UNAVAILABLE",
+      message: "Plugin KV storage is unavailable.",
+    };
+  }
+
+  const claimResult = await withOpenClawStorageLock("paired_turns", async () => {
+    const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+    const idx = requestedTurnId
+      ? existing.findIndex(r => r.turnId === requestedTurnId)
+      : existing.findIndex(r => r.status === "running" || r.status === "steered");
+
+    if (idx !== -1) {
+      const target = existing[idx]!;
+      if (target.status === "stopped") {
+        return { kind: "error" as const, code: "TURN_ALREADY_STOPPED", message: "The turn was stopped in EmDash before completion." };
+      }
+      if (target.status === "completed") {
+        return { kind: "error" as const, code: "TURN_ALREADY_COMPLETED", message: "The turn has already been completed." };
+      }
+      const completedRecord: PairedAgentTurnRecord = {
+        ...target,
+        status: "completed",
+        gatheredSnapshot: undefined,
+        lastUpdate: reply.slice(0, 500),
+      };
+      const updated = prunePairedAgentTurns(
+        existing.map((r, i) => (i === idx ? completedRecord : r)),
+      );
+      await ctx.kv!.set("paired_agent_turns_v1", updated);
+      await syncLegacyActiveTurnPointer(ctx, updated, new Set([target.turnId]));
+      return { kind: "native" as const, matched: target };
+    }
+
+    const legacyRaw = await ctx.kv!.get("active_turn");
+    const legacy =
+      legacyRaw && typeof legacyRaw === "object"
+        ? (legacyRaw as Partial<PolledPairedAgentTurn>)
+        : null;
+    if (
+      legacy &&
+      typeof legacy.turnId === "string" &&
+      (!requestedTurnId || legacy.turnId === requestedTurnId)
+    ) {
+      if (legacy.status === "stopped") {
+        return { kind: "error" as const, code: "TURN_ALREADY_STOPPED", message: "The active turn was stopped." };
+      }
+      if (legacy.status === "completed") {
+        return { kind: "error" as const, code: "TURN_ALREADY_COMPLETED", message: "The active turn was already completed." };
+      }
+      await ctx.kv!.set("active_turn", {
+        turnId: legacy.turnId,
+        prompt: legacy.prompt ?? "",
+        status: "completed",
+        lastUpdate: reply.slice(0, 500),
+      });
+      return { kind: "legacy" as const, turnId: legacy.turnId };
+    }
+
+    if (!requestedTurnId && existing.length > 0 && existing[existing.length - 1]?.status === "stopped") {
+      return { kind: "error" as const, code: "TURN_ALREADY_STOPPED", message: "The active turn was stopped in EmDash before completion." };
+    }
+
+    return {
+      kind: "error" as const,
+      code: requestedTurnId ? "TURN_NOT_FOUND" : "NO_ACTIVE_TURN",
+      message: requestedTurnId
+        ? `Turn "${requestedTurnId}" was not found.`
+        : "No active turn is waiting for completion.",
+    };
+  });
+
+  if (claimResult.kind === "error") {
+    return {
+      ok: false,
+      error: claimResult.code,
+      message: claimResult.message,
+    };
+  }
+
+  if (claimResult.kind === "legacy") {
+    publishOpenClawEvent({
+      type: "workspace_sync",
+      conversationId: "conv_catalog_overview",
+      reason: "external_agent_turn_completed",
+      timestamp: new Date().toISOString(),
+      visibility: "shared",
+    });
+    return { ok: true, status: "completed", turnId: claimResult.turnId, reply };
+  }
+
+  const matched = claimResult.matched;
+  const collections = await listSiteCollections(ctx);
+  const enabledSlugs = collections
+    .filter(c => connection.enabledCollections.includes(c.slug))
+    .map(c => c.slug);
+
+  let cleanedReply = reply;
+  const createdProposals: RevisionProposal[] = [];
+
+  if (connection.authorityMode === "propose_with_approval" && /```emdash-proposal\s/i.test(reply)) {
+    const candidateEntries: CatalogEntrySummary[] = [...(matched.gatheredSnapshot ?? [])].filter(
+      e => enabledSlugs.includes(e.collection),
+    );
+    const fenceProbe = /```emdash-proposal\s*([\s\S]*?)```/gi;
+    let probeMatch: RegExpExecArray | null;
+    while ((probeMatch = fenceProbe.exec(reply)) !== null) {
+      try {
+        const parsed = JSON.parse((probeMatch[1] ?? "").trim()) as {
+          collection?: string;
+          entryId?: string;
+        };
+        if (
+          parsed &&
+          typeof parsed.collection === "string" &&
+          enabledSlugs.includes(parsed.collection) &&
+          typeof parsed.entryId === "string" &&
+          !candidateEntries.some(
+            e => e.collection === parsed.collection && e.id === parsed.entryId,
+          )
+        ) {
+          const { item } = await getSingleContentItem(ctx, parsed.collection, parsed.entryId);
+          if (item) candidateEntries.push(item);
+        }
+      } catch {
+        // Malformed fence ignored here; parseGatewayAgentProposals strips it cleanly.
+      }
+    }
+
+    const parsedProposals = parseGatewayAgentProposals(
+      reply,
+      candidateEntries,
+      matched.conversationId,
+      connection.agentId,
+      matched.turnId,
+    );
+    cleanedReply = parsedProposals.cleanedText;
+    for (const p of parsedProposals.proposals) {
+      const targetEntry = candidateEntries.find(
+        e => e.collection === p.collection && e.id === p.entryId,
+      );
+      if (canCollectionStageDraft(collections, p.collection, targetEntry?.status ?? "published")) {
+        createdProposals.push(p);
+      }
+    }
+    for (let i = 0; i < createdProposals.length; i++) {
+      const check = await doesStoredEntryMatchProposalBase(ctx, createdProposals[i]!);
+      if (check.checked && !check.matches) {
+        createdProposals[i] = {
+          ...createdProposals[i]!,
+          status: "conflict",
+          conflictRev: check.item?._rev,
+          errorMessage:
+            "Entry changed while the paired agent turn was running. Rebase or regenerate before saving.",
+          updatedAt: new Date().toISOString(),
+        };
+      }
+    }
+  }
+
+  if (createdProposals.length > 0) {
+    await loadRevisionProposals(ctx);
+    await withOpenClawStorageLock("proposals", async () => {
+      const fresh = ctx.kv
+        ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+        : [];
+      await saveRevisionProposals(ctx, [...createdProposals, ...fresh]);
+    });
+  }
+
+  const proposalIds = createdProposals.map(p => p.proposalId);
+  const threadOutcome = await mutateThreads(ctx, [matched.conversationId], current => {
+    const targetThread = current.find(t => t.conversationId === matched.conversationId);
+    const placeholder = targetThread?.messages.find(
+      m => m.messageId === matched.assistantMessageId,
+    );
+    if (!targetThread || !placeholder || placeholder.status === "stopped") {
+      return {
+        threads: current,
+        result: {
+          applied: false,
+          code: placeholder?.status === "stopped" ? "TURN_ALREADY_STOPPED" : "TURN_NOT_FOUND",
+          threads: current,
+        },
+      };
+    }
+
+    const completedMsg: ChatTurnMessage = {
+      ...placeholder,
+      runId: matched.turnId,
+      content: cleanedReply,
+      status: "completed",
+      ...(proposalIds.length > 0 ? { proposalIds } : {}),
+    };
+    const nextMessages = targetThread.messages.map(m =>
+      m.messageId === matched.assistantMessageId ? completedMsg : m,
+    );
+    const nextStreaming = nextMessages.find(m => m.status === "streaming");
+    const stillStreaming = Boolean(nextStreaming);
+    const updatedThreadBase: ConversationThread = {
+      ...targetThread,
+      sessionKey: matched.sessionKey,
+      lastTurnSessionKey: matched.sessionKey,
+      status: stillStreaming ? "running" : "idle",
+      activeRunId: stillStreaming ? nextStreaming?.runId : undefined,
+      runPhase: stillStreaming ? "awaiting_paired_agent" : undefined,
+      updatedAt: new Date().toISOString(),
+      messages: nextMessages,
+    };
+    const updatedThread = stillStreaming
+      ? updatedThreadBase
+      : bindThreadToAgentSession(updatedThreadBase, connection.agentId);
+    const next = current.map(t =>
+      t.conversationId === matched.conversationId ? updatedThread : t,
+    );
+    return {
+      threads: next,
+      result: {
+        applied: true,
+        code: "OK",
+        threads: next,
+      },
+    };
+  });
+
+  if (!threadOutcome.applied) {
+    if (createdProposals.length > 0) {
+      const rollbackIds = new Set(proposalIds);
+      await withOpenClawStorageLock("proposals", async () => {
+        const fresh = ctx.kv
+          ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
+          : [];
+        await saveRevisionProposals(
+          ctx,
+          fresh.filter(p => !rollbackIds.has(p.proposalId)),
+        );
+      });
+    }
+    await withOpenClawStorageLock("paired_turns", async () => {
+      const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
+      const updated = existing.map(r =>
+        r.turnId === matched.turnId ? { ...r, status: "stopped" as const } : r,
+      );
+      await ctx.kv!.set("paired_agent_turns_v1", updated);
+    });
+    return {
+      ok: false,
+      error: threadOutcome.code,
+      message: "The originating conversation turn is no longer active.",
+    };
+  }
+
+  const finalAudience = resolveThreadAudience(
+    threadOutcome.threads,
+    matched.conversationId,
+    matched.ownerUserId ?? "u1",
+  );
+  const nowIso = new Date().toISOString();
+
+  publishOpenClawEvent({
+    type: "assistant_delta",
+    conversationId: matched.conversationId,
+    messageId: matched.assistantMessageId,
+    delta: cleanedReply,
+    content: cleanedReply,
+    timestamp: nowIso,
+    ...finalAudience,
+  });
+
+  for (const proposal of createdProposals) {
+    publishOpenClawEvent({
+      type: "proposal_updated",
+      proposal,
+      timestamp: nowIso,
+      ...finalAudience,
+    });
+  }
+
+  publishOpenClawEvent({
+    type: "workspace_sync",
+    conversationId: matched.conversationId,
+    reason: "turn_completed",
+    timestamp: nowIso,
+    ...finalAudience,
+  });
+
+  return {
+    ok: true,
+    status: "completed",
+    turnId: matched.turnId,
+    conversationId: matched.conversationId,
+    proposalIds,
+    reply: cleanedReply,
+  };
+}
+
 export async function openclawChatRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
@@ -1890,6 +2514,13 @@ export async function openclawChatRoute(
       ? bridge.ensureDeviceIdentity(existing?.deviceIdentity)
       : existing?.deviceIdentity;
 
+    const pairedAgentPoll =
+      gatewayUrl === "https://agent-session.openclaw.local"
+        ? typeof input.pairedAgentPoll === "boolean"
+          ? input.pairedAgentPoll
+          : Boolean(existing?.pairedAgentPoll)
+        : false;
+
     const updated: OpenClawConnection = {
       gatewayUrl,
       agentId,
@@ -1898,9 +2529,16 @@ export async function openclawChatRoute(
       ...(deviceIdentity ? { deviceIdentity } : {}),
       authorityMode,
       allowGatewayExecApprovals,
+      ...(pairedAgentPoll ? { pairedAgentPoll: true } : {}),
       enabledCollections,
     };
     await persistConnectionSettings(ctx, updated);
+    if (existing?.pairedAgentPoll && !pairedAgentPoll) {
+      await cancelAllPairedAgentTurns(
+        ctx,
+        "Gateway connection updated; pending paired-agent turn was cancelled.",
+      );
+    }
 
     await mutateThreads(ctx, [], current => {
       let changed = false;
@@ -1976,6 +2614,10 @@ export async function openclawChatRoute(
   if (action === "disconnect" && role >= ADMIN) {
     const bridge = getHostGatewayBridge();
     if (bridge) await bridge.disconnect();
+    await cancelAllPairedAgentTurns(
+      ctx,
+      "OpenClaw connection disconnected before paired agent completed the turn.",
+    );
     await ctx.settings.delete("connection");
     await rotateSitePairingCode(ctx);
     return (await buildWorkspaceSnapshot(
@@ -2870,6 +3512,7 @@ export async function openclawChatRoute(
     }
 
     const targetId = target?.conversationId ?? preferredConversationId;
+    await stopPairedAgentTurns(ctx, targetId);
     await mutateThreads(ctx, targetId ? [targetId] : [], current => {
       const next = current.map(t => {
         if (!isThreadVisibleToUser(t, currentUserId)) return t;
@@ -2889,7 +3532,6 @@ export async function openclawChatRoute(
       });
       return { threads: next, result: undefined };
     });
-    if (ctx.kv) await ctx.kv.delete("active_turn");
     return (await buildWorkspaceSnapshot(
       route,
       ctx,
@@ -3297,8 +3939,151 @@ export async function openclawChatRoute(
       } else {
         assistantReply = httpResult.replyText;
       }
+    } else if (connection?.pairedAgentPoll && transportMode === "paired-agent") {
+      // PATH B2a: Paired external agent polling `/_emdash/api/plugins/dinkus-openclaw/pair`
+      const pairedSystemContext = `${catalogDigest}${proposalInstruction}${formatPriorConversationContext(targetThread.messages)}`;
+
+      if (action === "steer_turn") {
+        const steered = await steerPairedAgentTurn(ctx, targetConvId, prompt);
+        if (steered) {
+          const steerAck = `Queued mid-run steer onto active turn \`${steered.turnId}\` for @${agentId}.`;
+          const steerThreads = await mutateThreads(ctx, [targetConvId], current => {
+            const next = current.map(t => {
+              if (t.conversationId !== targetConvId) return t;
+              const messages = t.messages.map(m =>
+                m.messageId === assistantMsgId
+                  ? {
+                      ...m,
+                      content: steerAck,
+                      status: "completed" as const,
+                      toolCalls,
+                    }
+                  : m,
+              );
+              const stillStreaming = messages.some(m => m.status === "streaming");
+              return {
+                ...t,
+                sessionKey,
+                lastTurnSessionKey: sessionKey,
+                status: stillStreaming ? ("running" as const) : ("idle" as const),
+                ...(stillStreaming
+                  ? { activeRunId: steered.turnId, runPhase: "awaiting_paired_agent" }
+                  : { activeRunId: undefined, runPhase: undefined }),
+                updatedAt: new Date().toISOString(),
+                messages,
+              };
+            });
+            return { threads: next, result: next };
+          });
+          const steerAud = resolveThreadAudience(steerThreads, targetConvId, currentUserId);
+          const steerTs = new Date().toISOString();
+          publishOpenClawEvent({
+            type: "assistant_delta",
+            conversationId: targetConvId,
+            messageId: assistantMsgId,
+            delta: steerAck,
+            content: steerAck,
+            timestamp: steerTs,
+            ...steerAud,
+          });
+          publishOpenClawEvent({
+            type: "workspace_sync",
+            conversationId: targetConvId,
+            reason: "turn_steered",
+            timestamp: steerTs,
+            ...steerAud,
+          });
+          return (await buildWorkspaceSnapshot(
+            route,
+            ctx,
+            targetConvId,
+            boundEntry,
+          )) as unknown as Record<string, unknown>;
+        }
+      }
+
+      const turnId = csprngId("turn_", 8);
+      const liveAud = await readLiveAudience();
+      const enqueueRes = await enqueuePairedAgentTurn(ctx, {
+        turnId,
+        conversationId: targetConvId,
+        assistantMessageId: assistantMsgId,
+        sessionKey,
+        agentId,
+        ownerUserId: liveAud.ownerUserId,
+        visibility: liveAud.visibility,
+        requestedByUserId: currentUserId,
+        requestedByRole: role,
+        prompt,
+        systemContext: pairedSystemContext,
+        gatheredSnapshot: gatheredEntries.slice(0, 24),
+        status: "running",
+        lastUpdate: `Waiting for paired agent @${agentId} to poll and complete turn.`,
+        createdAt: now,
+      });
+
+      if (!enqueueRes.queued) {
+        turnFinalStatus = "failed";
+        assistantReply =
+          enqueueRes.error ?? "Could not queue turn for the paired OpenClaw agent.";
+      } else {
+        const queuedOutcome = await mutateThreads(ctx, [targetConvId], current => {
+          let stoppedDuringSetup = false;
+          const next = current.map(t => {
+            if (t.conversationId !== targetConvId) return t;
+            const placeholder = t.messages.find(m => m.messageId === assistantMsgId);
+            if (t.status === "stopped" || placeholder?.status === "stopped") {
+              stoppedDuringSetup = true;
+              return t;
+            }
+            return {
+              ...t,
+              sessionKey,
+              lastTurnSessionKey: sessionKey,
+              status: "running" as const,
+              activeRunId: turnId,
+              runPhase: "awaiting_paired_agent",
+              updatedAt: new Date().toISOString(),
+              messages: t.messages.map(m =>
+                m.messageId === assistantMsgId
+                  ? {
+                      ...m,
+                      runId: turnId,
+                      toolCalls,
+                    }
+                  : m,
+              ),
+            };
+          });
+          return { threads: next, result: { stoppedDuringSetup, threads: next } };
+        });
+
+        if (queuedOutcome.stoppedDuringSetup) {
+          await stopPairedAgentTurns(ctx, targetConvId);
+        } else {
+          const queuedAud = resolveThreadAudience(
+            queuedOutcome.threads,
+            targetConvId,
+            currentUserId,
+          );
+          publishOpenClawEvent({
+            type: "workspace_sync",
+            conversationId: targetConvId,
+            reason: "paired_turn_queued",
+            timestamp: new Date().toISOString(),
+            ...queuedAud,
+          });
+        }
+
+        return (await buildWorkspaceSnapshot(
+          route,
+          ctx,
+          targetConvId,
+          boundEntry,
+        )) as unknown as Record<string, unknown>;
+      }
     } else {
-      // PATH B2: Built-in EmDash Store Inspector / paired-agent fallback
+      // PATH B2b: Built-in EmDash Store Inspector (local preview before pairing)
       const isMutationIntent =
         /^\/propose\b/i.test(prompt) ||
         /\b(update|edit|change|rewrite|improve|tighten|draft|propose|rename|description|excerpt|copy|headline|tagline)\b/i.test(

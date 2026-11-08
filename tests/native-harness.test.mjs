@@ -1568,3 +1568,292 @@ test("HTTP Gateway enforces Admin-only role, preserves conversation identity & h
     "Oldest unresolved pending proposal must not be truncated when importing external submissions",
   );
 });
+
+test("1-step /pair forwards native chat turns, steers, proposals, and stop guards to the paired external agent", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const pair = resolved.routes.pair.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+  const itemsByCollection = createStoreFixtures();
+
+  // 1. Admin loads workspace to mint one-time pairingCode, then external agent runs 1-step `/pair`
+  const boot = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.match(boot.pairingCode, /^oc_pair_/);
+
+  const pairRes = await pair(
+    createNativeRouteCtx({
+      userId: "anon",
+      role: 0,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        pairingCode: boot.pairingCode,
+        agentId: "roboclaw-ext",
+        authorityMode: "propose_with_approval",
+      },
+    }),
+  );
+  assert.equal(pairRes.ok, true);
+  assert.equal(pairRes.status, "paired");
+  assert.equal(pairRes.agentId, "roboclaw-ext");
+  assert.ok(typeof pairRes.sessionToken === "string" && pairRes.sessionToken.length > 10);
+
+  // 2. Create a shared thread, send a native chat prompt, and verify it queues for the paired agent
+  //    instead of falling back to local Store Inspector generated replies.
+  const createdShared = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "create_thread",
+        title: "Paired Agent Copy Review",
+        visibility: "shared",
+      },
+    }),
+  );
+  const convId = createdShared.activeConversationId;
+
+  const afterSend = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "send_message",
+        conversationId: convId,
+        prompt: "Tighten the Atelier Field Jacket excerpt for autumn launch.",
+      },
+    }),
+  );
+  const runningThread = afterSend.threads.find(t => t.conversationId === convId);
+  assert.ok(runningThread);
+  assert.equal(runningThread.status, "running");
+  assert.equal(runningThread.runPhase, "awaiting_paired_agent");
+  const streamingMsg = runningThread.messages.find(m => m.role === "assistant");
+  assert.ok(streamingMsg);
+  assert.equal(streamingMsg.status, "streaming");
+  assert.equal(streamingMsg.content, "");
+  assert.ok(streamingMsg.runId);
+
+  // 3. Queue a mid-run steer and verify `poll_turn` + MCP `emdash_status` deliver prompt + steers + sessionKey
+  const afterSteer = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "steer_turn",
+        conversationId: convId,
+        prompt: "Keep it under 12 words.",
+      },
+    }),
+  );
+  const steeredThread = afterSteer.threads.find(t => t.conversationId === convId);
+  assert.equal(steeredThread.status, "running");
+
+  const polled = await pair(
+    createNativeRouteCtx({
+      userId: "anon",
+      role: 0,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "poll_turn",
+        sessionToken: pairRes.sessionToken,
+      },
+    }),
+  );
+  assert.equal(polled.ok, true);
+  assert.ok(polled.activeTurn);
+  assert.equal(polled.activeTurn.turnId, streamingMsg.runId);
+  assert.equal(polled.activeTurn.conversationId, convId);
+  assert.equal(polled.activeTurn.sessionKey, `agent:roboclaw-ext:emdash:${convId}`);
+  assert.equal(polled.activeTurn.status, "steered");
+  assert.deepEqual(polled.activeTurn.steers, ["Keep it under 12 words."]);
+  assert.match(polled.activeTurn.systemContext, /Atelier Field Jacket/);
+
+  // 4. Toggle thread shared -> personal mid-turn and verify `complete_turn` updates the originating
+  //    conversation message, stages `emdash-proposal`, and keeps SSE events private to u_admin!
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "toggle_thread_visibility",
+        conversationId: convId,
+      },
+    }),
+  );
+
+  const completeRes = await pair(
+    createNativeRouteCtx({
+      userId: "anon",
+      role: 0,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "complete_turn",
+        sessionToken: pairRes.sessionToken,
+        turnId: polled.activeTurn.turnId,
+        reply: [
+          "Updated the autumn launch excerpt as requested.",
+          "```emdash-proposal",
+          JSON.stringify({
+            collection: "products",
+            entryId: "prod_01",
+            summary: "Autumn 10-word excerpt",
+            proposedFields: {
+              excerpt: "Weatherproof organic waxed cotton jacket built for crisp autumn mornings.",
+            },
+          }),
+          "```",
+        ].join("\n"),
+      },
+    }),
+  );
+  assert.equal(completeRes.ok, true);
+  assert.equal(completeRes.conversationId, convId);
+  assert.equal(completeRes.proposalIds.length, 1);
+
+  const afterComplete = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace", conversationId: convId },
+    }),
+  );
+  const completedThread = afterComplete.threads.find(t => t.conversationId === convId);
+  assert.equal(completedThread.status, "idle");
+  assert.equal(completedThread.runPhase, undefined);
+  const completedAssistant = completedThread.messages.find(
+    m => m.messageId === streamingMsg.messageId,
+  );
+  assert.equal(completedAssistant.status, "completed");
+  assert.equal(completedAssistant.content, "Updated the autumn launch excerpt as requested.");
+  assert.deepEqual(completedAssistant.proposalIds, completeRes.proposalIds);
+  assert.ok(afterComplete.proposals.some(p => p.proposalId === completeRes.proposalIds[0]));
+
+  // Other editors cannot see the personal thread or its proposal
+  const otherEditor = await chat(
+    createNativeRouteCtx({
+      userId: "u_editor_2",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace" },
+    }),
+  );
+  assert.equal(
+    otherEditor.proposals.some(p => p.proposalId === completeRes.proposalIds[0]),
+    false,
+  );
+
+  // 5. Stopping a queued paired-agent turn prevents late `complete_turn` / MCP `emdash_complete_turn`
+  //    from overwriting the stopped conversation message.
+  const secondSend = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        action: "send_message",
+        conversationId: convId,
+        prompt: "Draft a winter headline next.",
+      },
+    }),
+  );
+  const secondPoll = await pair(
+    createNativeRouteCtx({
+      userId: "anon",
+      role: 0,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "poll_turn", sessionToken: pairRes.sessionToken },
+    }),
+  );
+  assert.ok(secondPoll.activeTurn?.turnId);
+  assert.equal(secondSend.threads.find(t => t.conversationId === convId).status, "running");
+
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "stop_turn", conversationId: convId },
+    }),
+  );
+
+  const lateMcpComplete = await pair(
+    createNativeRouteCtx({
+      userId: "anon",
+      role: 0,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        jsonrpc: "2.0",
+        id: 91,
+        method: "tools/call",
+        params: {
+          name: "emdash_complete_turn",
+          sessionToken: pairRes.sessionToken,
+          arguments: {
+            turnId: secondPoll.activeTurn.turnId,
+            reply: "Late reply that must be rejected after stop_turn.",
+          },
+        },
+      },
+    }),
+  );
+  assert.equal(lateMcpComplete.error.code, -32004);
+  assert.match(lateMcpComplete.error.message, /TURN_ALREADY_STOPPED/);
+
+  const afterStoppedCheck = await chat(
+    createNativeRouteCtx({
+      userId: "u_admin",
+      role: 50,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { action: "get_workspace", conversationId: convId },
+    }),
+  );
+  const stoppedThread = afterStoppedCheck.threads.find(t => t.conversationId === convId);
+  assert.equal(stoppedThread.status, "stopped");
+  assert.equal(
+    stoppedThread.messages.some(m => m.content.includes("Late reply that must be rejected")),
+    false,
+  );
+});

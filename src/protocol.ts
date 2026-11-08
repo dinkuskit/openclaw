@@ -12,6 +12,7 @@ export interface OpenClawConnection {
   deviceIdentity?: StoredDeviceIdentity;
   authorityMode: "read_only" | "propose_with_approval";
   allowGatewayExecApprovals?: boolean;
+  pairedAgentPoll?: boolean;
   enabledCollections: string[];
 }
 
