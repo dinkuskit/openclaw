@@ -775,6 +775,121 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(concreteExt.proposedFields.excerpt, "External agent waxed cotton copy");
     assert.equal("seoTitle" in concreteExt.proposedFields, false);
 
+    // 7b. External MCP & REST patches targeting an unenabled collection or submitted in `read_only` mode MUST be rejected,
+    //     and the apply path MUST enforce current connection authority & collection scope!
+    const mcpDisabledCol = await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          jsonrpc: "2.0",
+          id: 80,
+          method: "tools/call",
+          params: {
+            name: "emdash_submit_proposal",
+            arguments: {
+              collection: "secret_pages",
+              entryId: "page_01",
+              summary: "Out-of-scope MCP patch",
+              proposedFields: { excerpt: "Should be blocked" },
+            },
+          },
+        },
+      }),
+    );
+    assert.equal(mcpDisabledCol.error?.code, -32003);
+    assert.match(mcpDisabledCol.error?.message ?? "", /COLLECTION_NOT_ENABLED/);
+
+    const restDisabledCol = await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          action: "propose",
+          collection: "secret_pages",
+          entryId: "page_01",
+          summary: "Out-of-scope REST patch",
+          proposedFields: { excerpt: "Should be blocked" },
+        },
+      }),
+    );
+    assert.equal(restDisabledCol.ok, false);
+    assert.equal(restDisabledCol.error, "COLLECTION_NOT_ENABLED");
+
+    // Switch connection to `read_only` -> both external submissions AND applying existing proposals are blocked!
+    await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          authorityMode: "read_only",
+        },
+      }),
+    );
+
+    const mcpReadOnly = await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          jsonrpc: "2.0",
+          id: 81,
+          method: "tools/call",
+          params: {
+            name: "emdash_submit_proposal",
+            arguments: {
+              collection: "products",
+              entryId: "prod_01",
+              summary: "Read-only MCP patch",
+              proposedFields: { excerpt: "Blocked in read_only" },
+            },
+          },
+        },
+      }),
+    );
+    assert.equal(mcpReadOnly.error?.code, -32003);
+    assert.match(mcpReadOnly.error?.message ?? "", /AUTHORITY_READ_ONLY/);
+
+    const restReadOnly = await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { authorization: "Bearer oc_live_secret_bootstrap_999" },
+        input: {
+          action: "propose",
+          collection: "products",
+          entryId: "prod_01",
+          summary: "Read-only REST patch",
+          proposedFields: { excerpt: "Blocked in read_only" },
+        },
+      }),
+    );
+    assert.equal(restReadOnly.ok, false);
+    assert.equal(restReadOnly.error, "AUTHORITY_READ_ONLY");
+
+    const applyWhileReadOnly = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "begin_apply_proposal",
+          proposalId: concreteExt.proposalId,
+        },
+      }),
+    );
+    assert.equal(applyWhileReadOnly.ok, false);
+    assert.equal(applyWhileReadOnly.error, "AUTHORITY_READ_ONLY");
+
     // Cleanly disconnect Gateway client before closing server
     await chat(
       makeCtx({

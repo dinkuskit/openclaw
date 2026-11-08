@@ -1145,6 +1145,44 @@ export async function openclawEditorPanel(
  * - Mints a scoped `sessionToken` (`oc_sess_...`) and serves MCP JSON-RPC (`initialize`, `tools/list`, `tools/call`)
  *   and REST actions (`poll_turn`, `complete_turn`, `propose`) at the same URL.
  */
+function validateExternalProposalSubmission(
+  connection: OpenClawConnection,
+  collection: string | undefined,
+  entryId: string | undefined,
+  proposedFields: Record<string, string> | undefined,
+): { code: string; message: string } | null {
+  const hasConcreteFields = Boolean(proposedFields && Object.keys(proposedFields).length > 0);
+  if (connection.authorityMode !== "propose_with_approval") {
+    return {
+      code: "AUTHORITY_READ_ONLY",
+      message:
+        "OpenClaw connection is in read_only authority mode; submitting content proposals is disabled.",
+    };
+  }
+  if (collection && !connection.enabledCollections.includes(collection)) {
+    return {
+      code: "COLLECTION_NOT_ENABLED",
+      message: `Collection "${collection}" is not enabled for this OpenClaw connection.`,
+    };
+  }
+  if (hasConcreteFields) {
+    if (!collection || !connection.enabledCollections.includes(collection)) {
+      return {
+        code: "COLLECTION_NOT_ENABLED",
+        message:
+          "Concrete field patches must specify a collection enabled on this OpenClaw connection.",
+      };
+    }
+    if (!entryId || entryId === "current") {
+      return {
+        code: "INVALID_PROPOSAL_TARGET",
+        message: "Concrete field patches must specify a target entryId.",
+      };
+    }
+  }
+  return null;
+}
+
 export async function openclawPairRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
@@ -1235,12 +1273,30 @@ export async function openclawPairRoute(
         };
       }
       if (toolName === "emdash_submit_proposal" && ctx.kv) {
+        const targetCollection = cleanText(args.collection, 60);
+        const targetEntryId = cleanText(args.entryId, 80);
         const proposedFields = extractSafeExternalFields(args.proposedFields);
+        const policyError = validateExternalProposalSubmission(
+          connection,
+          targetCollection,
+          targetEntryId,
+          proposedFields,
+        );
+        if (policyError) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32003,
+              message: `${policyError.code}: ${policyError.message}`,
+            },
+          };
+        }
         const proposal: PendingProposal = {
           proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          agentId: connection?.agentId ?? "openclaw",
-          collection: cleanText(args.collection, 60),
-          entryId: cleanText(args.entryId, 80),
+          agentId: connection.agentId,
+          collection: targetCollection,
+          entryId: targetEntryId,
           summary: cleanText(args.summary, 300) ?? "Agent proposal",
           targetTool: cleanText(args.targetTool, 80) ?? "content:update",
           ...(proposedFields ? { proposedFields } : {}),
@@ -1267,6 +1323,9 @@ export async function openclawPairRoute(
         };
       }
       const activeTurn = await loadActiveTurn(ctx);
+      const scopedCollections = collections.filter(c =>
+        connection.enabledCollections.includes(c.slug),
+      );
       return {
         jsonrpc: "2.0",
         id,
@@ -1276,9 +1335,10 @@ export async function openclawPairRoute(
               type: "text",
               text: JSON.stringify({
                 ok: true,
-                collections,
+                collections: scopedCollections,
+                authorityMode: connection.authorityMode,
                 activeTurn,
-                paired: Boolean(connection),
+                paired: true,
               }),
             },
           ],
@@ -1304,7 +1364,16 @@ export async function openclawPairRoute(
     }
     if (action === "poll_turn") {
       const activeTurn = await loadActiveTurn(ctx);
-      return { ok: true, agentId: connection.agentId, activeTurn, collections };
+      const scopedCollections = collections.filter(c =>
+        connection.enabledCollections.includes(c.slug),
+      );
+      return {
+        ok: true,
+        agentId: connection.agentId,
+        authorityMode: connection.authorityMode,
+        activeTurn,
+        collections: scopedCollections,
+      };
     }
     if (action === "complete_turn") {
       const reply = cleanText(input.reply, 2000) ?? "Completed.";
@@ -1327,12 +1396,27 @@ export async function openclawPairRoute(
       return { ok: true, status: "completed", reply };
     }
     if (action === "propose" && ctx.kv) {
+      const targetCollection = cleanText(input.collection, 60);
+      const targetEntryId = cleanText(input.entryId, 80);
       const proposedFields = extractSafeExternalFields(input.proposedFields);
+      const policyError = validateExternalProposalSubmission(
+        connection,
+        targetCollection,
+        targetEntryId,
+        proposedFields,
+      );
+      if (policyError) {
+        return {
+          ok: false,
+          error: policyError.code,
+          message: policyError.message,
+        };
+      }
       const proposal: PendingProposal = {
         proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         agentId: connection.agentId,
-        collection: cleanText(input.collection, 60),
-        entryId: cleanText(input.entryId, 80),
+        collection: targetCollection,
+        entryId: targetEntryId,
         summary: cleanText(input.summary, 300) ?? "Proposed content update",
         targetTool: cleanText(input.targetTool, 80) ?? "content:update",
         ...(proposedFields ? { proposedFields } : {}),

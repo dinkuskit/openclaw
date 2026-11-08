@@ -720,20 +720,63 @@ function normalizeV2Proposals(rawV2: unknown): RevisionProposal[] {
     : [];
 }
 
+function checkProposalConnectionScope(
+  connState: { connection: OpenClawConnection | null; error?: string },
+  collection: string,
+): Record<string, unknown> | null {
+  if (connState.error) {
+    return {
+      ok: false,
+      error: "SETTINGS_READ_ERROR",
+      message: connState.error,
+    };
+  }
+  const connection = connState.connection;
+  if (!connection || connection.authorityMode !== "propose_with_approval") {
+    return {
+      ok: false,
+      error: "AUTHORITY_READ_ONLY",
+      message:
+        "OpenClaw connection must be in propose_with_approval authority mode to revise or apply proposals.",
+    };
+  }
+  if (!connection.enabledCollections.includes(collection)) {
+    return {
+      ok: false,
+      error: "COLLECTION_NOT_ENABLED",
+      message: `Collection "${collection}" is not enabled on the current OpenClaw connection.`,
+    };
+  }
+  return null;
+}
+
 async function hydrateLegacyPendingProposal(
   ctx: PluginContext,
   item: Record<string, unknown>,
   fallbackIdx: number,
+  connection: OpenClawConnection | null,
 ): Promise<RevisionProposal> {
   const proposalId =
     typeof item.proposalId === "string" ? item.proposalId : `prop_legacy_${fallbackIdx}`;
-  const collection = typeof item.collection === "string" ? item.collection : "pages";
+  const explicitCollection =
+    typeof item.collection === "string" && item.collection.trim().length > 0
+      ? item.collection.trim()
+      : undefined;
+  const collection = explicitCollection ?? "pages";
   const entryId = typeof item.entryId === "string" ? item.entryId : "current";
   const summary =
     typeof item.summary === "string" ? item.summary : "Proposed content change";
 
+  const canImportConcretePatch = Boolean(
+    connection &&
+      connection.authorityMode === "propose_with_approval" &&
+      explicitCollection &&
+      connection.enabledCollections.includes(explicitCollection) &&
+      entryId !== "current",
+  );
+
   const proposedFields: Record<string, unknown> = {};
-  if (item.proposedFields && typeof item.proposedFields === "object") {
+  if (canImportConcretePatch && item.proposedFields && typeof item.proposedFields === "object") {
     for (const [k, v] of Object.entries(item.proposedFields as Record<string, unknown>)) {
       if (!EXCLUDED_DRAFT_ONLY_FIELDS.has(k) && typeof v === "string") {
         proposedFields[k] = v;
@@ -824,6 +867,7 @@ export async function loadRevisionProposals(ctx: PluginContext): Promise<Revisio
       return normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
     }
 
+    const connState = await readConnectionSettingsState(ctx);
     const v2Snapshot = normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"));
     const knownIds = new Set(v2Snapshot.map(p => p.proposalId));
     const hydratedById = new Map<string, RevisionProposal>();
@@ -834,7 +878,7 @@ export async function loadRevisionProposals(ctx: PluginContext): Promise<Revisio
       const rec = rawItem as Record<string, unknown>;
       const id = typeof rec.proposalId === "string" ? rec.proposalId : `prop_legacy_${idx}`;
       if (knownIds.has(id) || hydratedById.has(id)) continue;
-      hydratedById.set(id, await hydrateLegacyPendingProposal(ctx, rec, idx));
+      hydratedById.set(id, await hydrateLegacyPendingProposal(ctx, rec, idx, connState.connection));
     }
 
     const { merged, hasUnprocessed } = await withOpenClawStorageLock("proposals", async () => {
@@ -2182,6 +2226,7 @@ export async function openclawChatRoute(
       await loadRevisionProposals(ctx);
       const threads = await loadThreads(ctx);
       const collections = await listSiteCollections(ctx);
+      const connState = await readConnectionSettingsState(ctx);
       const outcome = await withOpenClawStorageLock("proposals", async () => {
         const proposals = ctx.kv
           ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
@@ -2205,6 +2250,10 @@ export async function openclawChatRoute(
               message: "Conversation access denied.",
             } as Record<string, unknown>,
           };
+        }
+        const scopeErr = checkProposalConnectionScope(connState, parent.collection);
+        if (scopeErr) {
+          return { error: scopeErr };
         }
         if (parent.status !== "pending" && parent.status !== "failed") {
           return {
@@ -2396,6 +2445,7 @@ export async function openclawChatRoute(
     await loadRevisionProposals(ctx);
     const threads = await loadThreads(ctx);
     const collections = await listSiteCollections(ctx);
+    const connState = await readConnectionSettingsState(ctx);
 
     const outcome = await withOpenClawStorageLock("proposals", async () => {
       const proposals = ctx.kv
@@ -2440,6 +2490,13 @@ export async function openclawChatRoute(
             error: "PROPOSAL_NOT_PENDING",
             message: `Proposal cannot be applied because its status is "${target.status}".`,
           } as Record<string, unknown>,
+          applyReady: false,
+        };
+      }
+      const scopeErr = checkProposalConnectionScope(connState, target.collection);
+      if (scopeErr) {
+        return {
+          error: scopeErr,
           applyReady: false,
         };
       }
@@ -2544,6 +2601,7 @@ export async function openclawChatRoute(
     if (proposalId) {
       await loadRevisionProposals(ctx);
       const threads = await loadThreads(ctx);
+      const connState = await readConnectionSettingsState(ctx);
       const outcome = await withOpenClawStorageLock("proposals", async () => {
         const proposals = ctx.kv
           ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
@@ -2619,6 +2677,16 @@ export async function openclawChatRoute(
                 "Summary-only proposal has no concrete field patch and cannot be marked applied.",
             },
           };
+        }
+        if (
+          action === "record_proposal_receipt" &&
+          (verifiedStatus === "applied" || verifiedStatus === "outcome_unknown") &&
+          target.status !== "applying"
+        ) {
+          const scopeErr = checkProposalConnectionScope(connState, target.collection);
+          if (scopeErr) {
+            return { error: scopeErr };
+          }
         }
 
         // Server-side content reconciliation: never trust a browser `applied` claim if stored CMS fields disagree,
