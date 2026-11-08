@@ -222,8 +222,11 @@ async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
   return raw as PendingProposal[];
 }
 
-async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
-  return (await pollPairedAgentTurn(ctx)) as ActiveTurn | null;
+async function loadActiveTurn(
+  ctx: PluginContext,
+  viewerUserId: string,
+): Promise<ActiveTurn | null> {
+  return (await pollPairedAgentTurn(ctx, viewerUserId)) as ActiveTurn | null;
 }
 
 export function buildAgentPairingCommand(siteOrigin: string, pairingCode: string): string {
@@ -785,6 +788,7 @@ export async function openclawAdmin(
     };
   }
 
+  const currentUserId = route.user?.id ?? "anonymous";
   const isAdmin = role >= ADMIN;
   const collections = await discoverSiteCollections(ctx);
   const siteOrigin = resolveSiteOrigin(route);
@@ -883,7 +887,7 @@ export async function openclawAdmin(
       );
     }
     const proposals = await loadProposals(ctx);
-    const activeTurn = await loadActiveTurn(ctx);
+    const activeTurn = await loadActiveTurn(ctx, currentUserId);
     return workspacePage(
       nextConnection,
       collections,
@@ -921,7 +925,7 @@ export async function openclawAdmin(
   }
 
   const proposals = await loadProposals(ctx);
-  let activeTurn = await loadActiveTurn(ctx);
+  let activeTurn = await loadActiveTurn(ctx, currentUserId);
 
   if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
     const enabledCollections = Array.isArray(event.values.enabledCollections)
@@ -978,8 +982,23 @@ export async function openclawAdmin(
   if (event.type === "form_submit" && event.action_id === "steer_agent" && activeTurn) {
     const steerMessage = cleanText(event.values.steerMessage, 500);
     if (steerMessage) {
-      const steeredNative = await steerPairedAgentTurn(ctx, undefined, steerMessage);
-      if (steeredNative) {
+      if (activeTurn.conversationId) {
+        const steeredNative = await steerPairedAgentTurn(
+          ctx,
+          activeTurn.conversationId,
+          steerMessage,
+          currentUserId,
+        );
+        if (!steeredNative) {
+          return workspacePage(
+            connection,
+            collections,
+            proposals,
+            null,
+            isAdmin,
+            "No active visible task is available to steer.",
+          );
+        }
         activeTurn = {
           turnId: steeredNative.turnId,
           conversationId: steeredNative.conversationId,
@@ -1026,7 +1045,7 @@ export async function openclawAdmin(
       );
     }
     if (activeTurn.status === "completed") {
-      if (ctx.kv) {
+      if (ctx.kv && !activeTurn.conversationId) {
         await ctx.kv.delete("active_turn");
       }
       return workspacePage(
@@ -1396,7 +1415,7 @@ export async function openclawPairRoute(
           },
         };
       }
-      const activeTurn = await loadActiveTurn(ctx);
+      const activeTurn = await pollPairedAgentTurn(ctx);
       const scopedCollections = collections.filter(c =>
         connection.enabledCollections.includes(c.slug),
       );

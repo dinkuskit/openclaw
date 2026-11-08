@@ -484,6 +484,14 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     }
   };
 
+  const isNarrowHarness = (): boolean => {
+    const hostEl = props.rootNode.host as HTMLElement | undefined;
+    const width =
+      hostEl?.getBoundingClientRect().width ||
+      (typeof window !== "undefined" ? window.innerWidth : 1280);
+    return width > 0 && width <= 960;
+  };
+
   onMount(() => {
     // Auto-collapse sidebars on narrow initial viewports so the chat stage stays usable
     const hostEl = props.rootNode.host as HTMLElement | undefined;
@@ -493,7 +501,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     if (initialWidth > 0 && initialWidth < 1080) {
       setRightOpen(false);
     }
-    if (initialWidth > 0 && initialWidth < 820) {
+    if (initialWidth > 0 && initialWidth <= 960) {
       setLeftOpen(false);
     }
 
@@ -1024,14 +1032,46 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       class="oc-root"
       data-theme={theme()}
       data-surface={props.getHostProps().surface}
+      onKeyDown={e => {
+        if (e.key === "Escape") {
+          if (activeSheet()) {
+            setActiveSheet(null);
+          } else if (isNarrowHarness() && (leftOpen() || rightOpen())) {
+            setLeftOpen(false);
+            setRightOpen(false);
+          }
+        }
+      }}
     >
+      <Show when={!isEditorPanel() && (leftOpen() || rightOpen())}>
+        <div
+          class="oc-sidebar-backdrop"
+          aria-hidden="true"
+          onClick={() => {
+            setLeftOpen(false);
+            setRightOpen(false);
+          }}
+        />
+      </Show>
+
       {/* ZONE 1: COLLAPSIBLE LEFT SIDEBAR (Hidden in compact Editor Side-Panel) */}
       <Show when={!isEditorPanel()}>
         <aside class={`oc-left-sidebar ${leftOpen() ? "" : "is-collapsed"}`}>
-          <button type="button" class="oc-new-conv-btn" onClick={handleCreateNewThread}>
-            <span style={{ "font-size": "15px", "line-height": "1" }}>+</span>
-            <span>New Conversation</span>
-          </button>
+          <div class="oc-left-sidebar-head">
+            <button type="button" class="oc-new-conv-btn" onClick={handleCreateNewThread}>
+              <span style={{ "font-size": "15px", "line-height": "1" }}>+</span>
+              <span>New Conversation</span>
+            </button>
+            <button
+              type="button"
+              class="oc-icon-btn oc-sidebar-close-btn oc-narrow-only"
+              title="Close Conversations sidebar"
+              aria-label="Close left sidebar"
+              onClick={() => setLeftOpen(false)}
+            >
+              ✕
+            </button>
+          </div>
 
           <div class="oc-nav-list">
             <button
@@ -1160,7 +1200,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                 class={`oc-icon-btn ${leftOpen() ? "is-active" : ""}`}
                 title="Toggle Conversations sidebar"
                 aria-label="Toggle left sidebar"
-                onClick={() => setLeftOpen(v => !v)}
+                onClick={() =>
+                  setLeftOpen(v => {
+                    const next = !v;
+                    if (next && isNarrowHarness()) setRightOpen(false);
+                    return next;
+                  })
+                }
               >
                 <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
                   <rect x="1.5" y="2.5" width="13" height="11" rx="2.5" stroke="currentColor" stroke-width="1.35" />
@@ -1230,7 +1276,13 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                 class={`oc-icon-btn ${rightOpen() ? "is-active" : ""}`}
                 title="Toggle Overview inspector"
                 aria-label="Toggle right sidebar"
-                onClick={() => setRightOpen(v => !v)}
+                onClick={() =>
+                  setRightOpen(v => {
+                    const next = !v;
+                    if (next && isNarrowHarness()) setLeftOpen(false);
+                    return next;
+                  })
+                }
               >
                 <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
                   <rect x="1.5" y="2.5" width="13" height="11" rx="2.5" stroke="currentColor" stroke-width="1.35" />
@@ -2401,7 +2453,15 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           <div class="oc-overview-card">
             <div class="oc-overview-head">
               <span>Overview</span>
-              <span>⋮</span>
+              <button
+                type="button"
+                class="oc-icon-btn oc-sidebar-close-btn"
+                title="Close Overview inspector"
+                aria-label="Close Overview inspector"
+                onClick={() => setRightOpen(false)}
+              >
+                ✕
+              </button>
             </div>
 
             {/* Review Proposals row with +X -Y diff counters */}

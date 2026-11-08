@@ -1848,26 +1848,16 @@ function projectPolledTurn(rec: PairedAgentTurnRecord): PolledPairedAgentTurn {
   };
 }
 
-async function syncLegacyActiveTurnPointer(
-  ctx: PluginContext,
-  records: PairedAgentTurnRecord[],
-  clearedTurnIds?: Set<string>,
-): Promise<void> {
-  if (!ctx.kv) return;
-  const nextActive = records.find(r => r.status === "running" || r.status === "steered");
-  if (nextActive) {
-    await ctx.kv.set("active_turn", projectPolledTurn(nextActive));
-    return;
+function isPairedRecordVisibleToViewer(
+  rec: PairedAgentTurnRecord,
+  threads: ConversationThread[],
+  viewerUserId: string,
+): boolean {
+  const thread = threads.find(t => t.conversationId === rec.conversationId);
+  if (thread) {
+    return isThreadVisibleToUser(thread, viewerUserId);
   }
-  const currentActive = (await ctx.kv.get("active_turn")) as Partial<PolledPairedAgentTurn> | null;
-  if (
-    currentActive &&
-    typeof currentActive === "object" &&
-    typeof currentActive.turnId === "string" &&
-    clearedTurnIds?.has(currentActive.turnId)
-  ) {
-    await ctx.kv.delete("active_turn");
-  }
+  return rec.visibility === "shared" || rec.ownerUserId === viewerUserId;
 }
 
 async function enqueuePairedAgentTurn(
@@ -1893,7 +1883,6 @@ async function enqueuePairedAgentTurn(
     }
     const updated = prunePairedAgentTurns([...existing, record]);
     await ctx.kv!.set("paired_agent_turns_v1", updated);
-    await syncLegacyActiveTurnPointer(ctx, updated);
     return { queued: true };
   });
 }
@@ -1902,14 +1891,17 @@ export async function steerPairedAgentTurn(
   ctx: PluginContext,
   conversationId: string | undefined,
   steerPrompt: string,
+  viewerUserId?: string,
 ): Promise<PairedAgentTurnRecord | null> {
   if (!ctx.kv) return null;
   return withOpenClawStorageLock("paired_turns", async () => {
+    const threads = viewerUserId ? await loadThreads(ctx) : [];
     const existing = normalizePairedAgentTurns(await ctx.kv!.get("paired_agent_turns_v1"));
     const targetIdx = existing.findIndex(
       r =>
         (r.status === "running" || r.status === "steered") &&
-        (!conversationId || r.conversationId === conversationId),
+        (!conversationId || r.conversationId === conversationId) &&
+        (!viewerUserId || isPairedRecordVisibleToViewer(r, threads, viewerUserId)),
     );
     if (targetIdx === -1) return null;
     const target = existing[targetIdx]!;
@@ -1921,7 +1913,6 @@ export async function steerPairedAgentTurn(
     };
     const updated = existing.map((r, i) => (i === targetIdx ? steered : r));
     await ctx.kv!.set("paired_agent_turns_v1", updated);
-    await syncLegacyActiveTurnPointer(ctx, updated);
     return steered;
   });
 }
@@ -1956,8 +1947,6 @@ export async function stopPairedAgentTurns(
     }
     if (!conversationId) {
       await ctx.kv!.delete("active_turn");
-    } else {
-      await syncLegacyActiveTurnPointer(ctx, updated, stoppedIds);
     }
     return [...stoppedIds];
   });
@@ -2031,10 +2020,16 @@ export async function cancelAllPairedAgentTurns(
 
 export async function pollPairedAgentTurn(
   ctx: PluginContext,
+  viewerUserId?: string,
 ): Promise<PolledPairedAgentTurn | null> {
   if (!ctx.kv) return null;
+  const threads = viewerUserId ? await loadThreads(ctx) : [];
   const records = normalizePairedAgentTurns(await ctx.kv.get("paired_agent_turns_v1"));
-  const active = records.find(r => r.status === "running" || r.status === "steered");
+  const active = records.find(
+    r =>
+      (r.status === "running" || r.status === "steered") &&
+      (!viewerUserId || isPairedRecordVisibleToViewer(r, threads, viewerUserId)),
+  );
   if (active) {
     return projectPolledTurn(active);
   }
@@ -2106,7 +2101,6 @@ export async function completePairedAgentTurn(
         existing.map((r, i) => (i === idx ? completedRecord : r)),
       );
       await ctx.kv!.set("paired_agent_turns_v1", updated);
-      await syncLegacyActiveTurnPointer(ctx, updated, new Set([target.turnId]));
       return { kind: "native" as const, matched: target };
     }
 

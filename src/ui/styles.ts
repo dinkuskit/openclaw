@@ -108,6 +108,33 @@ export const OPENCLAW_HARNESS_CSS = `
   pointer-events: none;
 }
 
+.oc-left-sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.oc-left-sidebar-head .oc-new-conv-btn {
+  flex: 1;
+  min-width: 0;
+}
+
+.oc-sidebar-close-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.oc-narrow-only {
+  display: none;
+}
+
+.oc-sidebar-backdrop {
+  display: none;
+}
+
 .oc-new-conv-btn {
   width: 100%;
   display: flex;
@@ -1140,6 +1167,19 @@ export const OPENCLAW_HARNESS_CSS = `
 }
 
 @container oc-harness (max-width: 960px) {
+  .oc-narrow-only {
+    display: inline-flex;
+  }
+
+  .oc-sidebar-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 22;
+    background: rgba(0, 0, 0, 0.36);
+    cursor: pointer;
+  }
+
   .oc-left-sidebar {
     position: absolute;
     left: 0;
@@ -1148,6 +1188,14 @@ export const OPENCLAW_HARNESS_CSS = `
     z-index: 24;
     width: min(268px, 84%);
     box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-left-sidebar.is-collapsed {
+    width: 0;
+    padding-left: 0;
+    padding-right: 0;
+    border-right: none;
+    box-shadow: none;
   }
 
   .oc-right-sidebar {
@@ -1160,10 +1208,30 @@ export const OPENCLAW_HARNESS_CSS = `
     padding: 12px;
     border-left: 1px solid var(--oc-border-strong);
     box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-right-sidebar.is-collapsed {
+    width: 0;
+    padding: 0;
+    border-left: none;
+    box-shadow: none;
   }
 }
 
 @media (max-width: 960px) {
+  .oc-narrow-only {
+    display: inline-flex;
+  }
+
+  .oc-sidebar-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 22;
+    background: rgba(0, 0, 0, 0.36);
+    cursor: pointer;
+  }
+
   .oc-left-sidebar {
     position: absolute;
     left: 0;
@@ -1172,6 +1240,14 @@ export const OPENCLAW_HARNESS_CSS = `
     z-index: 24;
     width: min(268px, 84%);
     box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-left-sidebar.is-collapsed {
+    width: 0;
+    padding-left: 0;
+    padding-right: 0;
+    border-right: none;
+    box-shadow: none;
   }
 
   .oc-right-sidebar {
@@ -1184,6 +1260,13 @@ export const OPENCLAW_HARNESS_CSS = `
     padding: 12px;
     border-left: 1px solid var(--oc-border-strong);
     box-shadow: var(--oc-shadow-float);
+  }
+
+  .oc-right-sidebar.is-collapsed {
+    width: 0;
+    padding: 0;
+    border-left: none;
+    box-shadow: none;
   }
 }
 

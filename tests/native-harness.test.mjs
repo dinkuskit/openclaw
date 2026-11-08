@@ -1573,6 +1573,7 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
   const resolved = createPlugin();
   const chat = resolved.routes.chat.handler;
   const pair = resolved.routes.pair.handler;
+  const admin = resolved.routes.admin.handler;
   const sharedSettings = new Map();
   const sharedKv = new Map();
   const itemsByCollection = createStoreFixtures();
@@ -1791,6 +1792,35 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
       },
     }),
   );
+
+  // Legacy `/admin` Block Kit route must not leak or steer another user's personal native turn
+  const otherAdminStatus = await admin(
+    createNativeRouteCtx({
+      userId: "u_editor_2",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: { type: "block_action", action_id: "check_status" },
+    }),
+  );
+  assert.doesNotMatch(JSON.stringify(otherAdminStatus), /Draft a winter headline next/);
+
+  await admin(
+    createNativeRouteCtx({
+      userId: "u_editor_2",
+      role: 40,
+      sharedSettings,
+      sharedKv,
+      itemsByCollection,
+      input: {
+        type: "form_submit",
+        action_id: "steer_agent",
+        values: { steerMessage: "Unauthorized cross-editor steer" },
+      },
+    }),
+  );
+
   const secondPoll = await pair(
     createNativeRouteCtx({
       userId: "anon",
@@ -1802,6 +1832,7 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
     }),
   );
   assert.ok(secondPoll.activeTurn?.turnId);
+  assert.equal(secondPoll.activeTurn.steers, undefined);
   assert.equal(secondSend.threads.find(t => t.conversationId === convId).status, "running");
 
   await chat(
