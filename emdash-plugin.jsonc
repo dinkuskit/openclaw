@@ -2,9 +2,17 @@
   "$schema": "./node_modules/@emdash-cms/plugin-cli/schemas/emdash-plugin.schema.json",
   "slug": "dinkus-openclaw",
   "publisher": "did:plc:ekk4pjmkh3k3ql2kfoex3qt4",
+  "version": "0.1.0",
   "name": "OpenClaw",
   "description": "Connect custom OpenClaw agents and gateways to any EmDash CMS site with configurable editor panels and approval cards.",
   "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "agents",
+    "ai",
+    "cms",
+    "commerce"
+  ],
   "author": {
     "name": "DinkusKit",
     "url": "https://github.com/dinkuskit"
@@ -18,6 +26,20 @@
     "schema:read",
     "content:read"
   ],
+  "allowedHosts": [],
+  "release": {
+    "requires": {
+      "env:emdash": ">=1.4.0"
+    },
+    "artifacts": {
+      "icon": {
+        "file": ".github/assets/dinkusclaw-github-app-avatar-512x512.png"
+      },
+      "banner": {
+        "file": ".github/assets/dinkusclaw-readme-banner-16x9.jpg"
+      }
+    }
+  },
   "storage": {},
   "admin": {
     "settingsSchema": {

@@ -43,7 +43,7 @@ const OPENCLAW_SETTINGS_SCHEMA = {
 export function createPlugin(options: OpenClawNativePluginOptions = {}): ResolvedPlugin {
   return {
     id: "dinkus-openclaw",
-    version: "0.0.0",
+    version: "0.1.0",
     capabilities: [
       "network:request:unrestricted",
       "network:request",
@@ -99,7 +99,7 @@ export function openclawNativePlugin(
   const adminEntry = options.adminEntry ?? "@dinkuskit/openclaw/admin";
   return {
     id: "dinkus-openclaw",
-    version: "0.0.0",
+    version: "0.1.0",
     format: "native",
     entrypoint: options.entrypoint ?? "@dinkuskit/openclaw/native",
     adminEntry,

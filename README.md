@@ -87,7 +87,10 @@ export default defineConfig({
 
 ### 2. Sandboxed Registry Profile (`@dinkuskit/openclaw` + `@dinkuskit/openclaw/sandbox`)
 
-Capability-gated sandboxed Registry plugin (`backend.js` ~52 KiB, well under EmDash's 128 KiB Registry limit) rendering an honest declarative Block Kit fallback (`@emdash-cms/blocks/server`) with pairing, authority controls, and approval queues when the native Astro/React integration is not installed.
+Capability-gated sandboxed EmDash Registry plugin (`did:plc:ekk4pjmkh3k3ql2kfoex3qt4/dinkus-openclaw`, `backend.js` ~94 KiB with ~37 KiB headroom under EmDash's 128 KiB Registry limit) rendering an honest declarative Block Kit workspace (`@emdash-cms/blocks/server`) when the native Astro/React integration is not installed:
+
+- **Shipped in the Registry sandbox (`0.1.0`):** Declarative `/openclaw` Block Kit workspace, dynamic collection discovery (`schema:read`), saved-entry `OpenClaw Assistant` side-panel, 1-step CSPRNG `/pair` MCP/REST bridge (`X-OpenClaw-Token` / JSON `sessionToken`), mid-task steering, encrypted `connection` settings, and `WAITING_FOR_HUMAN` proposal queues.
+- **Native-only gaps (and what closes them):** Precompiled SolidJS `<openclaw-emdash-chat>` Antigravity UI island, unbuffered `/_emdash/api/openclaw/stream` SSE token streaming, and persistent Node `@openclaw/gateway-client` Protocol v4 WebSockets require `@dinkuskit/openclaw/native` + `@dinkuskit/openclaw/astro` until the EmDash plugin sandbox exposes streaming routes and outbound WebSocket transports (sandboxed installs pair external OpenClaw agents over HTTPS via `/pair`).
 
 ---
 
@@ -124,4 +127,4 @@ npm install
 
 ## Status
 
-Public runnable plugin (`0.0.0`, `private: true`). MIT.
+Published on the EmDash Plugin Registry as `dinkus-openclaw@0.1.0` (`did:plc:ekk4pjmkh3k3ql2kfoex3qt4/dinkus-openclaw`, publisher `dinkuskit.com`). MIT.
