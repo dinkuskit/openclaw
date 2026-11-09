@@ -163,6 +163,10 @@ async function loadConnectionState(
   if (typeof raw !== "string" || !raw) return { connection: null };
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
+    const hasStoredCredential =
+      (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
+      (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
+      (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
     if (
       typeof parsed.gatewayUrl === "string" &&
       (parsed.gatewayUrl.startsWith("https://") ||
@@ -174,13 +178,16 @@ async function loadConnectionState(
       typeof parsed.agentId === "string" &&
       parsed.agentId.length > 0 &&
       typeof parsed.gatewayToken === "string" &&
-      parsed.gatewayToken.length > 0
+      hasStoredCredential
     ) {
       return {
         connection: {
           gatewayUrl: parsed.gatewayUrl,
           agentId: parsed.agentId,
           gatewayToken: parsed.gatewayToken,
+          ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
+            ? { bootstrapToken: parsed.bootstrapToken }
+            : {}),
           ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
             ? { deviceToken: parsed.deviceToken }
             : {}),

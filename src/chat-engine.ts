@@ -215,6 +215,7 @@ function validateDirectGatewayUrlInput(rawUrl: string): {
   ok: boolean;
   sanitizedUrl?: string;
   extractedToken?: string;
+  extractedBootstrapToken?: string;
   error?: string;
 } {
   let parsed: URL;
@@ -255,17 +256,16 @@ function validateDirectGatewayUrlInput(rawUrl: string): {
   }
   const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ""));
   const extractedToken =
-    (
-      hashParams.get("token") ??
-      hashParams.get("bootstrapToken") ??
-      parsed.searchParams.get("token") ??
-      parsed.searchParams.get("bootstrapToken") ??
-      ""
-    ).trim() || undefined;
+    (hashParams.get("token") ?? parsed.searchParams.get("token") ?? "").trim() || undefined;
+  const extractedBootstrapToken = !extractedToken
+    ? (hashParams.get("bootstrapToken") ?? parsed.searchParams.get("bootstrapToken") ?? "").trim() ||
+      undefined
+    : undefined;
   return {
     ok: true,
     sanitizedUrl: sanitizePublicGatewayUrl(parsed.toString()),
     extractedToken,
+    extractedBootstrapToken,
   };
 }
 
@@ -302,19 +302,26 @@ export async function readConnectionSettingsState(
   if (typeof raw !== "string" || !raw) return { connection: null };
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
+    const hasStoredCredential =
+      (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
+      (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
+      (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
     if (
       typeof parsed.gatewayUrl === "string" &&
       isSupportedGatewayUrl(parsed.gatewayUrl) &&
       typeof parsed.agentId === "string" &&
       parsed.agentId.length > 0 &&
       typeof parsed.gatewayToken === "string" &&
-      parsed.gatewayToken.length > 0
+      hasStoredCredential
     ) {
       return {
         connection: {
           gatewayUrl: parsed.gatewayUrl,
           agentId: parsed.agentId,
           gatewayToken: parsed.gatewayToken,
+          ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
+            ? { bootstrapToken: parsed.bootstrapToken }
+            : {}),
           ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
             ? { deviceToken: parsed.deviceToken }
             : {}),
@@ -360,6 +367,34 @@ async function persistConnectionSettings(
     versioned?.revision ?? null,
     JSON.stringify(next),
   );
+}
+
+async function persistIssuedDeviceCredentials(
+  ctx: PluginContext,
+  expectedGatewayUrl: string,
+  patch: {
+    deviceIdentity?: OpenClawConnection["deviceIdentity"];
+    deviceToken?: string;
+    clearBootstrapToken?: boolean;
+  },
+): Promise<void> {
+  const latestState = await readConnectionSettingsState(ctx);
+  if (latestState.error || !latestState.connection) return;
+  if (
+    sanitizePublicGatewayUrl(latestState.connection.gatewayUrl) !==
+    sanitizePublicGatewayUrl(expectedGatewayUrl)
+  ) {
+    return;
+  }
+  const next: OpenClawConnection = {
+    ...latestState.connection,
+    ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
+    ...(patch.deviceToken ? { deviceToken: patch.deviceToken } : {}),
+  };
+  if (patch.clearBootstrapToken) {
+    delete next.bootstrapToken;
+  }
+  await persistConnectionSettings(ctx, next);
 }
 
 export async function listSiteCollections(
@@ -2487,6 +2522,7 @@ export async function openclawChatRoute(
 
     let gatewayUrl: string;
     let extractedToken = rawToken;
+    let extractedBootstrapToken: string | undefined;
 
     if (explicitGatewayUrl) {
       if (explicitGatewayUrl === "https://agent-session.openclaw.local") {
@@ -2504,6 +2540,9 @@ export async function openclawChatRoute(
         if (normalized.extractedToken) {
           extractedToken = normalized.extractedToken;
         }
+        if (!rawToken && normalized.extractedBootstrapToken) {
+          extractedBootstrapToken = normalized.extractedBootstrapToken;
+        }
       } else {
         const checked = validateDirectGatewayUrlInput(explicitGatewayUrl);
         if (!checked.ok || !checked.sanitizedUrl) {
@@ -2517,6 +2556,9 @@ export async function openclawChatRoute(
         if (!extractedToken && checked.extractedToken) {
           extractedToken = checked.extractedToken;
         }
+        if (!extractedToken && checked.extractedBootstrapToken) {
+          extractedBootstrapToken = checked.extractedBootstrapToken;
+        }
       }
     } else if (existing?.gatewayUrl) {
       gatewayUrl = sanitizePublicGatewayUrl(existing.gatewayUrl);
@@ -2524,7 +2566,7 @@ export async function openclawChatRoute(
       gatewayUrl = "https://agent-session.openclaw.local";
     }
 
-    if (existingState.error && !extractedToken) {
+    if (existingState.error && !extractedToken && !extractedBootstrapToken) {
       return {
         ok: false,
         error: "SETTINGS_READ_ERROR",
@@ -2541,13 +2583,30 @@ export async function openclawChatRoute(
       };
     }
     const agentId = explicitAgentId ?? existing?.agentId ?? "openclaw";
-    const gatewayToken =
-      extractedToken ?? existing?.gatewayToken ?? csprngId("oc_sess_", 20);
+    const sameGatewayEndpoint = Boolean(
+      existing && sanitizePublicGatewayUrl(existing.gatewayUrl) === sanitizePublicGatewayUrl(gatewayUrl),
+    );
+    const gatewayToken = extractedBootstrapToken
+      ? (extractedToken ?? csprngId("oc_sess_", 20))
+      : extractedToken
+        ? extractedToken
+        : sameGatewayEndpoint && existing?.gatewayToken
+          ? existing.gatewayToken
+          : csprngId("oc_sess_", 20);
+    const bootstrapToken = extractedBootstrapToken
+      ? extractedBootstrapToken
+      : extractedToken
+        ? undefined
+        : sameGatewayEndpoint
+          ? existing?.bootstrapToken
+          : undefined;
+    const retainedDeviceToken =
+      extractedBootstrapToken || !sameGatewayEndpoint ? undefined : existing?.deviceToken;
     const authorityMode =
-      input.authorityMode === "read_only"
-        ? "read_only"
-        : input.authorityMode === "propose_with_approval"
-          ? "propose_with_approval"
+      input.authorityMode === "propose_with_approval"
+        ? "propose_with_approval"
+        : input.authorityMode === "read_only"
+          ? "read_only"
           : (existing?.authorityMode ?? "propose_with_approval");
     const allowGatewayExecApprovals =
       typeof input.allowGatewayExecApprovals === "boolean"
@@ -2572,7 +2631,8 @@ export async function openclawChatRoute(
       gatewayUrl,
       agentId,
       gatewayToken,
-      ...(existing?.deviceToken ? { deviceToken: existing.deviceToken } : {}),
+      ...(bootstrapToken ? { bootstrapToken } : {}),
+      ...(retainedDeviceToken ? { deviceToken: retainedDeviceToken } : {}),
       ...(deviceIdentity ? { deviceIdentity } : {}),
       authorityMode,
       allowGatewayExecApprovals,
@@ -2605,16 +2665,9 @@ export async function openclawChatRoute(
     });
 
     if (bridge && classifyTransportMode(gatewayUrl) === "gateway-ws") {
-      await bridge.connect(updated, async patch => {
-        const latestState = await readConnectionSettingsState(ctx);
-        if (latestState.error) return;
-        const latest = latestState.connection ?? updated;
-        await persistConnectionSettings(ctx, {
-          ...latest,
-          ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
-          ...(patch.deviceToken ? { deviceToken: patch.deviceToken } : {}),
-        });
-      });
+      await bridge.connect(updated, patch =>
+        persistIssuedDeviceCredentials(ctx, updated.gatewayUrl, patch),
+      );
     } else if (bridge) {
       await bridge.disconnect();
     }
@@ -2639,16 +2692,9 @@ export async function openclawChatRoute(
     const connection = connState.connection;
     const bridge = getHostGatewayBridge();
     if (connection && bridge && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
-      await bridge.connect(connection, async patch => {
-        const latestState = await readConnectionSettingsState(ctx);
-        if (latestState.error) return;
-        const latest = latestState.connection ?? connection;
-        await persistConnectionSettings(ctx, {
-          ...latest,
-          ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
-          ...(patch.deviceToken ? { deviceToken: patch.deviceToken } : {}),
-        });
-      });
+      await bridge.connect(connection, patch =>
+        persistIssuedDeviceCredentials(ctx, connection.gatewayUrl, patch),
+      );
     }
     return (await buildWorkspaceSnapshot(
       route,
@@ -3949,16 +3995,8 @@ export async function openclawChatRoute(
           steer: action === "steer_turn",
           callerIsAdmin: role >= ADMIN,
           expectedRunId: targetThread.activeRunId,
-          onDeviceCredentialsUpdated: async patch => {
-            const latestState = await readConnectionSettingsState(ctx);
-            if (latestState.error) return;
-            const latest = latestState.connection ?? connection!;
-            await persistConnectionSettings(ctx, {
-              ...latest,
-              ...(patch.deviceIdentity ? { deviceIdentity: patch.deviceIdentity } : {}),
-              ...(patch.deviceToken ? { deviceToken: patch.deviceToken } : {}),
-            });
-          },
+          onDeviceCredentialsUpdated: patch =>
+            persistIssuedDeviceCredentials(ctx, connection!.gatewayUrl, patch),
         });
 
         gatewayRunId = gwResult.runId;

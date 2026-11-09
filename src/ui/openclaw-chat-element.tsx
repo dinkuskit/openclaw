@@ -999,6 +999,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
       });
       setSnapshot(updated);
       setGwTokenInput("");
+      if (
+        updated.connection?.gatewayUrl &&
+        updated.connection.gatewayUrl !== "https://agent-session.openclaw.local"
+      ) {
+        setGwUrlInput(updated.connection.gatewayUrl);
+      }
       if (updated.gatewayBridge.state === "connected" || !gwUrlInput().trim()) {
         setActiveSheet(null);
       }

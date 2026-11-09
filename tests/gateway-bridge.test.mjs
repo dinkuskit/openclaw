@@ -1598,3 +1598,252 @@ test("Rebinds pre-pairing and existing conversation session keys when selecting 
     await gw.close();
   }
 });
+
+test("Bootstrap-token URL pairing authenticates via auth.bootstrapToken, upgrades to deviceToken, and reconnects without replaying consumed setup credential", async () => {
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  const connectAuthPayloads = [];
+  let bootstrapConsumed = false;
+
+  wss.on("connection", ws => {
+    ws.send(
+      JSON.stringify({
+        type: "event",
+        event: "connect.challenge",
+        payload: { nonce: "nonce_bootstrap_v4_1", ts: Date.now() },
+      }),
+    );
+
+    ws.on("message", raw => {
+      const frame = JSON.parse(String(raw));
+      if (frame.type !== "req") return;
+
+      if (frame.method === "connect") {
+        const auth = frame.params.auth ?? {};
+        connectAuthPayloads.push(auth);
+
+        if (!bootstrapConsumed) {
+          if (auth.bootstrapToken !== "oc_boot_setup_secret_42" || auth.token !== undefined) {
+            ws.send(
+              JSON.stringify({
+                type: "res",
+                id: frame.id,
+                ok: false,
+                error: {
+                  code: "UNAUTHORIZED",
+                  message: "Expected auth.bootstrapToken without auth.token on initial setup",
+                },
+              }),
+            );
+            return;
+          }
+          bootstrapConsumed = true;
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: true,
+              payload: {
+                type: "hello-ok",
+                protocol: 4,
+                server: { version: "2026.11.1-mock", connId: "conn_boot_1" },
+                features: {
+                  methods: ["chat.send", "sessions.messages.subscribe"],
+                  events: ["chat"],
+                },
+                auth: {
+                  deviceToken: "oc_dev_from_bootstrap_42",
+                  role: "operator",
+                  scopes: ["operator.read", "operator.write", "operator.approvals"],
+                },
+                policy: { maxPayload: 1048576, maxBufferedBytes: 4194304, tickIntervalMs: 30000 },
+              },
+            }),
+          );
+          return;
+        }
+
+        if (
+          auth.deviceToken !== "oc_dev_from_bootstrap_42" ||
+          auth.bootstrapToken !== undefined ||
+          auth.token !== undefined
+        ) {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: frame.id,
+              ok: false,
+              error: {
+                code: "UNAUTHORIZED",
+                message: "Expected issued auth.deviceToken without consumed bootstrapToken",
+              },
+            }),
+          );
+          return;
+        }
+
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: {
+              type: "hello-ok",
+              protocol: 4,
+              server: { version: "2026.11.1-mock", connId: "conn_boot_2" },
+              features: {
+                methods: ["chat.send", "sessions.messages.subscribe"],
+                events: ["chat"],
+              },
+              auth: {
+                deviceToken: "oc_dev_from_bootstrap_42",
+                role: "operator",
+                scopes: ["operator.read", "operator.write", "operator.approvals"],
+              },
+              policy: { maxPayload: 1048576, maxBufferedBytes: 4194304, tickIntervalMs: 30000 },
+            },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.messages.subscribe") {
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { subscribed: true },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "chat.send") {
+        const runId = "run_boot_turn_1";
+        ws.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { runId, status: "started" },
+          }),
+        );
+        setTimeout(() => {
+          ws.send(
+            JSON.stringify({
+              type: "event",
+              event: "chat",
+              payload: {
+                runId,
+                sessionKey: frame.params.sessionKey,
+                seq: 1,
+                state: "final",
+                message: { role: "assistant", content: [{ type: "text", text: "Paired via bootstrapToken." }] },
+              },
+            }),
+          );
+        }, 15);
+      }
+    });
+  });
+
+  await new Promise(resolve => wss.once("listening", resolve));
+  const port = wss.address().port;
+
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const sharedSettings = new Map();
+  const sharedKv = new Map();
+
+  try {
+    // 1. Seed a stale prior shared-token connection on a different URL to ensure `#bootstrapToken=`
+    //    neither inherits the old shared token nor stores the bootstrap secret in `gatewayToken`.
+    sharedSettings.set("connection", {
+      value: JSON.stringify({
+        gatewayUrl: "wss://old-gateway.example.com",
+        agentId: "old-agent",
+        gatewayToken: "oc_live_old_shared_token",
+        deviceToken: "oc_dev_old_token",
+        authorityMode: "read_only",
+        enabledCollections: ["pages"],
+      }),
+      revision: "rev_seed_1",
+    });
+
+    const configured = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: `http://127.0.0.1:${port}/chat#bootstrapToken=oc_boot_setup_secret_42`,
+          agentId: "roboclaw",
+          authorityMode: "propose_with_approval",
+        },
+      }),
+    );
+
+    assert.equal(configured.gatewayBridge.state, "connected");
+    assert.equal(configured.connection.gatewayUrl, `ws://127.0.0.1:${port}`);
+    assert.equal("gatewayToken" in configured.connection, false);
+    assert.equal("bootstrapToken" in configured.connection, false);
+    assert.equal("deviceToken" in configured.connection, false);
+
+    assert.equal(connectAuthPayloads.length, 1);
+    assert.equal(connectAuthPayloads[0].bootstrapToken, "oc_boot_setup_secret_42");
+    assert.equal(connectAuthPayloads[0].token, undefined);
+
+    const storedAfterPair = JSON.parse(sharedSettings.get("connection").value);
+    assert.notEqual(storedAfterPair.gatewayToken, "oc_boot_setup_secret_42");
+    assert.notEqual(storedAfterPair.gatewayToken, "oc_live_old_shared_token");
+    assert.equal(storedAfterPair.bootstrapToken, undefined, "Consumed bootstrapToken must be cleared once deviceToken is issued");
+    assert.equal(storedAfterPair.deviceToken, "oc_dev_from_bootstrap_42");
+
+    // 2. Subsequent turn reuses the live paired socket without disconnecting or re-sending bootstrapToken
+    const turnSnap = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "send_message",
+          conversationId: configured.activeConversationId,
+          prompt: "Confirm bootstrap pairing.",
+        },
+      }),
+    );
+    const activeThread = turnSnap.threads.find(t => t.conversationId === turnSnap.activeConversationId);
+    assert.equal(activeThread.messages.at(-1).status, "completed");
+    assert.match(activeThread.messages.at(-1).content, /Paired via bootstrapToken/);
+    assert.equal(connectAuthPayloads.length, 1, "send_message should reuse live paired socket");
+
+    // 3. Force a fresh bridge reconnect (`agentId` change changes fingerprint) -> authenticates with issued `deviceToken`!
+    const reconnected = await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: {
+          action: "configure_connection",
+          agentId: "blaze",
+        },
+      }),
+    );
+    assert.equal(reconnected.gatewayBridge.state, "connected");
+    assert.equal(connectAuthPayloads.length, 2);
+    assert.equal(connectAuthPayloads[1].deviceToken, "oc_dev_from_bootstrap_42");
+    assert.equal(connectAuthPayloads[1].bootstrapToken, undefined);
+    assert.equal(connectAuthPayloads[1].token, undefined);
+  } finally {
+    await chat(
+      makeCtx({
+        role: 50,
+        sharedSettings,
+        sharedKv,
+        input: { action: "disconnect" },
+      }),
+    ).catch(() => {});
+    await new Promise(resolve => wss.close(resolve));
+  }
+});

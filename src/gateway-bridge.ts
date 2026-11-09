@@ -65,7 +65,7 @@ export function redactGatewaySecrets(text: string): string {
       /([?&#](?:token|bootstrapToken|deviceToken|password|secret|apiKey|api_key|access_token|auth)=)[^&#\s"']+/gi,
       "$1[REDACTED]",
     )
-    .replace(/\boc_(?:live|sess|tok|pair)_[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]");
+    .replace(/\boc_(?:live|sess|tok|pair|boot|dev)_[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]");
 }
 
 const SENSITIVE_QUERY_KEYS = [
@@ -104,12 +104,16 @@ function isLoopbackHostname(hostname: string): boolean {
 export function normalizeGatewayEndpoint(
   rawUrl: string,
   rawToken?: string,
+  rawBootstrapToken?: string,
 ): {
   ok: boolean;
   wsUrl?: string;
   httpUrl?: string;
   controlUiOrigin?: string;
   extractedToken?: string;
+  extractedBootstrapToken?: string;
+  urlHadToken?: boolean;
+  urlHadBootstrapToken?: boolean;
   isWebSocketGateway: boolean;
   error?: string;
 } {
@@ -121,6 +125,7 @@ export function normalizeGatewayEndpoint(
       httpUrl: trimmed || undefined,
       controlUiOrigin: undefined,
       extractedToken: rawToken?.trim() || undefined,
+      extractedBootstrapToken: rawBootstrapToken?.trim() || undefined,
       isWebSocketGateway: false,
     };
   }
@@ -145,16 +150,30 @@ export function normalizeGatewayEndpoint(
     };
   }
 
-  // Extract one-time pairing fragment or query token if operator pasted `openclaw dashboard` browserUrl,
-  // stripping it immediately so credentials never stay in stored URLs.
-  let extractedToken = rawToken?.trim() || undefined;
+  // Extract one-time pairing fragment or query credentials if operator pasted an `openclaw dashboard`
+  // or setup URL, preserving `token` vs `bootstrapToken` credential kind while stripping secrets
+  // immediately so credentials never remain in stored URLs.
+  const explicitToken = rawToken?.trim() || undefined;
+  const nonSessionExplicitToken =
+    explicitToken && !explicitToken.startsWith("oc_sess_") ? explicitToken : undefined;
+  const explicitBootstrapToken = rawBootstrapToken?.trim() || undefined;
+
   const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ""));
-  const hashToken = hashParams.get("token") ?? hashParams.get("bootstrapToken");
-  const queryToken = parsed.searchParams.get("token") ?? parsed.searchParams.get("bootstrapToken");
-  const hasControlUiHandoffToken = Boolean(hashToken || queryToken);
-  if (!extractedToken && (hashToken || queryToken)) {
-    extractedToken = (hashToken ?? queryToken ?? "").trim() || undefined;
-  }
+  const urlSharedToken =
+    (hashParams.get("token") ?? parsed.searchParams.get("token") ?? "").trim() || undefined;
+  const urlBootstrapToken =
+    (hashParams.get("bootstrapToken") ?? parsed.searchParams.get("bootstrapToken") ?? "").trim() ||
+    undefined;
+  const hasControlUiHandoffToken = Boolean(urlSharedToken || urlBootstrapToken);
+
+  const extractedToken = nonSessionExplicitToken
+    ? explicitToken
+    : urlSharedToken ?? (!urlBootstrapToken && !explicitBootstrapToken ? explicitToken : undefined);
+  const extractedBootstrapToken =
+    !nonSessionExplicitToken && !urlSharedToken
+      ? (urlBootstrapToken ?? explicitBootstrapToken)
+      : undefined;
+
   parsed.hash = "";
   for (const k of SENSITIVE_QUERY_KEYS) {
     parsed.searchParams.delete(k);
@@ -183,6 +202,9 @@ export function normalizeGatewayEndpoint(
         httpUrl: parsed.toString().replace(/\/$/, ""),
         controlUiOrigin: undefined,
         extractedToken,
+        extractedBootstrapToken,
+        urlHadToken: Boolean(urlSharedToken),
+        urlHadBootstrapToken: Boolean(urlBootstrapToken),
         isWebSocketGateway: false,
       };
     }
@@ -227,6 +249,9 @@ export function normalizeGatewayEndpoint(
     wsUrl: wsUrlObj.toString().replace(/\/$/, ""),
     controlUiOrigin,
     extractedToken,
+    extractedBootstrapToken,
+    urlHadToken: Boolean(urlSharedToken),
+    urlHadBootstrapToken: Boolean(urlBootstrapToken),
     isWebSocketGateway: true,
   };
 }
@@ -360,6 +385,7 @@ function canonicalizeApproveCommand(trimmedPrompt: string): string | null {
 class NodeOpenClawGatewayBridge implements HostGatewayBridge {
   #client: GatewayClient | null = null;
   #fingerprint = "";
+  #pairedBootstrapFingerprint = "";
   #status: GatewayBridgeStatus = {
     available: true,
     state: "disconnected",
@@ -388,8 +414,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     return generateGatewayDeviceIdentity();
   }
 
-  normalizeGatewayInput(rawUrl: string, rawToken?: string) {
-    return normalizeGatewayEndpoint(rawUrl, rawToken);
+  normalizeGatewayInput(rawUrl: string, rawToken?: string, rawBootstrapToken?: string) {
+    return normalizeGatewayEndpoint(rawUrl, rawToken, rawBootstrapToken);
   }
 
   getStatus(connection: OpenClawConnection | null): GatewayBridgeStatus {
@@ -400,7 +426,11 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         grantedScopes: [],
       };
     }
-    const normalized = normalizeGatewayEndpoint(connection.gatewayUrl, connection.gatewayToken);
+    const normalized = normalizeGatewayEndpoint(
+      connection.gatewayUrl,
+      connection.gatewayToken,
+      connection.bootstrapToken,
+    );
     if (!normalized.isWebSocketGateway) {
       return {
         available: true,
@@ -423,9 +453,14 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     onDeviceCredentialsUpdated?: (patch: {
       deviceIdentity?: StoredDeviceIdentity;
       deviceToken?: string;
+      clearBootstrapToken?: boolean;
     }) => Promise<void>,
   ): Promise<GatewayBridgeStatus> {
-    const normalized = normalizeGatewayEndpoint(connection.gatewayUrl, connection.gatewayToken);
+    const normalized = normalizeGatewayEndpoint(
+      connection.gatewayUrl,
+      connection.gatewayToken,
+      connection.bootstrapToken,
+    );
     if (!normalized.ok || !normalized.isWebSocketGateway || !normalized.wsUrl) {
       this.#status = {
         available: true,
@@ -445,6 +480,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       normalized.extractedToken && !normalized.extractedToken.startsWith("oc_sess_")
         ? normalized.extractedToken
         : undefined;
+    let storedDeviceToken = normalized.urlHadBootstrapToken ? undefined : connection.deviceToken;
+    let activeBootstrapToken = !tokenCandidate ? normalized.extractedBootstrapToken : undefined;
 
     // OpenClaw 2026.11.1 `server-broadcast-scopes.ts` requires `operator.approvals` to observe
     // `session.approval` and `exec.approval.*` events (there is no separate read-only approval
@@ -454,7 +491,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     // and `sendTurn`.
     const requestedScopes = ["operator.read", "operator.write", "operator.approvals"];
 
-    const computeFingerprint = (devToken?: string) =>
+    const computeFingerprint = (devToken?: string, bootToken?: string) =>
       crypto
         .createHash("sha256")
         .update(
@@ -462,17 +499,20 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             wsUrl: normalized.wsUrl,
             agentId: connection.agentId,
             token: tokenCandidate ?? "",
+            bootstrapToken: bootToken ?? "",
             deviceToken: devToken ?? "",
             deviceId: identity.deviceId,
           }),
         )
         .digest("hex");
 
-    const nextFingerprint = computeFingerprint(connection.deviceToken);
+    const nextFingerprint = computeFingerprint(storedDeviceToken, activeBootstrapToken);
 
     if (
       this.#client &&
-      this.#fingerprint === nextFingerprint &&
+      (this.#fingerprint === nextFingerprint ||
+        (this.#pairedBootstrapFingerprint !== "" &&
+          this.#pairedBootstrapFingerprint === nextFingerprint)) &&
       (this.#status.state === "connected" || this.#status.state === "connecting")
     ) {
       if (this.#readyPromise && this.#status.state === "connecting") {
@@ -485,6 +525,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       this.#sessionToConversation.size > 0 || this.#activeCollectors.size > 0;
     await this.disconnect();
     this.#fingerprint = nextFingerprint;
+    this.#pairedBootstrapFingerprint = activeBootstrapToken ? nextFingerprint : "";
     this.#status = {
       available: true,
       state: "connecting",
@@ -495,7 +536,6 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     };
     this.#emitStatus();
 
-    let storedDeviceToken = connection.deviceToken;
     let helloCount = 0;
 
     const connectSettled = new Promise<GatewayBridgeStatus>(resolve => {
@@ -510,7 +550,8 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       const client = new GatewayClient({
         url: normalized.wsUrl,
         token: tokenCandidate,
-        deviceToken: storedDeviceToken,
+        bootstrapToken: activeBootstrapToken,
+        deviceToken: activeBootstrapToken ? undefined : storedDeviceToken,
         deviceIdentity: identity,
         clientName: "gateway-client",
         clientDisplayName: "EmDash OpenClaw Bridge",
@@ -534,20 +575,25 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
                   scopes: ["operator.read", "operator.write", "operator.approvals"],
                 }
               : null,
-          storeDeviceAuthToken: ({ token, scopes }) => {
+          storeDeviceAuthToken: async ({ token, scopes }) => {
             storedDeviceToken = token;
+            const hadBootstrap = Boolean(activeBootstrapToken);
+            activeBootstrapToken = undefined;
             if (this.#client === client) {
-              this.#fingerprint = computeFingerprint(token);
+              this.#fingerprint = computeFingerprint(token, undefined);
             }
             if (Array.isArray(scopes) && scopes.length > 0) {
               this.#status = { ...this.#status, grantedScopes: scopes };
             }
-            void onDeviceCredentialsUpdated?.({ deviceToken: token }).catch(() => {});
+            await onDeviceCredentialsUpdated?.({
+              deviceToken: token,
+              ...(hadBootstrap ? { clearBootstrapToken: true } : {}),
+            }).catch(() => {});
           },
           clearDeviceAuthToken: () => {
             storedDeviceToken = undefined;
             if (this.#client === client) {
-              this.#fingerprint = computeFingerprint(undefined);
+              this.#fingerprint = computeFingerprint(undefined, activeBootstrapToken);
             }
           },
           redactForLog: redactGatewaySecrets,
@@ -645,6 +691,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     this.#client = null;
     this.#readyPromise = null;
     this.#fingerprint = "";
+    this.#pairedBootstrapFingerprint = "";
     if (current) {
       resetGatewaySessionMessageSubscriptionCoordinator(current);
       current.stop();

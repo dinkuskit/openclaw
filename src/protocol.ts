@@ -8,6 +8,7 @@ export interface OpenClawConnection {
   gatewayUrl: string;
   agentId: string;
   gatewayToken: string;
+  bootstrapToken?: string;
   deviceToken?: string;
   deviceIdentity?: StoredDeviceIdentity;
   authorityMode: "read_only" | "propose_with_approval";

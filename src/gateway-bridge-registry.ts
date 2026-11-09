@@ -27,6 +27,7 @@ export interface GatewayTurnRequest {
   onDeviceCredentialsUpdated?: (patch: {
     deviceIdentity?: StoredDeviceIdentity;
     deviceToken?: string;
+    clearBootstrapToken?: boolean;
   }) => Promise<void>;
 }
 
@@ -54,12 +55,16 @@ export interface HostGatewayBridge {
   normalizeGatewayInput(
     rawUrl: string,
     rawToken?: string,
+    rawBootstrapToken?: string,
   ): {
     ok: boolean;
     wsUrl?: string;
     httpUrl?: string;
     controlUiOrigin?: string;
     extractedToken?: string;
+    extractedBootstrapToken?: string;
+    urlHadToken?: boolean;
+    urlHadBootstrapToken?: boolean;
     isWebSocketGateway: boolean;
     error?: string;
   };
@@ -69,6 +74,7 @@ export interface HostGatewayBridge {
     onDeviceCredentialsUpdated?: (patch: {
       deviceIdentity?: StoredDeviceIdentity;
       deviceToken?: string;
+      clearBootstrapToken?: boolean;
     }) => Promise<void>,
   ): Promise<GatewayBridgeStatus>;
   disconnect(): Promise<void>;
