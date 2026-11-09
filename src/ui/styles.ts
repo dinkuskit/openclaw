@@ -781,6 +781,7 @@ export const OPENCLAW_HARNESS_CSS = `
 }
 
 .oc-edit-input {
+  box-sizing: border-box;
   width: 100%;
   margin-top: 4px;
   padding: 7px 9px;
@@ -790,6 +791,13 @@ export const OPENCLAW_HARNESS_CSS = `
   color: var(--oc-text-main);
   font-size: 12.5px;
   font-family: inherit;
+}
+
+textarea.oc-edit-input {
+  resize: vertical;
+  line-height: 1.45;
+  min-height: 36px;
+  white-space: pre-wrap;
 }
 
 .oc-proposal-actions {

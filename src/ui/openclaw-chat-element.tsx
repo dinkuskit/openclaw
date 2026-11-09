@@ -1663,9 +1663,18 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                                 when={editingProposalId() === p().proposalId}
                                                 fallback={<div class="oc-diff-plus">+ {diff.after}</div>}
                                               >
-                                                <input
-                                                  type="text"
+                                                <textarea
                                                   class="oc-edit-input"
+                                                  rows={Math.min(
+                                                    10,
+                                                    Math.max(
+                                                      diff.field === "title" || diff.field === "name" ? 1 : 3,
+                                                      (
+                                                        editDraftForProposal(p().proposalId)[diff.field] ??
+                                                        diff.after
+                                                      ).split(/\r?\n/).length,
+                                                    ),
+                                                  )}
                                                   value={
                                                     editDraftForProposal(p().proposalId)[diff.field] ??
                                                     diff.after
@@ -1688,9 +1697,17 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                                         {field => (
                                           <div>
                                             <div class="oc-diff-field-name">{field}</div>
-                                            <input
-                                              type="text"
+                                            <textarea
                                               class="oc-edit-input"
+                                              rows={Math.min(
+                                                10,
+                                                Math.max(
+                                                  field === "title" || field === "name" ? 1 : 3,
+                                                  (editDraftForProposal(p().proposalId)[field] ?? "").split(
+                                                    /\r?\n/,
+                                                  ).length,
+                                                ),
+                                              )}
                                               value={
                                                 editDraftForProposal(p().proposalId)[field] ?? ""
                                               }

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { createPlugin, openclawNativePlugin } from "../dist/native.mjs";
 import { openclawBridge } from "../dist/astro.mjs";
 import { GET as streamGet } from "../dist/stream-endpoint.mjs";
@@ -104,6 +105,18 @@ test("native descriptor and createPlugin preserve dinkus-openclaw /openclaw URL 
   assert.ok(resolved.routes.chat);
   assert.ok(resolved.routes.pair);
   assert.ok(!resolved.capabilities.includes("content:write"));
+
+  const reactAdminBundle = fs.readFileSync(
+    new URL("../dist/admin.mjs", import.meta.url),
+    "utf8",
+  );
+  const textareaEditMatches =
+    reactAdminBundle.match(/<textarea class=["']?oc-edit-input["']?/g) ?? [];
+  assert.equal(
+    textareaEditMatches.length,
+    2,
+    "Both proposal-editing branches must render <textarea> so multiline field line breaks are preserved",
+  );
 });
 
 test("chat route enforces server-side receipt reconciliation, immutable revise_proposal, and draft-safe field guard", async () => {
