@@ -445,10 +445,13 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         ? normalized.extractedToken
         : undefined;
 
-    const allowInlineApprovals = Boolean(connection.allowGatewayExecApprovals);
-    const requestedScopes = allowInlineApprovals
-      ? ["operator.read", "operator.write", "operator.approvals"]
-      : ["operator.read", "operator.write"];
+    // OpenClaw 2026.11.1 `server-broadcast-scopes.ts` requires `operator.approvals` to observe
+    // `session.approval` and `exec.approval.*` events (there is no separate read-only approval
+    // scope). Request `operator.approvals` on the server-owned bridge so read-only Control UI
+    // handoff cards and approval-aware turn timeouts work by default, while inline resolution
+    // remains strictly gated on Site Admin + `allowGatewayExecApprovals` in `resolveApproval`
+    // and `sendTurn`.
+    const requestedScopes = ["operator.read", "operator.write", "operator.approvals"];
 
     const computeFingerprint = (devToken?: string) =>
       crypto
@@ -460,7 +463,6 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             token: tokenCandidate ?? "",
             deviceToken: devToken ?? "",
             deviceId: identity.deviceId,
-            allowInlineApprovals,
           }),
         )
         .digest("hex");
@@ -1072,6 +1074,13 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
     decision: GatewayApprovalDecision;
     resolvedByUserId: string;
   }): Promise<{ ok: boolean; approval?: GatewayExecApproval; error?: string }> {
+    if (!params.connection.allowGatewayExecApprovals) {
+      return {
+        ok: false,
+        error:
+          "Inline Gateway execution approvals are disabled by default. Enable in Gateway & Pairing or resolve in OpenClaw Control UI.",
+      };
+    }
     const status = await this.connect(params.connection);
     if (status.state !== "connected" || !this.#client) {
       return { ok: false, error: status.lastError ?? "Gateway is disconnected." };

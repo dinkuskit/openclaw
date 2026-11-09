@@ -226,32 +226,34 @@ function startMockOpenClawGateway({ grantApprovalsScope = true } = {}) {
             }),
           );
 
-          ws.send(
-            JSON.stringify({
-              type: "event",
-              event: "session.approval",
-              payload: {
-                sessionKey,
-                phase: "requested",
-                approval: {
-                  id: "appr_exec_99",
-                  status: "pending",
-                  urlPath: "/chat/main?approval=appr_exec_99",
-                  createdAtMs: Date.now(),
-                  expiresAtMs: Date.now() + 120_000,
-                  presentation: {
-                    kind: "exec",
-                    agentId: "roboclaw",
-                    title: "Run storefront link checker",
-                    commandText: "openclaw check-links --origin http://localhost:4321",
-                    commandPreview: "openclaw check-links --origin http://localhost:4321",
-                    host: "gateway-node-1",
-                    allowedDecisions: ["allow-once", "deny"],
+          if (connectionScopes.includes("operator.approvals")) {
+            ws.send(
+              JSON.stringify({
+                type: "event",
+                event: "session.approval",
+                payload: {
+                  sessionKey,
+                  phase: "requested",
+                  approval: {
+                    id: "appr_exec_99",
+                    status: "pending",
+                    urlPath: "/chat/main?approval=appr_exec_99",
+                    createdAtMs: Date.now(),
+                    expiresAtMs: Date.now() + 120_000,
+                    presentation: {
+                      kind: "exec",
+                      agentId: "roboclaw",
+                      title: "Run storefront link checker",
+                      commandText: "openclaw check-links --origin http://localhost:4321",
+                      commandPreview: "openclaw check-links --origin http://localhost:4321",
+                      host: "gateway-node-1",
+                      allowedDecisions: ["allow-once", "deny"],
+                    },
                   },
                 },
-              },
-            }),
-          );
+              }),
+            );
+          }
 
           const replyWithProposal = [
             "I audited **Atelier Field Jacket** on OpenClaw Gateway v4 and staged a draft update:",
@@ -548,13 +550,14 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     assert.equal(adminDisabledAttempt.ok, false);
     assert.equal(adminDisabledAttempt.error, "GATEWAY_APPROVAL_DISABLED");
 
-    //    (b2) Before opt-in, initial `connect` must NOT even request `operator.approvals`
+    //    (b2) Initial `connect` requests `operator.approvals` so the bridge can observe read-only
+    //         handoff approvals (`server-broadcast-scopes.ts`), while inline resolution stays blocked!
     const initialConnect = gw.receivedFrames.find(f => f.method === "connect");
     assert.ok(initialConnect);
     assert.equal(
       initialConnect.params.scopes.includes("operator.approvals"),
-      false,
-      "GatewayClient must not request operator.approvals while allowGatewayExecApprovals is disabled",
+      true,
+      "GatewayClient must request operator.approvals so pending approval handoff cards are observable",
     );
     const disabledChatApprove = await chat(
       makeCtx({
