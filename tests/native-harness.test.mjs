@@ -480,6 +480,9 @@ test("enforces admin-only pairing codes, private proposal SSE, base-rev conflict
   assert.equal(editorSnap.pairingCommand, "");
   assert.equal(sharedKv.has("pairing_code"), false);
 
+  // Seed legacy expiry-less `pairing_code` -> Admin snapshot rotates it and assigns `pairing_code_expires_at`
+  sharedKv.set("pairing_code", "oc_pair_legacy_unexpired");
+
   // Admin configures propose_with_approval connection (and mints pairing code)
   const adminSnap = await chat(
     createNativeRouteCtx({
@@ -496,6 +499,8 @@ test("enforces admin-only pairing codes, private proposal SSE, base-rev conflict
     }),
   );
   assert.ok(adminSnap.pairingCode.startsWith("oc_pair_"));
+  assert.notEqual(adminSnap.pairingCode, "oc_pair_legacy_unexpired");
+  assert.equal(typeof sharedKv.get("pairing_code_expires_at"), "number");
 
   // 2. Private proposal updates stay isolated to u_alice on SSE & route auth
   const aliceTurn = await chat(

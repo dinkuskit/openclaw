@@ -153,7 +153,8 @@ export async function getOrCreatePairingCode(ctx: PluginContext): Promise<string
   if (!ctx.kv) return csprngId("oc_pair_", 12);
   const existing = await ctx.kv.get("pairing_code");
   const expiresAt = await ctx.kv.get("pairing_code_expires_at");
-  const validExpiry = typeof expiresAt !== "number" || expiresAt > Date.now();
+  const validExpiry =
+    typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > Date.now();
   if (typeof existing === "string" && existing.startsWith("oc_pair_") && validExpiry) {
     return existing;
   }

@@ -782,7 +782,7 @@ async function loadOrCreatePairingCode(ctx: PluginContext): Promise<string> {
     const existing = await ctx.kv.get("pairing_code");
     const expiresAt = await ctx.kv.get("pairing_code_expires_at");
     const validExpiry =
-      typeof expiresAt !== "number" || expiresAt > Date.now();
+      typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > Date.now();
     if (typeof existing === "string" && existing.startsWith("oc_pair_") && validExpiry) {
       return existing;
     }
@@ -1564,7 +1564,8 @@ export async function openclawPairRoute(
   const pairingCode = cleanText(input.pairingCode, 120);
   const storedCode = ctx.kv ? await ctx.kv.get("pairing_code") : null;
   const expiresAt = ctx.kv ? await ctx.kv.get("pairing_code_expires_at") : null;
-  const isExpired = typeof expiresAt === "number" && expiresAt <= Date.now();
+  const isExpired =
+    typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= Date.now();
   if (
     !pairingCode ||
     typeof storedCode !== "string" ||

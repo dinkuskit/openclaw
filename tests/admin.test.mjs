@@ -97,6 +97,23 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   assert.ok(checkboxField);
   assert.equal(checkboxField.options.some(o => o.value === "articles"), true);
 
+  // Legacy `pairing_code` without `pairing_code_expires_at` must be rejected by `/pair` and rotated on Admin load
+  await ctx.kv.set("pairing_code", "oc_pair_legacy_no_expiry");
+  await ctx.kv.delete("pairing_code_expires_at");
+  const legacyPairRejected = await pairRoute(
+    route({ pairingCode: "oc_pair_legacy_no_expiry", agentId: "blaze" }),
+    ctx,
+  );
+  assert.equal(legacyPairRejected.ok, false);
+  assert.equal(legacyPairRejected.error, "INVALID_PAIRING_CODE");
+
+  await admin(route({ type: "page_load" }), ctx);
+  const rotatedFromLegacy = await ctx.kv.get("pairing_code");
+  const rotatedExpiresAt = await ctx.kv.get("pairing_code_expires_at");
+  assert.notEqual(rotatedFromLegacy, "oc_pair_legacy_no_expiry");
+  assert.equal(typeof rotatedExpiresAt, "number");
+  assert.equal(rotatedExpiresAt > Date.now(), true);
+
   // Also verify 1-step agent pairing via the public pair route (zero gatewayUrl/token needed)
   const pairingCode = await ctx.kv.get("pairing_code");
   const pairResp = await pairRoute(
