@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import plugin from "../dist/plugin.mjs";
 import { validateBlockResponse } from "@emdash-cms/blocks/server";
+import { adaptSandboxEntry } from "../node_modules/emdash/dist/plugins/adapt-sandbox-entry.mjs";
 
 const admin = plugin.routes.admin.handler;
 const editorPanel = plugin.routes["editor/assistant"].handler;
@@ -86,6 +87,8 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   const codeBlock = colsBlock.columns[0].find(b => b.type === "code");
   assert.ok(codeBlock);
   assert.match(codeBlock.code, /\/_emdash\/api\/plugins\/dinkus-openclaw\/pair/);
+  assert.match(codeBlock.code, /X-OpenClaw-Token/);
+  assert.doesNotMatch(codeBlock.code, /Authorization:\s*Bearer/i);
   const accordion = colsBlock.columns[1].find(b => b.type === "accordion");
   assert.ok(accordion);
   const form = accordion.blocks.find(b => b.type === "form" && b.block_id === "openclaw-connect-form");
@@ -93,6 +96,23 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   const checkboxField = form.fields.find(f => f.action_id === "enabledCollections");
   assert.ok(checkboxField);
   assert.equal(checkboxField.options.some(o => o.value === "articles"), true);
+
+  // Legacy `pairing_code` without `pairing_code_expires_at` must be rejected by `/pair` and rotated on Admin load
+  await ctx.kv.set("pairing_code", "oc_pair_legacy_no_expiry");
+  await ctx.kv.delete("pairing_code_expires_at");
+  const legacyPairRejected = await pairRoute(
+    route({ pairingCode: "oc_pair_legacy_no_expiry", agentId: "blaze" }),
+    ctx,
+  );
+  assert.equal(legacyPairRejected.ok, false);
+  assert.equal(legacyPairRejected.error, "INVALID_PAIRING_CODE");
+
+  await admin(route({ type: "page_load" }), ctx);
+  const rotatedFromLegacy = await ctx.kv.get("pairing_code");
+  const rotatedExpiresAt = await ctx.kv.get("pairing_code_expires_at");
+  assert.notEqual(rotatedFromLegacy, "oc_pair_legacy_no_expiry");
+  assert.equal(typeof rotatedExpiresAt, "number");
+  assert.equal(rotatedExpiresAt > Date.now(), true);
 
   // Also verify 1-step agent pairing via the public pair route (zero gatewayUrl/token needed)
   const pairingCode = await ctx.kv.get("pairing_code");
@@ -106,8 +126,56 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   );
   assert.equal(pairResp.ok, true);
   assert.equal(typeof pairResp.sessionToken, "string");
+  assert.equal(pairResp.authHeader, "X-OpenClaw-Token");
 
-  // Also verify built-in MCP JSON-RPC initialize on the pair route never returns 404
+  // Verify real EmDash 1.4.0 sandbox dispatch (`sanitizeHeadersForSandbox` strips Authorization,
+  // while `X-OpenClaw-Token` and JSON `sessionToken` reach the sandboxed `/pair` handler).
+  const sandboxResolved = adaptSandboxEntry(plugin, { id: "dinkus-openclaw", version: "0.0.0" });
+  const invokeSandboxPair = (input, headerEntries) =>
+    sandboxResolved.routes.pair.handler({
+      ...ctx,
+      input,
+      user: undefined,
+      ui: undefined,
+      requestMeta: {},
+      request: {
+        url: "https://site.example.test/_emdash/api/plugins/dinkus-openclaw/pair",
+        method: "POST",
+        headers: new Headers(headerEntries),
+      },
+    });
+
+  const strippedBearerMcp = await invokeSandboxPair(
+    {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: { name: "emdash_status", arguments: {} },
+    },
+    { Authorization: `Bearer ${pairResp.sessionToken}` },
+  );
+  assert.equal(strippedBearerMcp.error.code, -32001);
+  assert.match(strippedBearerMcp.error.message, /X-OpenClaw-Token/);
+
+  const sandboxHeaderMcp = await invokeSandboxPair(
+    {
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "emdash_status", arguments: {} },
+    },
+    { "X-OpenClaw-Token": pairResp.sessionToken },
+  );
+  assert.ok(sandboxHeaderMcp.result);
+
+  const sandboxHeaderPoll = await invokeSandboxPair(
+    { action: "poll_turn" },
+    { "X-OpenClaw-Token": pairResp.sessionToken },
+  );
+  assert.equal(sandboxHeaderPoll.ok, true);
+  assert.equal(sandboxHeaderPoll.agentId, "blaze");
+
+  // Also verify built-in MCP JSON-RPC initialize + tools/list sessionToken schema on the pair route
   const mcpInit = await pairRoute(
     route({
       jsonrpc: "2.0",
@@ -118,6 +186,18 @@ test("discovers dynamic site collections without requiring Commerce and saves co
   );
   assert.equal(mcpInit.jsonrpc, "2.0");
   assert.ok(mcpInit.result);
+
+  const mcpList = await pairRoute(
+    route({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    }),
+    ctx,
+  );
+  for (const tool of mcpList.result.tools) {
+    assert.equal(tool.inputSchema.properties.sessionToken.type, "string");
+  }
 
   const connected = await admin(
     route({
@@ -193,4 +273,21 @@ test("supports live mid-task steer and configurable editor side-panel collaborat
   );
   assert.doesNotThrow(() => validateBlockResponse(postsPanel));
   assert.equal(postsPanel.blocks.some(b => b.type === "form"), false);
+
+  // Reject URL-embedded credentials on Block Kit save_connection
+  const rejectedUserinfo = await admin(
+    route({
+      type: "form_submit",
+      action_id: "save_connection",
+      values: {
+        gatewayUrl: "https://user:secret@openclaw.example.test",
+        agentId: "openclaw",
+        gatewayToken: "oc_tok",
+        authorityMode: "read_only",
+      },
+    }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(rejectedUserinfo));
+  assert.equal(rejectedUserinfo.blocks[1].type, "banner");
 });

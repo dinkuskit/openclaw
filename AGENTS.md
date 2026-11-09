@@ -2,8 +2,9 @@
 
 This public repository owns `@dinkuskit/openclaw` (`dinkus-openclaw`), the
 open-source EmDash plugin that connects an OpenClaw gateway and custom agents to
-the EmDash CMS admin with Block Kit approval cards and MCP tools. Assume every
-committed byte is immediately public.
+the EmDash CMS admin across two mutually exclusive installation profiles sharing
+the `dinkus-openclaw` product identity. Assume every committed byte is
+immediately public.
 
 ## Source priority
 
@@ -22,17 +23,28 @@ committed byte is immediately public.
 
 ## Architectural invariants
 
-- **Sandboxed Registry plugin (`dinkus-openclaw`):** Admin UI is Block Kit only
-  (`@emdash-cms/blocks/server`). Measure the built `backend.js` against the
-  `128 KiB` Registry per-file cap (`scripts/check-registry-bundle.mjs`).
-- **No plugin-to-plugin imports in the sandbox:** OpenClaw agents interact with
-  EmDash content, drafts, and companion DinkusKit plugins (`Commerce`,
-  `Payments`, `Ship`) through EmDash's native permissioned MCP server and
-  capability-gated host APIs (`schema:read`, `content:read`,
-  `admin.editor-draft:read`, `admin.editor-draft:patch`).
-- **Read-only start & `WAITING_FOR_HUMAN` approval cards:** Assistant access
-  starts read-only by default. Mutations require explicit per-business authority
-  and human approval cards.
+- **Dual installation profiles, single URL (`/_emdash/admin/plugins/dinkus-openclaw/openclaw`):**
+  - **Sandboxed Registry profile (`@dinkuskit/openclaw` + `./sandbox`):** Admin
+    UI is Block Kit only (`@emdash-cms/blocks/server`). Measure the built
+    `backend.js` against the `128 KiB` Registry per-file cap
+    (`scripts/check-registry-bundle.mjs`).
+  - **Native Interactive Harness (`@dinkuskit/openclaw/native` + `./admin` + `./astro`):**
+    Mounts thin React host adapters (`pages["/openclaw"]` and
+    `contentEditorPanels`) hosting one precompiled SolidJS Web Component
+    (`<openclaw-emdash-chat>`) backed by an authenticated host Astro SSE bridge
+    (`/_emdash/api/openclaw/stream`).
+- **Gateway owns conversation execution; EmDash owns CMS mutations:** The plugin
+  declares `schema:read`, `content:read` (plus `content:revisions:read` in the
+  native profile to reconcile staged drafts on published entries), and
+  `network:request:unrestricted` only (never `content:write`). Approved draft
+  proposals execute through EmDash's authenticated revision-fenced content API
+  (`_rev` optimistic concurrency:
+  `pending -> applying -> applied | conflict | outcome_unknown | failed`).
+- **No plugin-to-plugin imports in the sandbox:** Companion DinkusKit plugins
+  (`Commerce`, `Payments`, `Ship`) interact through EmDash's permissioned MCP
+  and capability-gated host APIs.
+- **Read-only start & human approval cards:** Mutations require explicit
+  `propose_with_approval` authority and human approval cards.
 
 ## Bootstrap state and gates
 

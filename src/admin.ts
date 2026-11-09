@@ -1,22 +1,28 @@
 import type { Block, BlockResponse, FormField } from "@emdash-cms/blocks/server";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
+import {
+  cancelAllPairedAgentTurns,
+  completePairedAgentTurn,
+  pollPairedAgentTurn,
+  steerPairedAgentTurn,
+} from "./chat-engine.js";
+import type { OpenClawConnection } from "./protocol.js";
+import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
+
+export type { OpenClawConnection };
 
 /** EmDash Editor role (40) and Administrator role (50). */
 const EDITOR = 40;
 const ADMIN = 50;
 
-export interface OpenClawConnection {
-  gatewayUrl: string;
-  agentId: string;
-  gatewayToken: string;
-  authorityMode: "read_only" | "propose_with_approval";
-  enabledCollections: string[];
-}
-
 export interface ActiveTurn {
   turnId: string;
+  conversationId?: string;
+  sessionKey?: string;
   prompt: string;
-  status: "running" | "steered" | "completed";
+  steers?: string[];
+  systemContext?: string;
+  status: "running" | "steered" | "completed" | "stopped";
   lastUpdate: string;
 }
 
@@ -27,7 +33,31 @@ export interface PendingProposal {
   entryId?: string;
   summary: string;
   targetTool: string;
+  proposedFields?: Record<string, string>;
   createdAt: string;
+}
+
+const EXCLUDED_EXTERNAL_PATCH_FIELDS = new Set([
+  "seoTitle",
+  "seoDescription",
+  "seoImage",
+  "canonicalUrl",
+  "noindex",
+  "status",
+  "publishedAt",
+  "_rev",
+  "id",
+]);
+
+function extractSafeExternalFields(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!EXCLUDED_EXTERNAL_PATCH_FIELDS.has(k) && typeof v === "string") {
+      out[k] = v.slice(0, 4000);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 interface Action {
@@ -117,36 +147,79 @@ async function discoverSiteCollections(
   ];
 }
 
-async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
-  const raw = await ctx.settings.get("connection");
-  if (typeof raw !== "string" || !raw) return null;
+async function loadConnectionState(
+  ctx: PluginContext,
+): Promise<{ connection: OpenClawConnection | null; error?: string }> {
+  let raw: unknown;
+  try {
+    raw = await ctx.settings.get("connection");
+  } catch {
+    return {
+      connection: null,
+      error:
+        "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.",
+    };
+  }
+  if (typeof raw !== "string" || !raw) return { connection: null };
   try {
     const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
+    const hasStoredCredential =
+      (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
+      (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
+      (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
     if (
       typeof parsed.gatewayUrl === "string" &&
-      parsed.gatewayUrl.startsWith("https://") &&
+      (parsed.gatewayUrl.startsWith("https://") ||
+        parsed.gatewayUrl.startsWith("wss://") ||
+        parsed.gatewayUrl.startsWith("ws://127.0.0.1:") ||
+        parsed.gatewayUrl.startsWith("ws://localhost:") ||
+        parsed.gatewayUrl.startsWith("http://127.0.0.1:") ||
+        parsed.gatewayUrl.startsWith("http://localhost:")) &&
       typeof parsed.agentId === "string" &&
       parsed.agentId.length > 0 &&
       typeof parsed.gatewayToken === "string" &&
-      parsed.gatewayToken.length > 0
+      hasStoredCredential
     ) {
       return {
-        gatewayUrl: parsed.gatewayUrl,
-        agentId: parsed.agentId,
-        gatewayToken: parsed.gatewayToken,
-        authorityMode:
-          parsed.authorityMode === "propose_with_approval"
-            ? "propose_with_approval"
-            : "read_only",
-        enabledCollections: Array.isArray(parsed.enabledCollections)
-          ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
-          : ["pages", "posts"],
+        connection: {
+          gatewayUrl: parsed.gatewayUrl,
+          agentId: parsed.agentId,
+          gatewayToken: parsed.gatewayToken,
+          ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
+            ? { bootstrapToken: parsed.bootstrapToken }
+            : {}),
+          ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
+            ? { deviceToken: parsed.deviceToken }
+            : {}),
+          ...(parsed.deviceIdentity &&
+          typeof parsed.deviceIdentity.deviceId === "string" &&
+          typeof parsed.deviceIdentity.publicKeyPem === "string" &&
+          typeof parsed.deviceIdentity.privateKeyPem === "string"
+            ? { deviceIdentity: parsed.deviceIdentity }
+            : {}),
+          authorityMode:
+            parsed.authorityMode === "propose_with_approval"
+              ? "propose_with_approval"
+              : "read_only",
+          allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
+          ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
+          enabledCollections: Array.isArray(parsed.enabledCollections)
+            ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+            : ["pages", "posts"],
+        },
       };
     }
   } catch {
-    // Malformed settings require re-setup.
+    // Preserve stored encrypted value instead of deleting on parse errors.
   }
-  return null;
+  return {
+    connection: null,
+    error: "Stored OpenClaw settings could not be parsed. Re-save Gateway settings to replace them.",
+  };
+}
+
+async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
+  return (await loadConnectionState(ctx)).connection;
 }
 
 async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
@@ -156,11 +229,11 @@ async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
   return raw as PendingProposal[];
 }
 
-async function loadActiveTurn(ctx: PluginContext): Promise<ActiveTurn | null> {
-  if (!ctx.kv) return null;
-  const raw = await ctx.kv.get("active_turn");
-  if (!raw || typeof raw !== "object") return null;
-  return raw as ActiveTurn;
+async function loadActiveTurn(
+  ctx: PluginContext,
+  viewerUserId: string,
+): Promise<ActiveTurn | null> {
+  return (await pollPairedAgentTurn(ctx, viewerUserId)) as ActiveTurn | null;
 }
 
 export function buildAgentPairingCommand(siteOrigin: string, pairingCode: string): string {
@@ -184,9 +257,10 @@ export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string)
     `       "authorityMode": "propose_with_approval"`,
     `     }'`,
     ``,
-    `2. The JSON response returns your sessionToken`,
-    `   and built-in MCP / agent endpoint at:`,
-    `   ${pairEndpoint}`,
+    `2. The JSON response returns your sessionToken.`,
+    `   Authenticate follow-up MCP / REST requests with`,
+    `   -H "X-OpenClaw-Token: <sessionToken>" (or JSON "sessionToken")`,
+    `   at: ${pairEndpoint}`,
     `3. Reply once paired so I can click`,
     `   "Check pairing status" in EmDash.`,
   ].join("\n");
@@ -360,6 +434,40 @@ export function setupPage(
   return { blocks, ...(toast ? { toast } : {}) };
 }
 
+function sanitizeAdminPublicUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    for (const k of [
+      "token",
+      "bootstrapToken",
+      "deviceToken",
+      "password",
+      "secret",
+      "apiKey",
+      "api_key",
+      "access_token",
+      "auth",
+    ]) {
+      parsed.searchParams.delete(k);
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return rawUrl.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s"']+)@/gi, "$1");
+  }
+}
+
+function hasEmbeddedUrlCredentials(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return Boolean(parsed.username || parsed.password);
+  } catch {
+    return /:\/\/[^/@\s]+@/.test(rawUrl);
+  }
+}
+
 export function workspacePage(
   connection: OpenClawConnection,
   collections: Array<{ slug: string; label: string }>,
@@ -369,11 +477,12 @@ export function workspacePage(
   replyText?: string,
   toast?: BlockResponse["toast"],
 ): BlockResponse {
-  let gatewayHost = connection.gatewayUrl;
+  const safeGatewayUrl = sanitizeAdminPublicUrl(connection.gatewayUrl);
+  let gatewayHost = safeGatewayUrl;
   try {
-    gatewayHost = new URL(connection.gatewayUrl).host;
+    gatewayHost = new URL(safeGatewayUrl).host;
   } catch {
-    // Keep full URL if parsing fails.
+    // Keep sanitized URL if parsing fails.
   }
 
   const blocks: Block[] = [
@@ -542,7 +651,7 @@ export function workspacePage(
             ],
             [
               fields(
-                ["Gateway", connection.gatewayUrl],
+                ["Gateway", safeGatewayUrl],
                 ["Agent ID", `@${connection.agentId}`],
                 [
                   "Authority Mode",
@@ -600,27 +709,96 @@ function resolveSiteOrigin(route: SandboxedRouteContext): string {
   return "http://localhost:4321";
 }
 
+function csprngToken(prefix: string, byteLen = 18): string {
+  const bytes = new Uint8Array(byteLen);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    throw new Error("WebCrypto getRandomValues is required for token generation");
+  }
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let out = prefix;
+  for (const b of bytes) {
+    out += alphabet[b % alphabet.length];
+  }
+  return out;
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+function readRequestHeader(headers: unknown, headerNameLower: string): string | undefined {
+  if (!headers) return undefined;
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    const val = (headers as { get: (k: string) => string | null }).get(headerNameLower);
+    return typeof val === "string" ? val : undefined;
+  }
+  if (typeof headers === "object") {
+    for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (key.toLowerCase() === headerNameLower && typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractSessionTokenHeader(route: SandboxedRouteContext): string | undefined {
+  const headers =
+    (route as unknown as { request?: { headers?: unknown }; headers?: unknown }).request?.headers ??
+    (route as unknown as { headers?: unknown }).headers;
+  if (!headers) return undefined;
+
+  // Primary header: `X-OpenClaw-Token` survives EmDash 1.4.0 `sanitizeHeadersForSandbox`
+  // (which strips `Authorization` before sandbox route dispatch) and works on native too.
+  const openclawHeader = readRequestHeader(headers, "x-openclaw-token");
+  if (typeof openclawHeader === "string") {
+    const normalized = cleanText(openclawHeader.replace(/^Bearer\s+/i, "").trim(), 300);
+    if (normalized) return normalized;
+  }
+
+  // Native-profile compatibility: retain `Authorization: Bearer <sessionToken>`.
+  const authVal = readRequestHeader(headers, "authorization");
+  if (typeof authVal === "string" && /^Bearer\s+/i.test(authVal)) {
+    return cleanText(authVal.replace(/^Bearer\s+/i, "").trim(), 300);
+  }
+  return undefined;
+}
+
+const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
+
 function generatePairingCode(): string {
-  return `oc_pair_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+  return csprngToken("oc_pair_", 12);
 }
 
 async function loadOrCreatePairingCode(ctx: PluginContext): Promise<string> {
   if (ctx.kv) {
     const existing = await ctx.kv.get("pairing_code");
-    if (typeof existing === "string" && existing.startsWith("oc_pair_")) {
+    const expiresAt = await ctx.kv.get("pairing_code_expires_at");
+    const validExpiry =
+      typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > Date.now();
+    if (typeof existing === "string" && existing.startsWith("oc_pair_") && validExpiry) {
       return existing;
     }
     const fresh = generatePairingCode();
     await ctx.kv.set("pairing_code", fresh);
+    await ctx.kv.set("pairing_code_expires_at", Date.now() + PAIRING_CODE_TTL_MS);
     return fresh;
   }
-  return "oc_pair_ready";
+  return generatePairingCode();
 }
 
 async function rotatePairingCode(ctx: PluginContext): Promise<string> {
   const fresh = generatePairingCode();
   if (ctx.kv) {
     await ctx.kv.set("pairing_code", fresh);
+    await ctx.kv.set("pairing_code_expires_at", Date.now() + PAIRING_CODE_TTL_MS);
   }
   return fresh;
 }
@@ -639,10 +817,11 @@ export async function openclawAdmin(
     };
   }
 
+  const currentUserId = route.user?.id ?? "anonymous";
   const isAdmin = role >= ADMIN;
   const collections = await discoverSiteCollections(ctx);
   const siteOrigin = resolveSiteOrigin(route);
-  const pairingCode = await loadOrCreatePairingCode(ctx);
+  const pairingCode = isAdmin ? await loadOrCreatePairingCode(ctx) : "";
   const event = parseInteraction(route.input);
   if (!event) {
     return {
@@ -679,22 +858,25 @@ export async function openclawAdmin(
         ? "propose_with_approval"
         : "read_only";
 
-    if (!gatewayUrl || !gatewayUrl.startsWith("https://")) {
+    if (!gatewayUrl || !gatewayUrl.startsWith("https://") || hasEmbeddedUrlCredentials(gatewayUrl)) {
       return setupPage(
         true,
         collections,
         siteOrigin,
         pairingCode,
-        "Enter an HTTPS OpenClaw gateway URL.",
+        gatewayUrl && hasEmbeddedUrlCredentials(gatewayUrl)
+          ? "Gateway URL must not embed username or password credentials; use the Gateway bearer token field."
+          : "Enter an HTTPS OpenClaw gateway URL.",
       );
     }
-    if (!agentId) {
+    const sanitizedGatewayUrl = sanitizeAdminPublicUrl(gatewayUrl);
+    if (!agentId || !/[a-z0-9]/i.test(agentId)) {
       return setupPage(
         true,
         collections,
         siteOrigin,
         pairingCode,
-        "Enter the default OpenClaw agent ID.",
+        "Enter a valid OpenClaw agent ID containing letters or numbers.",
       );
     }
     if (!gatewayToken) {
@@ -711,11 +893,14 @@ export async function openclawAdmin(
       ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
       : collections.filter(col => event.values[`col_${col.slug}`] !== false).map(col => col.slug);
 
+    const pairedAgentPoll = sanitizedGatewayUrl === "https://agent-session.openclaw.local";
     const nextConnection: OpenClawConnection = {
-      gatewayUrl,
+      gatewayUrl: sanitizedGatewayUrl,
       agentId,
       gatewayToken,
       authorityMode,
+      allowGatewayExecApprovals: false,
+      ...(pairedAgentPoll ? { pairedAgentPoll: true } : {}),
       enabledCollections,
     };
     const existing = await ctx.settings.getVersioned("connection");
@@ -724,8 +909,14 @@ export async function openclawAdmin(
       existing?.revision ?? null,
       JSON.stringify(nextConnection),
     );
+    if (!pairedAgentPoll) {
+      await cancelAllPairedAgentTurns(
+        ctx,
+        "Gateway connection updated; pending paired-agent turn was cancelled.",
+      );
+    }
     const proposals = await loadProposals(ctx);
-    const activeTurn = await loadActiveTurn(ctx);
+    const activeTurn = await loadActiveTurn(ctx, currentUserId);
     return workspacePage(
       nextConnection,
       collections,
@@ -740,25 +931,30 @@ export async function openclawAdmin(
     );
   }
 
-  const connection = await loadConnection(ctx);
+  const connState = await loadConnectionState(ctx);
+  const connection = connState.connection;
   if (!connection) {
     if (event.type === "block_action" && event.action_id === "check_pairing") {
-      return setupPage(true, collections, siteOrigin, pairingCode, undefined, {
+      return setupPage(true, collections, siteOrigin, pairingCode, connState.error, {
         type: "info",
         message: "Waiting for your OpenClaw agent to complete the pairing POST.",
       });
     }
-    return setupPage(isAdmin, collections, siteOrigin, pairingCode);
+    return setupPage(isAdmin, collections, siteOrigin, pairingCode, connState.error);
   }
 
   if (event.type === "block_action" && event.action_id === "disconnect" && isAdmin) {
+    await cancelAllPairedAgentTurns(
+      ctx,
+      "OpenClaw connection disconnected before paired agent completed the turn.",
+    );
     await ctx.settings.delete("connection");
     const freshCode = await rotatePairingCode(ctx);
     return setupPage(true, collections, siteOrigin, freshCode);
   }
 
   const proposals = await loadProposals(ctx);
-  let activeTurn = await loadActiveTurn(ctx);
+  let activeTurn = await loadActiveTurn(ctx, currentUserId);
 
   if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
     const enabledCollections = Array.isArray(event.values.enabledCollections)
@@ -782,27 +978,74 @@ export async function openclawAdmin(
     (event.action_id === "approve_proposal" || event.action_id === "reject_proposal")
   ) {
     const proposalId = cleanText(event.value, 120);
-    const remaining = proposals.filter(item => item.proposalId !== proposalId);
-    if (ctx.kv) {
-      await ctx.kv.set("pending_proposals", remaining);
+    if (event.action_id === "reject_proposal") {
+      const remaining = await withOpenClawStorageLock("proposals", async () => {
+        const current = await loadProposals(ctx);
+        const next = current.filter(item => item.proposalId !== proposalId);
+        if (ctx.kv) {
+          await ctx.kv.set("pending_proposals", next);
+        }
+        return next;
+      });
+      return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
+        type: "info",
+        message: `Rejected proposal ${proposalId ?? ""}. No CMS changes were applied.`,
+      });
     }
-    const verb = event.action_id === "approve_proposal" ? "Approved" : "Rejected";
-    return workspacePage(connection, collections, remaining, activeTurn, isAdmin, undefined, {
-      type: "success",
-      message: `${verb} proposal ${proposalId ?? ""}.`,
-    });
+    // Honest sandbox boundary: Block Kit runs without content:write or browser _rev access.
+    // Never delete the pending proposal and falsely claim "Approved".
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      "Sandboxed Block Kit mode cannot execute _rev-fenced writes directly. Open the Native OpenClaw harness or Content Editor to review and save this draft.",
+      {
+        type: "info",
+        message: `Proposal ${proposalId ?? ""} remains pending until saved with _rev verification.`,
+      },
+    );
   }
 
   if (event.type === "form_submit" && event.action_id === "steer_agent" && activeTurn) {
     const steerMessage = cleanText(event.values.steerMessage, 500);
     if (steerMessage) {
-      activeTurn = {
-        ...activeTurn,
-        status: "steered",
-        lastUpdate: `Steered mid-task: "${steerMessage}"`,
-      };
-      if (ctx.kv) {
-        await ctx.kv.set("active_turn", activeTurn);
+      if (activeTurn.conversationId) {
+        const steeredNative = await steerPairedAgentTurn(
+          ctx,
+          activeTurn.conversationId,
+          steerMessage,
+          currentUserId,
+        );
+        if (!steeredNative) {
+          return workspacePage(
+            connection,
+            collections,
+            proposals,
+            null,
+            isAdmin,
+            "No active visible task is available to steer.",
+          );
+        }
+        activeTurn = {
+          turnId: steeredNative.turnId,
+          conversationId: steeredNative.conversationId,
+          sessionKey: steeredNative.sessionKey,
+          prompt: steeredNative.prompt,
+          steers: steeredNative.steers,
+          status: "steered",
+          lastUpdate: steeredNative.lastUpdate,
+        };
+      } else {
+        activeTurn = {
+          ...activeTurn,
+          status: "steered",
+          lastUpdate: `Queued mid-task steer: "${steerMessage}"`,
+        };
+        if (ctx.kv) {
+          await ctx.kv.set("active_turn", activeTurn);
+        }
       }
     }
     return workspacePage(
@@ -814,24 +1057,42 @@ export async function openclawAdmin(
       undefined,
       {
         type: "info",
-        message: `Sent mid-task steer to @${connection.agentId}.`,
+        message: `Queued mid-task steer for @${connection.agentId}.`,
       },
     );
   }
 
   if (event.type === "block_action" && event.action_id === "check_status") {
-    if (ctx.kv) {
-      await ctx.kv.delete("active_turn");
+    if (!activeTurn) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        null,
+        isAdmin,
+        "No active task is currently running.",
+      );
+    }
+    if (activeTurn.status === "completed") {
+      if (ctx.kv && !activeTurn.conversationId) {
+        await ctx.kv.delete("active_turn");
+      }
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        null,
+        isAdmin,
+        `Completed task "${activeTurn.prompt}": ${activeTurn.lastUpdate}`,
+      );
     }
     return workspacePage(
       connection,
       collections,
       proposals,
-      null,
+      activeTurn,
       isAdmin,
-      activeTurn
-        ? `Completed task "${activeTurn.prompt}" (${activeTurn.lastUpdate}).`
-        : "No active task is currently running.",
+      `Task "${activeTurn.prompt}" is still ${activeTurn.status} — ${activeTurn.lastUpdate}`,
     );
   }
 
@@ -918,17 +1179,19 @@ export async function openclawEditorPanel(
   if (event?.type === "form_submit" && event.action_id === "collaborate_entry") {
     const instruction = cleanText(event.values.instruction, 500);
     if (instruction && ctx.kv) {
-      const proposals = await loadProposals(ctx);
-      proposals.push({
-        proposalId: `prop_${Date.now()}`,
-        agentId: connection.agentId,
-        collection,
-        entryId,
-        summary: `${collection}/${entryId}: ${instruction}`,
-        targetTool: "content:collaborate",
-        createdAt: new Date().toISOString(),
+      await withOpenClawStorageLock("proposals", async () => {
+        const proposals = await loadProposals(ctx);
+        proposals.push({
+          proposalId: `prop_${Date.now()}`,
+          agentId: connection.agentId,
+          collection,
+          entryId,
+          summary: `${collection}/${entryId}: ${instruction}`,
+          targetTool: "content:collaborate",
+          createdAt: new Date().toISOString(),
+        });
+        await ctx.kv!.set("pending_proposals", proposals);
       });
-      await ctx.kv.set("pending_proposals", proposals);
     }
     return {
       blocks: [
@@ -969,6 +1232,44 @@ export async function openclawEditorPanel(
  * - Mints a scoped `sessionToken` (`oc_sess_...`) and serves MCP JSON-RPC (`initialize`, `tools/list`, `tools/call`)
  *   and REST actions (`poll_turn`, `complete_turn`, `propose`) at the same URL.
  */
+function validateExternalProposalSubmission(
+  connection: OpenClawConnection,
+  collection: string | undefined,
+  entryId: string | undefined,
+  proposedFields: Record<string, string> | undefined,
+): { code: string; message: string } | null {
+  const hasConcreteFields = Boolean(proposedFields && Object.keys(proposedFields).length > 0);
+  if (connection.authorityMode !== "propose_with_approval") {
+    return {
+      code: "AUTHORITY_READ_ONLY",
+      message:
+        "OpenClaw connection is in read_only authority mode; submitting content proposals is disabled.",
+    };
+  }
+  if (collection && !connection.enabledCollections.includes(collection)) {
+    return {
+      code: "COLLECTION_NOT_ENABLED",
+      message: `Collection "${collection}" is not enabled for this OpenClaw connection.`,
+    };
+  }
+  if (hasConcreteFields) {
+    if (!collection || !connection.enabledCollections.includes(collection)) {
+      return {
+        code: "COLLECTION_NOT_ENABLED",
+        message:
+          "Concrete field patches must specify a collection enabled on this OpenClaw connection.",
+      };
+    }
+    if (!entryId || entryId === "current") {
+      return {
+        code: "INVALID_PROPOSAL_TARGET",
+        message: "Concrete field patches must specify a target entryId.",
+      };
+    }
+  }
+  return null;
+}
+
 export async function openclawPairRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
@@ -999,6 +1300,11 @@ export async function openclawPairRoute(
       return { jsonrpc: "2.0", id, result: {} };
     }
     if (input.method === "tools/list") {
+      const sessionTokenProp = {
+        type: "string",
+        description:
+          "Paired sessionToken (optional when passed via the X-OpenClaw-Token header).",
+      };
       return {
         jsonrpc: "2.0",
         id,
@@ -1007,7 +1313,24 @@ export async function openclawPairRoute(
             {
               name: "emdash_status",
               description: "Inspect paired EmDash site collections and active turn.",
-              inputSchema: { type: "object", properties: {} },
+              inputSchema: {
+                type: "object",
+                properties: { sessionToken: sessionTokenProp },
+              },
+            },
+            {
+              name: "emdash_complete_turn",
+              description:
+                "Complete an active native chat or Block Kit turn with the agent reply (up to 32,000 characters).",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  turnId: { type: "string", minLength: 1, maxLength: 120 },
+                  reply: { type: "string", minLength: 1, maxLength: 32000 },
+                  sessionToken: sessionTokenProp,
+                },
+                required: ["reply"],
+              },
             },
             {
               name: "emdash_submit_proposal",
@@ -1019,6 +1342,8 @@ export async function openclawPairRoute(
                   targetTool: { type: "string" },
                   collection: { type: "string" },
                   entryId: { type: "string" },
+                  proposedFields: { type: "object" },
+                  sessionToken: sessionTokenProp,
                 },
                 required: ["summary"],
               },
@@ -1038,19 +1363,92 @@ export async function openclawPairRoute(
           ? (params.arguments as Record<string, unknown>)
           : {};
       const connection = await loadConnection(ctx);
+      const suppliedToken =
+        extractSessionTokenHeader(route) ??
+        cleanText(params.sessionToken, 300) ??
+        cleanText(args.sessionToken, 300) ??
+        cleanText(input.sessionToken, 300);
+      if (
+        !connection ||
+        !suppliedToken ||
+        !constantTimeEqual(suppliedToken, connection.gatewayToken)
+      ) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32001,
+            message:
+              "UNAUTHORIZED_SESSION: Pass X-OpenClaw-Token: <sessionToken> header or sessionToken in JSON params/arguments (Authorization: Bearer <sessionToken> is also accepted on the native profile).",
+          },
+        };
+      }
+      if (toolName === "emdash_complete_turn") {
+        const completed = await completePairedAgentTurn(ctx, connection, {
+          turnId: args.turnId,
+          reply: args.reply,
+          requireReply: true,
+        });
+        if (!completed.ok) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32004,
+              message: `${String(completed.error ?? "COMPLETE_TURN_FAILED")}: ${String(completed.message ?? "Could not complete turn.")}`,
+            },
+          };
+        }
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: JSON.stringify(completed) }],
+          },
+        };
+      }
       if (toolName === "emdash_submit_proposal" && ctx.kv) {
-        const proposals = await loadProposals(ctx);
+        const targetCollection = cleanText(args.collection, 60);
+        const targetEntryId = cleanText(args.entryId, 80);
+        const proposedFields = extractSafeExternalFields(args.proposedFields);
+        const policyError = validateExternalProposalSubmission(
+          connection,
+          targetCollection,
+          targetEntryId,
+          proposedFields,
+        );
+        if (policyError) {
+          return {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32003,
+              message: `${policyError.code}: ${policyError.message}`,
+            },
+          };
+        }
         const proposal: PendingProposal = {
-          proposalId: `prop_${Date.now()}`,
-          agentId: connection?.agentId ?? "openclaw",
-          collection: cleanText(args.collection, 60),
-          entryId: cleanText(args.entryId, 80),
+          proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          agentId: connection.agentId,
+          collection: targetCollection,
+          entryId: targetEntryId,
           summary: cleanText(args.summary, 300) ?? "Agent proposal",
           targetTool: cleanText(args.targetTool, 80) ?? "content:update",
+          ...(proposedFields ? { proposedFields } : {}),
           createdAt: new Date().toISOString(),
         };
-        proposals.push(proposal);
-        await ctx.kv.set("pending_proposals", proposals);
+        await withOpenClawStorageLock("proposals", async () => {
+          const proposals = await loadProposals(ctx);
+          proposals.push(proposal);
+          await ctx.kv!.set("pending_proposals", proposals);
+        });
+        publishOpenClawEvent({
+          type: "workspace_sync",
+          conversationId: "conv_default",
+          reason: "external_agent_proposal",
+          timestamp: new Date().toISOString(),
+          visibility: "shared",
+        });
         return {
           jsonrpc: "2.0",
           id,
@@ -1059,7 +1457,10 @@ export async function openclawPairRoute(
           },
         };
       }
-      const activeTurn = await loadActiveTurn(ctx);
+      const activeTurn = await pollPairedAgentTurn(ctx);
+      const scopedCollections = collections.filter(c =>
+        connection.enabledCollections.includes(c.slug),
+      );
       return {
         jsonrpc: "2.0",
         id,
@@ -1069,9 +1470,10 @@ export async function openclawPairRoute(
               type: "text",
               text: JSON.stringify({
                 ok: true,
-                collections,
+                collections: scopedCollections,
+                authorityMode: connection.authorityMode,
                 activeTurn,
-                paired: Boolean(connection),
+                paired: true,
               }),
             },
           ],
@@ -1084,52 +1486,92 @@ export async function openclawPairRoute(
   const action = cleanText(input.action, 40);
   if (action) {
     const connection = await loadConnection(ctx);
-    const token = cleanText(input.sessionToken, 300) ?? cleanText(input.gatewayToken, 300);
-    if (!connection || !token || token !== connection.gatewayToken) {
+    const token =
+      extractSessionTokenHeader(route) ??
+      cleanText(input.sessionToken, 300) ??
+      cleanText(input.gatewayToken, 300);
+    if (!connection || !token || !constantTimeEqual(token, connection.gatewayToken)) {
       return {
         ok: false,
         error: "UNAUTHORIZED_SESSION",
-        message: "Pass the sessionToken returned when pairing.",
+        message:
+          "Pass the paired sessionToken via X-OpenClaw-Token: <sessionToken> header or JSON sessionToken (Authorization: Bearer <sessionToken> is also accepted on the native profile).",
       };
     }
     if (action === "poll_turn") {
-      const activeTurn = await loadActiveTurn(ctx);
-      return { ok: true, agentId: connection.agentId, activeTurn, collections };
+      const activeTurn = await pollPairedAgentTurn(ctx);
+      const scopedCollections = collections.filter(c =>
+        connection.enabledCollections.includes(c.slug),
+      );
+      return {
+        ok: true,
+        agentId: connection.agentId,
+        authorityMode: connection.authorityMode,
+        activeTurn,
+        collections: scopedCollections,
+      };
     }
     if (action === "complete_turn") {
-      const reply = cleanText(input.reply, 2000) ?? "Completed.";
-      const activeTurn = await loadActiveTurn(ctx);
-      if (ctx.kv) {
-        await ctx.kv.set("active_turn", {
-          turnId: activeTurn?.turnId ?? `turn_${Date.now()}`,
-          prompt: activeTurn?.prompt ?? "",
-          status: "completed",
-          lastUpdate: reply,
-        });
-      }
-      return { ok: true, status: "completed", reply };
+      return completePairedAgentTurn(ctx, connection, {
+        turnId: input.turnId,
+        reply: input.reply,
+      });
     }
     if (action === "propose" && ctx.kv) {
-      const proposals = await loadProposals(ctx);
+      const targetCollection = cleanText(input.collection, 60);
+      const targetEntryId = cleanText(input.entryId, 80);
+      const proposedFields = extractSafeExternalFields(input.proposedFields);
+      const policyError = validateExternalProposalSubmission(
+        connection,
+        targetCollection,
+        targetEntryId,
+        proposedFields,
+      );
+      if (policyError) {
+        return {
+          ok: false,
+          error: policyError.code,
+          message: policyError.message,
+        };
+      }
       const proposal: PendingProposal = {
-        proposalId: `prop_${Date.now()}`,
+        proposalId: `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         agentId: connection.agentId,
-        collection: cleanText(input.collection, 60),
-        entryId: cleanText(input.entryId, 80),
+        collection: targetCollection,
+        entryId: targetEntryId,
         summary: cleanText(input.summary, 300) ?? "Proposed content update",
         targetTool: cleanText(input.targetTool, 80) ?? "content:update",
+        ...(proposedFields ? { proposedFields } : {}),
         createdAt: new Date().toISOString(),
       };
-      proposals.push(proposal);
-      await ctx.kv.set("pending_proposals", proposals);
+      await withOpenClawStorageLock("proposals", async () => {
+        const proposals = await loadProposals(ctx);
+        proposals.push(proposal);
+        await ctx.kv!.set("pending_proposals", proposals);
+      });
+      publishOpenClawEvent({
+        type: "workspace_sync",
+        conversationId: "conv_default",
+        reason: "external_agent_proposal",
+        timestamp: new Date().toISOString(),
+        visibility: "shared",
+      });
       return { ok: true, proposal };
     }
   }
 
-  // 3. 1-Step Pairing via one-time pairingCode (gatewayUrl and gatewayToken are optional!)
+  // 3. 1-Step Pairing via admin-minted one-time pairingCode (never mints on unauthenticated requests)
   const pairingCode = cleanText(input.pairingCode, 120);
-  const expectedCode = await loadOrCreatePairingCode(ctx);
-  if (!pairingCode || pairingCode !== expectedCode) {
+  const storedCode = ctx.kv ? await ctx.kv.get("pairing_code") : null;
+  const expiresAt = ctx.kv ? await ctx.kv.get("pairing_code_expires_at") : null;
+  const isExpired =
+    typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= Date.now();
+  if (
+    !pairingCode ||
+    typeof storedCode !== "string" ||
+    isExpired ||
+    !constantTimeEqual(pairingCode, storedCode)
+  ) {
     return {
       ok: false,
       error: "INVALID_PAIRING_CODE",
@@ -1138,22 +1580,42 @@ export async function openclawPairRoute(
   }
 
   const rawGatewayUrl = cleanText(input.gatewayUrl, 300);
+  if (rawGatewayUrl && hasEmbeddedUrlCredentials(rawGatewayUrl)) {
+    return {
+      ok: false,
+      error: "INVALID_GATEWAY_URL",
+      message: "Gateway URL must not embed username or password credentials.",
+    };
+  }
   const gatewayUrl =
-    rawGatewayUrl && rawGatewayUrl.startsWith("https://")
-      ? rawGatewayUrl
+    rawGatewayUrl &&
+    (rawGatewayUrl.startsWith("https://") ||
+      rawGatewayUrl.startsWith("wss://") ||
+      rawGatewayUrl.startsWith("ws://127.0.0.1:") ||
+      rawGatewayUrl.startsWith("ws://localhost:"))
+      ? sanitizeAdminPublicUrl(rawGatewayUrl)
       : "https://agent-session.openclaw.local";
-  const agentId = cleanText(input.agentId, 80) ?? "openclaw";
-  const sessionToken =
-    cleanText(input.gatewayToken, 300) ??
-    `oc_sess_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+  const explicitAgentId = cleanText(input.agentId, 80);
+  if (explicitAgentId !== undefined && !/[a-z0-9]/i.test(explicitAgentId)) {
+    return {
+      ok: false,
+      error: "INVALID_AGENT_ID",
+      message: "OpenClaw agentId must contain at least one alphanumeric character.",
+    };
+  }
+  const agentId = explicitAgentId ?? "openclaw";
+  const sessionToken = cleanText(input.gatewayToken, 300) ?? csprngToken("oc_sess_", 20);
   const authorityMode =
     input.authorityMode === "read_only" ? "read_only" : "propose_with_approval";
 
+  const pairedAgentPoll = gatewayUrl === "https://agent-session.openclaw.local";
   const nextConnection: OpenClawConnection = {
     gatewayUrl,
     agentId,
     gatewayToken: sessionToken,
     authorityMode,
+    allowGatewayExecApprovals: false,
+    ...(pairedAgentPoll ? { pairedAgentPoll: true } : {}),
     enabledCollections: collections.map(col => col.slug),
   };
 
@@ -1163,7 +1625,20 @@ export async function openclawPairRoute(
     existing?.revision ?? null,
     JSON.stringify(nextConnection),
   );
+  if (!pairedAgentPoll) {
+    await cancelAllPairedAgentTurns(
+      ctx,
+      "Paired direct Gateway URL; pending polling turns were cancelled.",
+    );
+  }
   await rotatePairingCode(ctx);
+  publishOpenClawEvent({
+    type: "workspace_sync",
+    conversationId: "conv_catalog_overview",
+    reason: "agent_paired",
+    timestamp: new Date().toISOString(),
+    visibility: "shared",
+  });
 
   return {
     ok: true,
@@ -1171,6 +1646,7 @@ export async function openclawPairRoute(
     agentId,
     authorityMode,
     sessionToken,
+    authHeader: "X-OpenClaw-Token",
     mcpEndpoint: endpointUrl,
     agentEndpoint: endpointUrl,
     collections: collections.map(col => col.slug),
