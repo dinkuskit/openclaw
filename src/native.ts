@@ -18,11 +18,29 @@ function adaptNativeHandler<T>(
     fn(routeCtx as SandboxedRouteContext, routeCtx as PluginContext);
 }
 
+const OPENCLAW_ADMIN_PAGES = [
+  {
+    path: "/openclaw",
+    label: "OpenClaw",
+    icon: "bot",
+    group: "OpenClaw",
+  },
+];
+
+const OPENCLAW_SETTINGS_SCHEMA = {
+  connection: {
+    type: "secret" as const,
+    label: "OpenClaw gateway connection",
+    description:
+      "Encrypted OpenClaw gateway endpoint, agent ID, bearer token, and enabled content collections. Managed on the OpenClaw page.",
+  },
+};
+
 /**
  * Trusted in-process EmDash plugin factory for the interactive OpenClaw
  * Control-UI × Antigravity 2.0 native harness.
  */
-export function createPlugin(): ResolvedPlugin {
+export function createPlugin(options: OpenClawNativePluginOptions = {}): ResolvedPlugin {
   return {
     id: "dinkus-openclaw",
     version: "0.0.0",
@@ -37,7 +55,11 @@ export function createPlugin(): ResolvedPlugin {
     storage: {},
     hooks: {},
     mcp: { tools: {} },
-    admin: {},
+    admin: {
+      entry: options.adminEntry ?? "@dinkuskit/openclaw/admin",
+      pages: OPENCLAW_ADMIN_PAGES,
+      settingsSchema: OPENCLAW_SETTINGS_SCHEMA,
+    },
     routes: {
       admin: {
         public: false,
@@ -73,28 +95,17 @@ export function createPlugin(): ResolvedPlugin {
  */
 export function openclawNativePlugin(
   options: OpenClawNativePluginOptions = {},
-): PluginDescriptor {
+): PluginDescriptor<OpenClawNativePluginOptions> {
+  const adminEntry = options.adminEntry ?? "@dinkuskit/openclaw/admin";
   return {
     id: "dinkus-openclaw",
     version: "0.0.0",
     format: "native",
     entrypoint: options.entrypoint ?? "@dinkuskit/openclaw/native",
-    adminEntry: options.adminEntry ?? "@dinkuskit/openclaw/admin",
-    adminPages: [
-      {
-        path: "/openclaw",
-        label: "OpenClaw",
-        icon: "bot",
-      },
-    ],
-    settingsSchema: {
-      connection: {
-        type: "secret",
-        label: "OpenClaw gateway connection",
-        description:
-          "Encrypted OpenClaw gateway endpoint, agent ID, bearer token, and enabled content collections. Managed on the OpenClaw page.",
-      },
-    },
+    adminEntry,
+    options: { adminEntry },
+    adminPages: OPENCLAW_ADMIN_PAGES,
+    settingsSchema: OPENCLAW_SETTINGS_SCHEMA,
   };
 }
 

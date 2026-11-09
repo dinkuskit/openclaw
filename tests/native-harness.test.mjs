@@ -99,12 +99,21 @@ test("native descriptor and createPlugin preserve dinkus-openclaw /openclaw URL 
   assert.equal(descriptor.id, "dinkus-openclaw");
   assert.equal(descriptor.format, "native");
   assert.equal(descriptor.adminPages?.[0]?.path, "/openclaw");
+  assert.equal(descriptor.settingsSchema?.connection?.type, "secret");
 
-  const resolved = createPlugin();
+  const resolved = createPlugin(descriptor.options);
   assert.equal(resolved.id, "dinkus-openclaw");
+  assert.equal(resolved.admin.entry, "@dinkuskit/openclaw/admin");
+  assert.equal(resolved.admin.pages?.[0]?.path, "/openclaw");
+  assert.equal(resolved.admin.settingsSchema?.connection?.type, "secret");
   assert.ok(resolved.routes.chat);
   assert.ok(resolved.routes.pair);
   assert.ok(!resolved.capabilities.includes("content:write"));
+
+  const customDescriptor = openclawNativePlugin({ adminEntry: "@acme/custom-openclaw-admin" });
+  const customResolved = createPlugin(customDescriptor.options);
+  assert.equal(customResolved.admin.entry, "@acme/custom-openclaw-admin");
+  assert.equal(customResolved.admin.settingsSchema?.connection?.type, "secret");
 
   const reactAdminBundle = fs.readFileSync(
     new URL("../dist/admin.mjs", import.meta.url),
