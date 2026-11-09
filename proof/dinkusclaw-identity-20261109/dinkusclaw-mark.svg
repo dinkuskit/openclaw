@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" fill="none">
+  <!-- DinkusClaw Vector Mark — Minimalist Geometric Cyber-Claw -->
+  <path d="M16 4C10.477 4 6 8.477 6 14C6 18.5 9 22.3 13 23.6V27C13 27.552 13.448 28 14 28H18C18.552 28 19 27.552 19 27V23.6C23 22.3 26 18.5 26 14C26 8.477 21.523 4 16 4Z" fill="#16161A"/>
+  <!-- Left Pincer Blade -->
+  <path d="M8 13C8 8.5 11.5 5 16 5C14 8 13 11 13 15C10.5 15 8 14 8 13Z" fill="#FF2A2A"/>
+  <!-- Right Pincer Blade -->
+  <path d="M24 13C24 8.5 20.5 5 16 5C18 8 19 11 19 15C21.5 15 24 14 24 13Z" fill="#FF2A2A"/>
+  <!-- Central Aperture / Visor Iris -->
+  <circle cx="16" cy="14" r="3" fill="#16161A" stroke="#00F0FF" stroke-width="1.5"/>
+  <circle cx="16" cy="14" r="1.2" fill="#FF2A2A"/>
+  <!-- Outer Stroke -->
+  <path d="M16 4C10.477 4 6 8.477 6 14C6 18.5 9 22.3 13 23.6V27C13 27.552 13.448 28 14 28H18C18.552 28 19 27.552 19 27V23.6C23 22.3 26 18.5 26 14C26 8.477 21.523 4 16 4Z" stroke="#FF2A2A" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>
