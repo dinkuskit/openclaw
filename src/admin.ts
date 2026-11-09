@@ -250,9 +250,10 @@ export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string)
     `       "authorityMode": "propose_with_approval"`,
     `     }'`,
     ``,
-    `2. The JSON response returns your sessionToken`,
-    `   and built-in MCP / agent endpoint at:`,
-    `   ${pairEndpoint}`,
+    `2. The JSON response returns your sessionToken.`,
+    `   Authenticate follow-up MCP / REST requests with`,
+    `   -H "X-OpenClaw-Token: <sessionToken>" (or JSON "sessionToken")`,
+    `   at: ${pairEndpoint}`,
     `3. Reply once paired so I can click`,
     `   "Check pairing status" in EmDash.`,
   ].join("\n");
@@ -725,19 +726,40 @@ function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-function extractBearerHeader(route: SandboxedRouteContext): string | undefined {
-  const headers = (route as unknown as { request?: { headers?: unknown } }).request?.headers;
+function readRequestHeader(headers: unknown, headerNameLower: string): string | undefined {
   if (!headers) return undefined;
-  let authVal: string | null | undefined;
   if (typeof (headers as { get?: unknown }).get === "function") {
-    authVal = (headers as { get: (k: string) => string | null }).get("authorization");
-  } else if (typeof headers === "object") {
-    const rec = headers as Record<string, unknown>;
-    const raw = rec.authorization ?? rec.Authorization;
-    if (typeof raw === "string") authVal = raw;
+    const val = (headers as { get: (k: string) => string | null }).get(headerNameLower);
+    return typeof val === "string" ? val : undefined;
   }
+  if (typeof headers === "object") {
+    for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+      if (key.toLowerCase() === headerNameLower && typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractSessionTokenHeader(route: SandboxedRouteContext): string | undefined {
+  const headers =
+    (route as unknown as { request?: { headers?: unknown }; headers?: unknown }).request?.headers ??
+    (route as unknown as { headers?: unknown }).headers;
+  if (!headers) return undefined;
+
+  // Primary header: `X-OpenClaw-Token` survives EmDash 1.4.0 `sanitizeHeadersForSandbox`
+  // (which strips `Authorization` before sandbox route dispatch) and works on native too.
+  const openclawHeader = readRequestHeader(headers, "x-openclaw-token");
+  if (typeof openclawHeader === "string") {
+    const normalized = cleanText(openclawHeader.replace(/^Bearer\s+/i, "").trim(), 300);
+    if (normalized) return normalized;
+  }
+
+  // Native-profile compatibility: retain `Authorization: Bearer <sessionToken>`.
+  const authVal = readRequestHeader(headers, "authorization");
   if (typeof authVal === "string" && /^Bearer\s+/i.test(authVal)) {
-    return authVal.replace(/^Bearer\s+/i, "").trim() || undefined;
+    return cleanText(authVal.replace(/^Bearer\s+/i, "").trim(), 300);
   }
   return undefined;
 }
@@ -1271,6 +1293,11 @@ export async function openclawPairRoute(
       return { jsonrpc: "2.0", id, result: {} };
     }
     if (input.method === "tools/list") {
+      const sessionTokenProp = {
+        type: "string",
+        description:
+          "Paired sessionToken (optional when passed via the X-OpenClaw-Token header).",
+      };
       return {
         jsonrpc: "2.0",
         id,
@@ -1279,7 +1306,10 @@ export async function openclawPairRoute(
             {
               name: "emdash_status",
               description: "Inspect paired EmDash site collections and active turn.",
-              inputSchema: { type: "object", properties: {} },
+              inputSchema: {
+                type: "object",
+                properties: { sessionToken: sessionTokenProp },
+              },
             },
             {
               name: "emdash_complete_turn",
@@ -1290,6 +1320,7 @@ export async function openclawPairRoute(
                 properties: {
                   turnId: { type: "string", minLength: 1, maxLength: 120 },
                   reply: { type: "string", minLength: 1, maxLength: 32000 },
+                  sessionToken: sessionTokenProp,
                 },
                 required: ["reply"],
               },
@@ -1305,6 +1336,7 @@ export async function openclawPairRoute(
                   collection: { type: "string" },
                   entryId: { type: "string" },
                   proposedFields: { type: "object" },
+                  sessionToken: sessionTokenProp,
                 },
                 required: ["summary"],
               },
@@ -1325,7 +1357,7 @@ export async function openclawPairRoute(
           : {};
       const connection = await loadConnection(ctx);
       const suppliedToken =
-        extractBearerHeader(route) ??
+        extractSessionTokenHeader(route) ??
         cleanText(params.sessionToken, 300) ??
         cleanText(args.sessionToken, 300) ??
         cleanText(input.sessionToken, 300);
@@ -1339,7 +1371,8 @@ export async function openclawPairRoute(
           id,
           error: {
             code: -32001,
-            message: "UNAUTHORIZED_SESSION: Pass Authorization: Bearer <sessionToken> or sessionToken.",
+            message:
+              "UNAUTHORIZED_SESSION: Pass X-OpenClaw-Token: <sessionToken> header or sessionToken in JSON params/arguments (Authorization: Bearer <sessionToken> is also accepted on the native profile).",
           },
         };
       }
@@ -1447,14 +1480,15 @@ export async function openclawPairRoute(
   if (action) {
     const connection = await loadConnection(ctx);
     const token =
-      extractBearerHeader(route) ??
+      extractSessionTokenHeader(route) ??
       cleanText(input.sessionToken, 300) ??
       cleanText(input.gatewayToken, 300);
     if (!connection || !token || !constantTimeEqual(token, connection.gatewayToken)) {
       return {
         ok: false,
         error: "UNAUTHORIZED_SESSION",
-        message: "Pass the sessionToken returned when pairing.",
+        message:
+          "Pass the paired sessionToken via X-OpenClaw-Token: <sessionToken> header or JSON sessionToken (Authorization: Bearer <sessionToken> is also accepted on the native profile).",
       };
     }
     if (action === "poll_turn") {
@@ -1604,6 +1638,7 @@ export async function openclawPairRoute(
     agentId,
     authorityMode,
     sessionToken,
+    authHeader: "X-OpenClaw-Token",
     mcpEndpoint: endpointUrl,
     agentEndpoint: endpointUrl,
     collections: collections.map(col => col.slug),

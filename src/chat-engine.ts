@@ -143,7 +143,7 @@ export function buildPairingPromptString(siteOrigin: string, pairingCode: string
     ``,
     `1. Run this curl command:`,
     `   ${buildPairingCommandString(siteOrigin, pairingCode)}`,
-    `2. Use the returned sessionToken (Authorization: Bearer <sessionToken>) with MCP / REST at:`,
+    `2. Authenticate follow-up MCP / REST requests with -H "X-OpenClaw-Token: <sessionToken>" (or JSON "sessionToken"; Authorization: Bearer <sessionToken> is also accepted on the native profile) at:`,
     `   ${pairEndpoint}`,
     `3. Poll native chat prompts with {"action":"poll_turn"} (or MCP emdash_status) and deliver replies with {"action":"complete_turn","turnId":"<turnId>","reply":"..."} (or MCP emdash_complete_turn).`,
   ].join("\n");

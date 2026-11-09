@@ -30,6 +30,31 @@ import {
 } from "./emdash-client.js";
 import { OPENCLAW_HARNESS_CSS } from "./styles.js";
 
+export function restoreComposerDraftOnSendFailure(
+  draftsByConv: Record<string, string>,
+  originConvKey: string,
+  currentActiveConvKey: string,
+  rawDraft: string,
+): {
+  draftsByConv: Record<string, string>;
+  restoreKey: string;
+  restored: boolean;
+} {
+  const restoreKey =
+    originConvKey === "__default__" && currentActiveConvKey !== "__default__"
+      ? currentActiveConvKey
+      : originConvKey;
+  const newerDraft = draftsByConv[restoreKey] ?? "";
+  if (newerDraft.length > 0) {
+    return { draftsByConv, restoreKey, restored: false };
+  }
+  return {
+    draftsByConv: { ...draftsByConv, [restoreKey]: rawDraft },
+    restoreKey,
+    restored: true,
+  };
+}
+
 export interface OpenClawChatElementProps {
   surface: "admin-page" | "editor-panel";
   collection?: string;
@@ -676,18 +701,25 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
   const sendPrompt = async (overridePrompt?: string, isSteer = false) => {
     const convKey = activeConvKey();
-    const text = (overridePrompt ?? composerText()).trim();
+    const usedComposerDraft = overridePrompt === undefined;
+    const rawDraft = usedComposerDraft ? composerText() : undefined;
+    const text = (overridePrompt ?? rawDraft ?? "").trim();
     if (!text) return;
     if (text === "/pair") {
-      setComposerText("", convKey);
+      if (usedComposerDraft) {
+        setComposerText("", convKey);
+        if (textareaRef) textareaRef.style.height = "38px";
+      }
       setActiveSheet("pairing");
       return;
     }
 
     const targetConversationId = snapshot()?.activeConversationId;
     const targetBoundEntry = effectiveBoundEntry();
-    setComposerText("", convKey);
-    if (textareaRef) textareaRef.style.height = "38px";
+    if (usedComposerDraft) {
+      setComposerText("", convKey);
+      if (textareaRef) textareaRef.style.height = "38px";
+    }
     stickToBottom = true;
 
     if (isSteer) {
@@ -735,6 +767,24 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
         scrollTranscriptToBottom(true);
       }
     } catch (err) {
+      if (rawDraft !== undefined) {
+        let restoredActive = false;
+        setComposerByConv(prev => {
+          const outcome = restoreComposerDraftOnSendFailure(
+            prev,
+            convKey,
+            activeConvKey(),
+            rawDraft,
+          );
+          restoredActive = outcome.restored && activeConvKey() === outcome.restoreKey;
+          return outcome.draftsByConv;
+        });
+        if (restoredActive && textareaRef) {
+          textareaRef.value = rawDraft;
+          textareaRef.style.height = "38px";
+          textareaRef.style.height = `${Math.min(150, textareaRef.scrollHeight)}px`;
+        }
+      }
       setErrorBanner(err instanceof Error ? err.message : "Failed to send message");
     } finally {
       if (isSteer) {
@@ -2296,8 +2346,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                   }
                 >
                   <div style={{ "font-size": "12px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
-                    Paste into RoboClaw, OpenClaw CLI, Codex, or Claude Code to mint a Bearer session
-                    token for authenticated EmDash MCP inspection & proposal staging:
+                    Paste into RoboClaw, OpenClaw CLI, Codex, or Claude Code to mint a scoped sessionToken
+                    (sent via X-OpenClaw-Token or JSON sessionToken) for authenticated EmDash MCP inspection &
+                    proposal staging:
                   </div>
                   <div class="oc-code-copy">{snapshot()?.pairingCommand}</div>
                   <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>

@@ -60,6 +60,7 @@ export function redactGatewaySecrets(text: string): string {
   return text
     .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s"']+)@/gi, "$1[REDACTED]@")
     .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/(X-OpenClaw-Token\s*:\s*)[^\s"']+/gi, "$1[REDACTED]")
     .replace(
       /([?&#](?:token|bootstrapToken|deviceToken|password|secret|apiKey|api_key|access_token|auth)=)[^&#\s"']+/gi,
       "$1[REDACTED]",

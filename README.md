@@ -52,7 +52,7 @@ Capability-gated sandboxed Registry plugin (`backend.js` ~52 KiB, well under EmD
    - **OpenClaw Gateway Execution Approvals (`Gateway Approval · exec | plugin | system-agent`):** Permission to edit CMS content **never** grants Gateway execution approval authority. Execution approvals render as read-only handoff cards (`Review in Gateway Control UI ↗`) unless the viewer is a **Site Administrator (`role >= 50`)**, explicit `allowGatewayExecApprovals` opt-in is enabled, and the Gateway connection holds `operator.approvals` scope.
 3. **Per-User Thread Isolation & Hardened MCP Pairing (`src/admin.ts`, `src/stream-endpoint.ts`):**
    - Conversations default to `visibility: "personal"` (`ownerUserId`-scoped in both workspace snapshots and live SSE streams) with an explicit topbar `🔒 Personal` / `👥 Shared` toggle.
-   - Public `/pair` requires a CSPRNG 15-minute admin pairing code to mint a Bearer `sessionToken`, and MCP `tools/call` enforces `Authorization: Bearer <sessionToken>`.
+   - Public `/pair` requires a CSPRNG 15-minute admin pairing code to mint a scoped `sessionToken`, and MCP `tools/call` / REST polling enforce `X-OpenClaw-Token: <sessionToken>` or JSON `sessionToken` (with `Authorization: Bearer <sessionToken>` also accepted on the native profile).
 
 ## Verification
 

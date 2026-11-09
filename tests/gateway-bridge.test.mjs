@@ -728,6 +728,22 @@ test("Gateway v4 WebSocket bridge streams turns, parses emdash-proposal, enforce
     );
     assert.ok(authMcp.result);
 
+    const openclawHeaderMcp = await pair(
+      makeCtx({
+        role: 0,
+        sharedSettings,
+        sharedKv,
+        headers: { "x-openclaw-token": "oc_live_secret_bootstrap_999" },
+        input: {
+          jsonrpc: "2.0",
+          id: 7801,
+          method: "tools/call",
+          params: { name: "openclaw_list_collections", arguments: {} },
+        },
+      }),
+    );
+    assert.ok(openclawHeaderMcp.result);
+
     // 7. External `/pair` proposals submitted AFTER `revision_proposals_v2` exists are ingested,
     //    visible to any admin via `conv_default`, and summary-only imports cannot vacuously apply!
     await pair(

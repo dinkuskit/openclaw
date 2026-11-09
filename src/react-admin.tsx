@@ -1,6 +1,11 @@
 import * as React from "react";
 import type { OpenClawChatElementProps } from "./ui/openclaw-chat-element.js";
-import { registerOpenClawChatElement } from "./ui/openclaw-chat-element.js";
+import {
+  registerOpenClawChatElement,
+  restoreComposerDraftOnSendFailure,
+} from "./ui/openclaw-chat-element.js";
+
+export { restoreComposerDraftOnSendFailure };
 
 interface HostElement extends HTMLElement {
   onToggleEmdashNav?: () => void;

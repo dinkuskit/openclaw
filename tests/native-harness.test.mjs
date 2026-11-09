@@ -1943,4 +1943,56 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
     stoppedThread.messages.some(m => m.content.includes("Late reply that must be rejected")),
     false,
   );
+  assert.match(afterStoppedCheck.pairingPrompt, /X-OpenClaw-Token/);
+
+  // Verify compiled native chat bundle restores unsent composer drafts on failed send
+  // without overwriting newer input or cross-contaminating switched conversations.
+  const hadWindow = "window" in globalThis;
+  const prevWindow = globalThis.window;
+  let adminModule;
+  try {
+    if (!hadWindow) {
+      globalThis.window = { document: { addEventListener() {} } };
+    }
+    adminModule = await import("../dist/admin.mjs");
+  } finally {
+    if (!hadWindow) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+  assert.equal(typeof adminModule.restoreComposerDraftOnSendFailure, "function");
+
+  const restoredEmpty = adminModule.restoreComposerDraftOnSendFailure(
+    { [convId]: "" },
+    convId,
+    convId,
+    "Line 1\nLine 2 unsent prompt",
+  );
+  assert.equal(restoredEmpty.restored, true);
+  assert.equal(restoredEmpty.draftsByConv[convId], "Line 1\nLine 2 unsent prompt");
+
+  const preservedNewer = adminModule.restoreComposerDraftOnSendFailure(
+    { [convId]: "Newer draft typed while request was in flight" },
+    convId,
+    convId,
+    "Older failed prompt",
+  );
+  assert.equal(preservedNewer.restored, false);
+  assert.equal(
+    preservedNewer.draftsByConv[convId],
+    "Newer draft typed while request was in flight",
+  );
+
+  const switchedConv = adminModule.restoreComposerDraftOnSendFailure(
+    { [convId]: "", conv_other: "Draft in second thread" },
+    convId,
+    "conv_other",
+    "Unsent prompt in original thread",
+  );
+  assert.equal(switchedConv.restored, true);
+  assert.equal(switchedConv.restoreKey, convId);
+  assert.equal(switchedConv.draftsByConv[convId], "Unsent prompt in original thread");
+  assert.equal(switchedConv.draftsByConv.conv_other, "Draft in second thread");
 });
