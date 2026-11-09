@@ -8,6 +8,7 @@ import pluginSandbox from "../dist/plugin.mjs";
 import {
   applyRevisionProposal,
   connectOpenClawEventStream,
+  ensureProposalBaseRevs,
   fetchLiveEntryWithRev,
   reconcileUnknownProposal,
 } from "../.tmp/solid-build/emdash-client.mjs";
@@ -900,6 +901,24 @@ test("browser emdash-client preserves /compare staged drafts, enforces revision 
     );
     assert.equal(putPayloads.length, 1, "Stale tab must never dispatch PUT");
 
+    // 3b. Stale `ensureProposalBaseRevs` / `record_proposal_receipt(status: "conflict")`
+    //     after another tab rejected, superseded, or applied a proposal must NEVER reopen it!
+    await ensureProposalBaseRevs(
+      [{ ...staleProposal, baseRev: "v3:rev_d3", status: "pending" }],
+      turn.activeConversationId,
+    );
+    const staleConflictOnRejected = await chat(
+      makeEmDash140Ctx({
+        action: "record_proposal_receipt",
+        conversationId: turn.activeConversationId,
+        proposalId: "prop_stale_tab_1",
+        status: "conflict",
+        conflictRev: "emdash_rev_after_edit",
+      }),
+    );
+    assert.equal(staleConflictOnRejected.ok, false);
+    assert.equal(staleConflictOnRejected.error, "PROPOSAL_ALREADY_FINALIZED");
+
     // 4. Interrupted `applying` save on EmDash 1.4.0 published draft reconciles via /compare!
     const interruptedProp = {
       ...staleProposal,
@@ -916,6 +935,33 @@ test("browser emdash-client preserves /compare staged drafts, enforces revision 
       p => p.proposalId === "prop_interrupted_1",
     );
     assert.equal(reconciledItem.status, "applied");
+
+    // Once `applied`, a late conflict receipt from another tab cannot overwrite `applied`!
+    const staleConflictOnApplied = await chat(
+      makeEmDash140Ctx({
+        action: "record_proposal_receipt",
+        conversationId: turn.activeConversationId,
+        proposalId: "prop_interrupted_1",
+        status: "conflict",
+        conflictRev: "emdash_rev_999",
+      }),
+    );
+    assert.equal(staleConflictOnApplied.ok, false);
+    assert.equal(staleConflictOnApplied.error, "PROPOSAL_ALREADY_FINALIZED");
+    const checkStillFinalized = await chat(
+      makeEmDash140Ctx({
+        action: "get_workspace",
+        conversationId: turn.activeConversationId,
+      }),
+    );
+    assert.equal(
+      checkStillFinalized.proposals.find(p => p.proposalId === "prop_stale_tab_1")?.status,
+      "rejected",
+    );
+    assert.equal(
+      checkStillFinalized.proposals.find(p => p.proposalId === "prop_interrupted_1")?.status,
+      "applied",
+    );
   } finally {
     globalThis.fetch = origFetch;
   }

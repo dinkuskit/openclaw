@@ -3311,7 +3311,37 @@ export async function openclawChatRoute(
           };
         }
 
+        const isFinalizedProposal =
+          target.status === "applied" ||
+          target.status === "rejected" ||
+          target.status === "superseded";
+
         if (action === "record_proposal_receipt") {
+          const validReceiptStatuses = new Set<ProposalLifecycleStatus>([
+            "applied",
+            "conflict",
+            "failed",
+            "outcome_unknown",
+            "rejected",
+          ]);
+          if (!statusRaw || !validReceiptStatuses.has(statusRaw)) {
+            return {
+              error: {
+                ok: false,
+                error: "INVALID_RECEIPT_STATUS",
+                message: "Unsupported proposal receipt status.",
+              },
+            };
+          }
+          if (isFinalizedProposal) {
+            return {
+              error: {
+                ok: false,
+                error: "PROPOSAL_ALREADY_FINALIZED",
+                message: `Proposal cannot transition to "${statusRaw}" because its status is "${target.status}".`,
+              },
+            };
+          }
           if (
             statusRaw === "rejected" &&
             target.status !== "pending" &&
@@ -3327,28 +3357,31 @@ export async function openclawChatRoute(
             };
           }
           if (
-            statusRaw === "applied" &&
-            (target.status === "rejected" || target.status === "superseded")
+            (statusRaw === "conflict" || statusRaw === "failed") &&
+            target.status === "outcome_unknown"
           ) {
             return {
               error: {
                 ok: false,
-                error: "PROPOSAL_NOT_PENDING",
-                message: `Proposal cannot be marked applied because its status is "${target.status}".`,
+                error: "PROPOSAL_RECONCILIATION_REQUIRED",
+                message:
+                  'Proposal save outcome is unknown; reconcile with EmDash before recording a conflict or failure.',
               },
             };
           }
-        } else if (
-          target.status === "rejected" ||
-          target.status === "superseded"
-        ) {
-          return {
-            error: {
-              ok: false,
-              error: "PROPOSAL_NOT_PENDING",
-              message: `Proposal cannot be reconciled because its status is "${target.status}".`,
-            },
-          };
+        } else {
+          if (target.status === "applied") {
+            return { error: null };
+          }
+          if (target.status !== "applying" && target.status !== "outcome_unknown") {
+            return {
+              error: {
+                ok: false,
+                error: "PROPOSAL_NOT_PENDING",
+                message: `Proposal cannot be reconciled because its status is "${target.status}".`,
+              },
+            };
+          }
         }
 
         let verifiedStatus: ProposalLifecycleStatus =
