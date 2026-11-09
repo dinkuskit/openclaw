@@ -68,10 +68,13 @@ const nodeHostExternals = [
   "node:*",
 ];
 
-// 3. Bundle the trusted native EmDash plugin entrypoint (`createPlugin` + `openclawNativePlugin`)
+const workerSafeExternals = ["emdash", "emdash/*", "@emdash-cms/*"];
+
+// 3a. Bundle the Node-only OpenClaw Gateway WebSocket bridge separately so Cloudflare Workers
+// (`workerd`) never statically import Node `ws` or `node:tls` at bundle or module-init time.
 await build({
-  entryPoints: [resolve(root, "src/native.ts")],
-  outfile: resolve(distDir, "native.mjs"),
+  entryPoints: [resolve(root, "src/gateway-bridge.ts")],
+  outfile: resolve(distDir, "gateway-bridge.mjs"),
   bundle: true,
   format: "esm",
   platform: "node",
@@ -79,14 +82,40 @@ await build({
   external: nodeHostExternals,
 });
 
-// 4. Bundle the Astro SSE host bridge integration & stream endpoint
+// 3b. Bundle the trusted native EmDash plugin entrypoint (`createPlugin` + `openclawNativePlugin`)
+await build({
+  entryPoints: [resolve(root, "src/native.ts")],
+  outfile: resolve(distDir, "native.mjs"),
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: ["node22"],
+  define: { __OPENCLAW_WORKERD__: "false" },
+  external: nodeHostExternals,
+});
+
+// 3c. Bundle a pure Web-standard Cloudflare Workers (`workerd`) entrypoint with zero `node:*` or `ws` imports
+await build({
+  entryPoints: [resolve(root, "src/native.ts")],
+  outfile: resolve(distDir, "native.workerd.mjs"),
+  bundle: true,
+  format: "esm",
+  platform: "neutral",
+  mainFields: ["module", "main"],
+  target: ["es2022"],
+  define: { __OPENCLAW_WORKERD__: "true" },
+  external: workerSafeExternals,
+});
+
+// 4. Bundle the Astro SSE host bridge integration & Workers-safe stream endpoint
 await build({
   entryPoints: [resolve(root, "src/astro.ts")],
   outfile: resolve(distDir, "astro.mjs"),
   bundle: true,
   format: "esm",
-  platform: "node",
-  target: ["node22"],
+  platform: "neutral",
+  mainFields: ["module", "main"],
+  target: ["es2022"],
   external: nodeHostExternals,
 });
 
@@ -95,18 +124,28 @@ await build({
   outfile: resolve(distDir, "stream-endpoint.mjs"),
   bundle: true,
   format: "esm",
-  platform: "node",
-  target: ["node22"],
-  external: nodeHostExternals,
+  platform: "neutral",
+  mainFields: ["module", "main"],
+  target: ["es2022"],
+  external: workerSafeExternals,
 });
 
-// 5. Emit lightweight TypeScript declaration shims for `./native`, `./admin`, and `./astro`
+// 5. Emit lightweight TypeScript declaration shims for `./native`, `./admin`, `./astro`, and `./stream-endpoint`
 await writeFile(
   resolve(distDir, "native.d.mts"),
   [
     'import type { PluginDescriptor, ResolvedPlugin } from "emdash";',
     "export interface OpenClawNativePluginOptions { entrypoint?: string; adminEntry?: string; }",
-    "export declare function createPlugin(): ResolvedPlugin;",
+    "export interface AgentTemplateEntry { id: string; name: string; tagline: string; categories: string[]; packageUrl: string; detailUrl: string; installCommand: string; }",
+    'export interface AgentTemplateInstallCommands { templateRef: string; agentId: string; sourceKind: "catalog-slug" | "tarball-url" | "local-path"; packageTarget: string; enableTemplatesCommand: string; validateCommand: string; installCommand: string; harnessCommand: string; pairCommand: string; fullSetupScript: string; }',
+    "export declare const BLOBSTER_CATALOG_URL: string;",
+    "export declare const BLOBSTER_SUBMIT_URL: string;",
+    "export declare const OPENCLAW_ENABLE_TEMPLATES_CMD: string;",
+    "export declare const FEATURED_AGENT_TEMPLATES: AgentTemplateEntry[];",
+    "export declare function buildAgentTemplateInstallCommands(templateRef: string, siteOrigin?: string, pairingCode?: string): AgentTemplateInstallCommands;",
+    "export declare function resolvePlaygroundVisitorHash(route: unknown): Promise<string | undefined>;",
+    "export declare function isNodeGatewayBridgeSupportedRuntime(): boolean;",
+    "export declare function createPlugin(options?: OpenClawNativePluginOptions): ResolvedPlugin;",
     "export declare function openclawNativePlugin(options?: OpenClawNativePluginOptions): PluginDescriptor;",
     "export default createPlugin;",
     "",
@@ -129,6 +168,15 @@ await writeFile(
     "export interface OpenClawBridgeOptions { streamEntrypoint?: string; }",
     "export declare function openclawBridge(options?: OpenClawBridgeOptions): { name: string; hooks: Record<string, unknown> };",
     "export default openclawBridge;",
+    "",
+  ].join("\n"),
+);
+
+await writeFile(
+  resolve(distDir, "stream-endpoint.d.mts"),
+  [
+    "export declare const prerender: false;",
+    "export declare function GET(context: { request: Request; url: URL; locals: Record<string, unknown> }): Promise<Response>;",
     "",
   ].join("\n"),
 );

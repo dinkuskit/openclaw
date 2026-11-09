@@ -51,6 +51,8 @@
     "./sandbox": "./dist/plugin.mjs",
     "./native": {
       "types": "./dist/native.d.mts",
+      "workerd": "./dist/native.workerd.mjs",
+      "worker": "./dist/native.workerd.mjs",
       "default": "./dist/native.mjs"
     },
     "./admin": {
@@ -61,7 +63,10 @@
       "types": "./dist/astro.d.mts",
       "default": "./dist/astro.mjs"
     },
-    "./stream-endpoint": "./dist/stream-endpoint.mjs"
+    "./stream-endpoint": {
+      "types": "./dist/stream-endpoint.d.mts",
+      "default": "./dist/stream-endpoint.mjs"
+    }
   },
   "peerDependencies": {
     "emdash": "1.4.0"

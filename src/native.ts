@@ -1,10 +1,63 @@
 import type { PluginDescriptor, ResolvedPlugin } from "emdash";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
 import { openclawAdmin, openclawEditorPanel, openclawPairRoute } from "./admin.js";
-import { openclawChatRoute } from "./chat-engine.js";
-import { installNodeGatewayBridge } from "./gateway-bridge.js";
+import {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  FEATURED_AGENT_TEMPLATES,
+  OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
+  openclawChatRoute,
+  resolvePlaygroundVisitorHash,
+  type AgentTemplateEntry,
+  type AgentTemplateInstallCommands,
+} from "./chat-engine.js";
 
-installNodeGatewayBridge();
+export {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  FEATURED_AGENT_TEMPLATES,
+  OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
+  resolvePlaygroundVisitorHash,
+  type AgentTemplateEntry,
+  type AgentTemplateInstallCommands,
+};
+
+declare const __OPENCLAW_WORKERD__: boolean | undefined;
+
+export function isNodeGatewayBridgeSupportedRuntime(): boolean {
+  if (typeof __OPENCLAW_WORKERD__ !== "undefined" && __OPENCLAW_WORKERD__) {
+    return false;
+  }
+  const g = globalThis as {
+    navigator?: { userAgent?: string };
+    WebSocketPair?: unknown;
+    process?: { versions?: { node?: string; workerd?: string } };
+  };
+  if (g.navigator?.userAgent?.includes("Cloudflare-Workers")) {
+    return false;
+  }
+  if (typeof g.WebSocketPair === "function") {
+    return false;
+  }
+  if (!g.process?.versions?.node || g.process?.versions?.workerd) {
+    return false;
+  }
+  return true;
+}
+
+if (isNodeGatewayBridgeSupportedRuntime()) {
+  try {
+    const bridgeModuleUrl = new URL("./gateway-" + "bridge.mjs", import.meta.url).href;
+    const mod = (await import(/* @vite-ignore */ bridgeModuleUrl)) as {
+      installNodeGatewayBridge?: () => unknown;
+    };
+    mod.installNodeGatewayBridge?.();
+  } catch {
+    // Non-Node or edge bundler without Node ws gateway client; HTTP & paired-agent transports remain active.
+  }
+}
 
 export interface OpenClawNativePluginOptions {
   entrypoint?: string;

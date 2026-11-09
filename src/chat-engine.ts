@@ -1,23 +1,50 @@
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
 import { getHostGatewayBridge } from "./gateway-bridge-registry.js";
-import type {
-  AutomationRule,
-  BoundEntryRef,
-  CatalogEntrySummary,
-  ChatTurnMessage,
-  ContentFieldDiff,
-  ConversationThread,
-  GatewayApprovalDecision,
-  GatewayBridgeStatus,
-  GatewayExecApproval,
-  OpenClawConnection,
-  OpenClawWorkspaceSnapshot,
-  ProposalLifecycleStatus,
-  RevisionProposal,
-  SiteCollectionSummary,
-  ToolCallTrace,
+import {
+  PLAYGROUND_LOCKED_MESSAGE,
+  extractRouteRuntimeEnv,
+  isPlaygroundLocked,
+  isSameGatewayOrigin,
+  readPlaygroundEnvConfig,
+  resolvePlaygroundConnection,
+  resolvePlaygroundVisitorHash,
+} from "./playground-env.js";
+import {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  FEATURED_AGENT_TEMPLATES,
+  OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
+  type AgentTemplateEntry,
+  type AgentTemplateInstallCommands,
+  type AutomationRule,
+  type BoundEntryRef,
+  type CatalogEntrySummary,
+  type ChatTurnMessage,
+  type ContentFieldDiff,
+  type ConversationThread,
+  type GatewayApprovalDecision,
+  type GatewayBridgeStatus,
+  type GatewayExecApproval,
+  type OpenClawConnection,
+  type OpenClawWorkspaceSnapshot,
+  type ProposalLifecycleStatus,
+  type RevisionProposal,
+  type SiteCollectionSummary,
+  type ToolCallTrace,
 } from "./protocol.js";
 import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
+
+export {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  FEATURED_AGENT_TEMPLATES,
+  OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
+  resolvePlaygroundVisitorHash,
+  type AgentTemplateEntry,
+  type AgentTemplateInstallCommands,
+};
 
 const EDITOR = 40;
 const ADMIN = 50;
@@ -285,77 +312,129 @@ function classifyTransportMode(
 export interface ConnectionSettingsReadState {
   connection: OpenClawConnection | null;
   error?: string;
+  fromPlaygroundEnv?: boolean;
+  playgroundLocked?: boolean;
 }
 
 export async function readConnectionSettingsState(
   ctx: PluginContext,
+  extraEnv?: Record<string, unknown>,
 ): Promise<ConnectionSettingsReadState> {
+  const playgroundCfg = readPlaygroundEnvConfig(extraEnv);
+  const resolveEnvFallback = async (): Promise<OpenClawConnection | null> => {
+    if (!playgroundCfg.gatewayUrl || !playgroundCfg.gatewayToken) {
+      return null;
+    }
+    const fallbackSlugs = playgroundCfg.enabledCollections
+      ? playgroundCfg.enabledCollections
+      : (await listSiteCollections(ctx)).map(c => c.slug);
+    return resolvePlaygroundConnection(fallbackSlugs, extraEnv);
+  };
+
+  if (playgroundCfg.locked && playgroundCfg.gatewayUrl && playgroundCfg.gatewayToken) {
+    const envConn = await resolveEnvFallback();
+    if (envConn) {
+      return {
+        connection: envConn,
+        fromPlaygroundEnv: true,
+        playgroundLocked: true,
+      };
+    }
+  }
+
   let raw: unknown;
+  let readError: string | undefined;
   try {
     raw = await ctx.settings.get("connection");
   } catch {
+    readError =
+      "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.";
+  }
+
+  if (typeof raw === "string" && raw) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
+      const hasStoredCredential =
+        (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
+        (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
+        (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
+      if (
+        typeof parsed.gatewayUrl === "string" &&
+        isSupportedGatewayUrl(parsed.gatewayUrl) &&
+        typeof parsed.agentId === "string" &&
+        parsed.agentId.length > 0 &&
+        typeof parsed.gatewayToken === "string" &&
+        hasStoredCredential
+      ) {
+        return {
+          connection: {
+            gatewayUrl: parsed.gatewayUrl,
+            agentId: parsed.agentId,
+            gatewayToken: parsed.gatewayToken,
+            ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
+              ? { bootstrapToken: parsed.bootstrapToken }
+              : {}),
+            ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
+              ? { deviceToken: parsed.deviceToken }
+              : {}),
+            ...(parsed.deviceIdentity &&
+            typeof parsed.deviceIdentity.deviceId === "string" &&
+            typeof parsed.deviceIdentity.publicKeyPem === "string" &&
+            typeof parsed.deviceIdentity.privateKeyPem === "string"
+              ? { deviceIdentity: parsed.deviceIdentity }
+              : {}),
+            authorityMode:
+              parsed.authorityMode === "propose_with_approval"
+                ? "propose_with_approval"
+                : "read_only",
+            allowGatewayExecApprovals: playgroundCfg.locked
+              ? false
+              : parsed.allowGatewayExecApprovals === true,
+            ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
+            enabledCollections: Array.isArray(parsed.enabledCollections)
+              ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+              : ["pages", "products"],
+          },
+          fromPlaygroundEnv: false,
+          playgroundLocked: playgroundCfg.locked,
+        };
+      }
+    } catch {
+      // Preserve stored encrypted value instead of deleting on parse errors.
+    }
+    readError =
+      "Stored OpenClaw connection settings could not be parsed. Re-save Gateway credentials to replace them.";
+  }
+
+  const envFallback = await resolveEnvFallback();
+  if (envFallback) {
     return {
-      connection: null,
-      error:
-        "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.",
+      connection: envFallback,
+      fromPlaygroundEnv: true,
+      playgroundLocked: playgroundCfg.locked,
     };
   }
-  if (typeof raw !== "string" || !raw) return { connection: null };
-  try {
-    const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
-    const hasStoredCredential =
-      (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
-      (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
-      (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
-    if (
-      typeof parsed.gatewayUrl === "string" &&
-      isSupportedGatewayUrl(parsed.gatewayUrl) &&
-      typeof parsed.agentId === "string" &&
-      parsed.agentId.length > 0 &&
-      typeof parsed.gatewayToken === "string" &&
-      hasStoredCredential
-    ) {
-      return {
-        connection: {
-          gatewayUrl: parsed.gatewayUrl,
-          agentId: parsed.agentId,
-          gatewayToken: parsed.gatewayToken,
-          ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
-            ? { bootstrapToken: parsed.bootstrapToken }
-            : {}),
-          ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
-            ? { deviceToken: parsed.deviceToken }
-            : {}),
-          ...(parsed.deviceIdentity &&
-          typeof parsed.deviceIdentity.deviceId === "string" &&
-          typeof parsed.deviceIdentity.publicKeyPem === "string" &&
-          typeof parsed.deviceIdentity.privateKeyPem === "string"
-            ? { deviceIdentity: parsed.deviceIdentity }
-            : {}),
-          authorityMode:
-            parsed.authorityMode === "propose_with_approval"
-              ? "propose_with_approval"
-              : "read_only",
-          allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
-          ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
-          enabledCollections: Array.isArray(parsed.enabledCollections)
-            ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
-            : ["pages", "products"],
-        },
-      };
-    }
-  } catch {
-    // Preserve stored encrypted value instead of deleting on parse errors.
+
+  if (readError) {
+    return {
+      connection: null,
+      error: readError,
+      fromPlaygroundEnv: false,
+      playgroundLocked: playgroundCfg.locked,
+    };
   }
   return {
     connection: null,
-    error:
-      "Stored OpenClaw connection settings could not be parsed. Re-save Gateway credentials to replace them.",
+    fromPlaygroundEnv: false,
+    playgroundLocked: playgroundCfg.locked,
   };
 }
 
-export async function readConnectionSettings(ctx: PluginContext): Promise<OpenClawConnection | null> {
-  return (await readConnectionSettingsState(ctx)).connection;
+export async function readConnectionSettings(
+  ctx: PluginContext,
+  extraEnv?: Record<string, unknown>,
+): Promise<OpenClawConnection | null> {
+  return (await readConnectionSettingsState(ctx, extraEnv)).connection;
 }
 
 async function persistConnectionSettings(
@@ -380,7 +459,14 @@ async function persistIssuedDeviceCredentials(
   },
 ): Promise<void> {
   const latestState = await readConnectionSettingsState(ctx);
-  if (latestState.error || !latestState.connection) return;
+  if (
+    latestState.error ||
+    !latestState.connection ||
+    latestState.fromPlaygroundEnv ||
+    latestState.playgroundLocked
+  ) {
+    return;
+  }
   if (
     sanitizePublicGatewayUrl(latestState.connection.gatewayUrl) !==
     sanitizePublicGatewayUrl(expectedGatewayUrl)
@@ -1254,12 +1340,20 @@ interface HttpGatewayTurnOptions {
   sessionKey: string;
   priorMessages: ChatTurnMessage[];
   systemContext: string;
+  extraEnv?: Record<string, unknown>;
 }
 
 interface HttpGatewayTurnResult {
   ok: boolean;
   replyText?: string;
   errorMessage?: string;
+}
+
+function sanitizeHttpGatewayErrorMessage(raw: string): string {
+  return raw
+    .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/(CF-Access-Client-Secret\s*:\s*)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/\boc_(?:live|sess|tok|pair|boot|dev)_[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]");
 }
 
 async function tryExternalHttpGatewayTurn(
@@ -1292,12 +1386,35 @@ async function tryExternalHttpGatewayTurn(
   const endpoint = base.endsWith("/v1/chat/completions")
     ? base
     : `${base}/v1/chat/completions`;
-  if (!ctx.http) {
+  const httpFetch = ctx?.http?.fetch
+    ? ctx.http.fetch.bind(ctx.http)
+    : typeof globalThis.fetch === "function"
+      ? globalThis.fetch.bind(globalThis)
+      : null;
+  if (!httpFetch) {
     return {
       ok: false,
-      errorMessage: "HTTP client capability (`ctx.http`) is unavailable in this runtime.",
+      errorMessage:
+        "HTTP client capability (`ctx.http` / `globalThis.fetch`) is unavailable in this runtime.",
     };
   }
+  const playgroundCfg = readPlaygroundEnvConfig(options.extraEnv);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${connection.gatewayToken}`,
+    "x-openclaw-agent-id": connection.agentId,
+    "x-openclaw-scopes": "operator.write",
+    "x-openclaw-session-key": options.sessionKey,
+  };
+  if (
+    playgroundCfg.cfAccessClientId &&
+    playgroundCfg.cfAccessClientSecret &&
+    (!playgroundCfg.gatewayUrl || isSameGatewayOrigin(endpoint, playgroundCfg.gatewayUrl))
+  ) {
+    headers["CF-Access-Client-Id"] = playgroundCfg.cfAccessClientId;
+    headers["CF-Access-Client-Secret"] = playgroundCfg.cfAccessClientSecret;
+  }
+
   const historyMessages = options.priorMessages
     .filter(
       m =>
@@ -1313,14 +1430,11 @@ async function tryExternalHttpGatewayTurn(
     }));
 
   try {
-    const response = await ctx.http.fetch(endpoint, {
+    const response = await httpFetch(endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${connection.gatewayToken}`,
-      },
+      headers,
       body: JSON.stringify({
-        model: `openclaw:${connection.agentId}`,
+        model: `openclaw/${connection.agentId}`,
         user: options.sessionKey,
         stream: false,
         messages: [
@@ -1356,7 +1470,10 @@ async function tryExternalHttpGatewayTurn(
   } catch (err) {
     return {
       ok: false,
-      errorMessage: err instanceof Error ? err.message : "HTTP Gateway request failed.",
+      errorMessage:
+        err instanceof Error
+          ? sanitizeHttpGatewayErrorMessage(err.message)
+          : "HTTP Gateway request failed.",
     };
   }
 }
@@ -1380,22 +1497,43 @@ function parseSessionKeyAgentSegment(sessionKey: string | undefined | null): str
   return normalizeOpenClawAgentSegment(match[1]);
 }
 
-function buildCanonicalSessionKey(agentId: string, conversationId: string): string {
+function buildCanonicalSessionKey(
+  agentId: string,
+  conversationId: string,
+  visitorHash?: string,
+): string {
   const safeAgent = normalizeOpenClawAgentSegment(agentId);
   const safeConv = conversationId.replace(/[^a-zA-Z0-9_-]/g, "");
-  return `agent:${safeAgent}:emdash:${safeConv}`;
+  const scopeSegment = visitorHash ? `pg-${visitorHash}` : "emdash";
+  return `agent:${safeAgent}:${scopeSegment}:${safeConv}`;
 }
 
 function resolveThreadSessionKey(
   thread: Pick<ConversationThread, "conversationId" | "sessionKey" | "agentSessionKeys">,
   agentId: string,
+  visitorHash?: string,
 ): string {
   const targetAgent = normalizeOpenClawAgentSegment(agentId);
-  if (thread.sessionKey && parseSessionKeyAgentSegment(thread.sessionKey) === targetAgent) {
+  if (visitorHash) {
+    const expectedPrefix = `agent:${targetAgent}:pg-${visitorHash}:`;
+    if (thread.sessionKey && thread.sessionKey.startsWith(expectedPrefix)) {
+      return thread.sessionKey;
+    }
+    return buildCanonicalSessionKey(targetAgent, thread.conversationId, visitorHash);
+  }
+  if (
+    thread.sessionKey &&
+    parseSessionKeyAgentSegment(thread.sessionKey) === targetAgent &&
+    !thread.sessionKey.startsWith(`agent:${targetAgent}:pg-`)
+  ) {
     return thread.sessionKey;
   }
   const remembered = thread.agentSessionKeys?.[targetAgent];
-  if (remembered && parseSessionKeyAgentSegment(remembered) === targetAgent) {
+  if (
+    remembered &&
+    parseSessionKeyAgentSegment(remembered) === targetAgent &&
+    !remembered.startsWith(`agent:${targetAgent}:pg-`)
+  ) {
     return remembered;
   }
   return buildCanonicalSessionKey(targetAgent, thread.conversationId);
@@ -1405,9 +1543,11 @@ function bindThreadToAgentSession(
   thread: ConversationThread,
   agentId: string,
   explicitSessionKey?: string,
+  visitorHash?: string,
 ): ConversationThread {
   const targetAgent = normalizeOpenClawAgentSegment(agentId);
-  const sessionKey = explicitSessionKey ?? resolveThreadSessionKey(thread, targetAgent);
+  const sessionKey =
+    explicitSessionKey ?? resolveThreadSessionKey(thread, targetAgent, visitorHash);
   const existingAgent = parseSessionKeyAgentSegment(thread.sessionKey);
   const nextMap: Record<string, string> = {
     ...(thread.agentSessionKeys ?? {}),
@@ -1445,14 +1585,15 @@ function ensureUserThreads(
   collections: SiteCollectionSummary[],
   entriesPreview: CatalogEntrySummary[],
   boundEntry?: BoundEntryRef,
+  visitorHash?: string,
 ): { threads: ConversationThread[]; addedIds: string[]; reboundIds: string[] } {
   const reboundIds: string[] = [];
   let next = allThreads.map(t => {
     if (t.status === "running") return t;
-    const expectedKey = resolveThreadSessionKey(t, agentId);
+    const expectedKey = resolveThreadSessionKey(t, agentId, visitorHash);
     if (t.sessionKey === expectedKey) return t;
     reboundIds.push(t.conversationId);
-    return bindThreadToAgentSession(t, agentId, expectedKey);
+    return bindThreadToAgentSession(t, agentId, expectedKey, visitorHash);
   });
   const addedIds: string[] = [];
 
@@ -1472,7 +1613,7 @@ function ensureUserThreads(
       const convId = next.some(t => t.conversationId === baseConvId)
         ? `${baseConvId}_${csprngId("", 3)}`
         : baseConvId;
-      const sessionKey = buildCanonicalSessionKey(agentId, convId);
+      const sessionKey = buildCanonicalSessionKey(agentId, convId, visitorHash);
       const targetAgent = normalizeOpenClawAgentSegment(agentId);
       addedIds.push(convId);
       next = [
@@ -1511,7 +1652,7 @@ function ensureUserThreads(
     const convId = next.some(t => t.conversationId === baseConvId)
       ? `conv_${currentUserId}_personal_${csprngId("", 3)}`
       : baseConvId;
-    const sessionKey = buildCanonicalSessionKey(agentId, convId);
+    const sessionKey = buildCanonicalSessionKey(agentId, convId, visitorHash);
     const targetAgent = normalizeOpenClawAgentSegment(agentId);
     addedIds.push(convId);
     next = [
@@ -1546,9 +1687,13 @@ export async function buildWorkspaceSnapshot(
   const siteOrigin = resolveRequestOrigin(route, ctx);
   const siteName =
     (ctx as unknown as { site?: { name?: string } }).site?.name ?? "EmDash Store";
-  const pairingCode = isAdmin ? await getOrCreatePairingCode(ctx) : "";
-  const connState = await readConnectionSettingsState(ctx);
+  const extraEnv = extractRouteRuntimeEnv(route) ?? extractRouteRuntimeEnv(ctx);
+  const visitorHash = await resolvePlaygroundVisitorHash(route);
+  const connState = await readConnectionSettingsState(ctx, extraEnv);
   const connection = connState.connection;
+  const playgroundLocked = Boolean(connState.playgroundLocked);
+  const playgroundMode = Boolean(connState.fromPlaygroundEnv || playgroundLocked);
+  const pairingCode = isAdmin && !playgroundLocked ? await getOrCreatePairingCode(ctx) : "";
   const collections = await listSiteCollections(ctx);
 
   const visibleSlugs = connection
@@ -1577,6 +1722,7 @@ export async function buildWorkspaceSnapshot(
     enrichedCollections,
     entriesPreview,
     boundEntry,
+    visitorHash,
   );
   if (initialEnsure.addedIds.length > 0 || initialEnsure.reboundIds.length > 0) {
     allThreads = await mutateThreads(
@@ -1590,6 +1736,7 @@ export async function buildWorkspaceSnapshot(
           enrichedCollections,
           entriesPreview,
           boundEntry,
+          visitorHash,
         );
         const retained = retainThreads(reEnsured.threads, [
           ...protectedIds,
@@ -1639,16 +1786,26 @@ export async function buildWorkspaceSnapshot(
   }
 
   const bridge = getHostGatewayBridge();
-  const gatewayBridge: GatewayBridgeStatus = bridge
-    ? bridge.getStatus(connection)
-    : {
-        available: false,
-        state: "disconnected",
-        grantedScopes: [],
-      };
+  const transportMode = connection ? classifyTransportMode(connection.gatewayUrl) : null;
+  const gatewayBridge: GatewayBridgeStatus =
+    connState.fromPlaygroundEnv && connection && transportMode === "live-gateway"
+      ? {
+          available: true,
+          state: "connected",
+          gatewayUrl: sanitizePublicGatewayUrl(connection.gatewayUrl),
+          grantedScopes: ["operator.write"],
+        }
+      : bridge
+        ? bridge.getStatus(connection)
+        : {
+            available: false,
+            state: "disconnected",
+            grantedScopes: [],
+          };
 
   const canResolveGatewayApprovals =
     isAdmin &&
+    !playgroundLocked &&
     Boolean(connection?.allowGatewayExecApprovals) &&
     gatewayBridge.grantedScopes.includes("operator.approvals");
 
@@ -1662,8 +1819,10 @@ export async function buildWorkspaceSnapshot(
     siteName,
     paired: Boolean(connection),
     pairingCode,
-    pairingCommand: isAdmin ? buildPairingCommandString(siteOrigin, pairingCode) : "",
-    pairingPrompt: isAdmin ? buildPairingPromptString(siteOrigin, pairingCode) : "",
+    pairingCommand:
+      isAdmin && !playgroundLocked ? buildPairingCommandString(siteOrigin, pairingCode) : "",
+    pairingPrompt:
+      isAdmin && !playgroundLocked ? buildPairingPromptString(siteOrigin, pairingCode) : "",
     ...(connState.error ? { settingsError: connState.error } : {}),
     connection: connection
       ? {
@@ -1672,7 +1831,7 @@ export async function buildWorkspaceSnapshot(
           authorityMode: connection.authorityMode,
           allowGatewayExecApprovals: Boolean(connection.allowGatewayExecApprovals),
           enabledCollections: connection.enabledCollections,
-          transportMode: classifyTransportMode(connection.gatewayUrl),
+          transportMode: transportMode ?? classifyTransportMode(connection.gatewayUrl),
         }
       : null,
     gatewayBridge,
@@ -1683,6 +1842,11 @@ export async function buildWorkspaceSnapshot(
     proposals: visibleProposals,
     execApprovals: visibleApprovals,
     automations,
+    agentTemplates: FEATURED_AGENT_TEMPLATES,
+    catalogUrl: BLOBSTER_CATALOG_URL,
+    submitUrl: BLOBSTER_SUBMIT_URL,
+    playgroundMode,
+    playgroundLocked,
     streamEndpoint: "/_emdash/api/openclaw/stream",
   };
 }
@@ -2492,6 +2656,9 @@ export async function openclawChatRoute(
       : undefined;
 
   const preferredConversationId = cleanInputText(input.conversationId, 120);
+  const extraEnv = extractRouteRuntimeEnv(route) ?? extractRouteRuntimeEnv(ctx);
+  const visitorHash = await resolvePlaygroundVisitorHash(route);
+  const playgroundLocked = isPlaygroundLocked(extraEnv);
 
   if (action === "get_workspace") {
     return (await buildWorkspaceSnapshot(
@@ -2500,6 +2667,23 @@ export async function openclawChatRoute(
       preferredConversationId,
       boundEntry,
     )) as unknown as Record<string, unknown>;
+  }
+
+  if (
+    playgroundLocked &&
+    (action === "configure_connection" ||
+      action === "save_settings" ||
+      action === "save_connection" ||
+      action === "disconnect" ||
+      action === "rotate_pairing_code" ||
+      action === "resolve_gateway_approval")
+  ) {
+    return {
+      ok: false,
+      error: "PLAYGROUND_LOCKED",
+      playgroundLocked: true,
+      message: PLAYGROUND_LOCKED_MESSAGE,
+    };
   }
 
   if (action === "rotate_pairing_code" && role >= ADMIN) {
@@ -2512,8 +2696,8 @@ export async function openclawChatRoute(
     )) as unknown as Record<string, unknown>;
   }
 
-  if (action === "configure_connection" && role >= ADMIN) {
-    const existingState = await readConnectionSettingsState(ctx);
+  if ((action === "configure_connection" || action === "save_settings") && role >= ADMIN) {
+    const existingState = await readConnectionSettingsState(ctx, extraEnv);
     const existing = existingState.connection;
     const collections = await listSiteCollections(ctx);
     const bridge = getHostGatewayBridge();
@@ -2652,10 +2836,10 @@ export async function openclawChatRoute(
       let changed = false;
       const next = current.map(t => {
         if (t.status === "running") return t;
-        const expectedKey = resolveThreadSessionKey(t, updated.agentId);
+        const expectedKey = resolveThreadSessionKey(t, updated.agentId, visitorHash);
         if (t.sessionKey === expectedKey) return t;
         changed = true;
-        const rebound = bindThreadToAgentSession(t, updated.agentId, expectedKey);
+        const rebound = bindThreadToAgentSession(t, updated.agentId, expectedKey, visitorHash);
         bridge?.updateSessionAudience(expectedKey, {
           ownerUserId: t.ownerUserId ?? currentUserId,
           visibility: t.visibility ?? "personal",
@@ -2689,7 +2873,7 @@ export async function openclawChatRoute(
   }
 
   if (action === "probe_gateway" && role >= ADMIN) {
-    const connState = await readConnectionSettingsState(ctx);
+    const connState = await readConnectionSettingsState(ctx, extraEnv);
     const connection = connState.connection;
     const bridge = getHostGatewayBridge();
     if (connection && bridge && classifyTransportMode(connection.gatewayUrl) === "gateway-ws") {
@@ -2743,7 +2927,7 @@ export async function openclawChatRoute(
   }
 
   if (action === "create_thread") {
-    const connection = await readConnectionSettings(ctx);
+    const connection = await readConnectionSettings(ctx, extraEnv);
     const collections = await listSiteCollections(ctx);
     const title = cleanInputText(input.title, 120) ?? "New Store Conversation";
     const visibility = input.visibility === "shared" ? "shared" : "personal";
@@ -2753,7 +2937,7 @@ export async function openclawChatRoute(
     const now = new Date().toISOString();
     const convId = csprngId("conv_", 8);
     const initialAgent = connection?.agentId ?? "openclaw";
-    const initialSessionKey = buildCanonicalSessionKey(initialAgent, convId);
+    const initialSessionKey = buildCanonicalSessionKey(initialAgent, convId, visitorHash);
     const newThread: ConversationThread = {
       conversationId: convId,
       ownerUserId: currentUserId,
@@ -2783,7 +2967,7 @@ export async function openclawChatRoute(
   if (action === "toggle_thread_visibility") {
     const targetId = preferredConversationId;
     if (targetId) {
-      const connection = await readConnectionSettings(ctx);
+      const connection = await readConnectionSettings(ctx, extraEnv);
       const bridge = getHostGatewayBridge();
       const forbidden = await mutateThreads(ctx, [targetId], current => {
         const existing = current.find(t => t.conversationId === targetId);
@@ -2805,7 +2989,12 @@ export async function openclawChatRoute(
             bridge?.updateSessionAudience(t.sessionKey, audience);
             return { ...t, visibility: nextVis, updatedAt: new Date().toISOString() };
           }
-          const rebound = bindThreadToAgentSession(t, connection?.agentId ?? "openclaw");
+          const rebound = bindThreadToAgentSession(
+            t,
+            connection?.agentId ?? "openclaw",
+            undefined,
+            visitorHash,
+          );
           if (t.sessionKey && t.sessionKey !== rebound.sessionKey) {
             bridge?.updateSessionAudience(t.sessionKey, audience);
           }
@@ -2965,7 +3154,7 @@ export async function openclawChatRoute(
       await loadRevisionProposals(ctx);
       const threads = await loadThreads(ctx);
       const collections = await listSiteCollections(ctx);
-      const connState = await readConnectionSettingsState(ctx);
+      const connState = await readConnectionSettingsState(ctx, extraEnv);
       const outcome = await withOpenClawStorageLock("proposals", async () => {
         const proposals = ctx.kv
           ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
@@ -3184,7 +3373,7 @@ export async function openclawChatRoute(
     await loadRevisionProposals(ctx);
     const threads = await loadThreads(ctx);
     const collections = await listSiteCollections(ctx);
-    const connState = await readConnectionSettingsState(ctx);
+    const connState = await readConnectionSettingsState(ctx, extraEnv);
 
     const outcome = await withOpenClawStorageLock("proposals", async () => {
       const proposals = ctx.kv
@@ -3340,7 +3529,7 @@ export async function openclawChatRoute(
     if (proposalId) {
       await loadRevisionProposals(ctx);
       const threads = await loadThreads(ctx);
-      const connState = await readConnectionSettingsState(ctx);
+      const connState = await readConnectionSettingsState(ctx, extraEnv);
       const outcome = await withOpenClawStorageLock("proposals", async () => {
         const proposals = ctx.kv
           ? normalizeV2Proposals(await ctx.kv.get("revision_proposals_v2"))
@@ -3560,7 +3749,7 @@ export async function openclawChatRoute(
       };
     }
 
-    const connection = await readConnectionSettings(ctx);
+    const connection = await readConnectionSettings(ctx, extraEnv);
     if (!connection?.allowGatewayExecApprovals) {
       return {
         ok: false,
@@ -3608,7 +3797,7 @@ export async function openclawChatRoute(
   }
 
   if (action === "stop_turn") {
-    const connection = await readConnectionSettings(ctx);
+    const connection = await readConnectionSettings(ctx, extraEnv);
     const bridge = getHostGatewayBridge();
     const initialThreads = await loadThreads(ctx);
     const target = initialThreads.find(
@@ -3644,7 +3833,7 @@ export async function openclawChatRoute(
         sessionKey:
           target.status === "running" && target.sessionKey
             ? target.sessionKey
-            : resolveThreadSessionKey(target, connection.agentId),
+            : resolveThreadSessionKey(target, connection.agentId, visitorHash),
         runId: target.activeRunId,
       });
       if (!abortRes.ok) {
@@ -3694,10 +3883,10 @@ export async function openclawChatRoute(
       };
     }
 
-    const connState = await readConnectionSettingsState(ctx);
+    const connState = await readConnectionSettingsState(ctx, extraEnv);
     let connection = connState.connection;
     const collections = await listSiteCollections(ctx);
-    if (!connection && !connState.error && role >= ADMIN) {
+    if (!connection && !connState.error && !playgroundLocked && role >= ADMIN) {
       connection = {
         gatewayUrl: "https://agent-session.openclaw.local",
         agentId: "openclaw",
@@ -3771,6 +3960,7 @@ export async function openclawChatRoute(
         collections,
         [],
         boundEntry,
+        visitorHash,
       );
       const visible = ensured.threads.filter(t => isThreadVisibleToUser(t, currentUserId));
       const targetThread =
@@ -3788,11 +3978,17 @@ export async function openclawChatRoute(
         visible[0]!;
       const targetConvId = targetThread.conversationId;
       const reboundTarget =
-        action === "steer_turn" && targetThread.status === "running" && targetThread.sessionKey
+        action === "steer_turn" &&
+        targetThread.status === "running" &&
+        targetThread.sessionKey &&
+        (!visitorHash ||
+          targetThread.sessionKey.startsWith(
+            `agent:${normalizeOpenClawAgentSegment(agentId)}:pg-${visitorHash}:`,
+          ))
           ? targetThread
-          : bindThreadToAgentSession(targetThread, agentId);
+          : bindThreadToAgentSession(targetThread, agentId, undefined, visitorHash);
       const sessionKey =
-        reboundTarget.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId);
+        reboundTarget.sessionKey ?? buildCanonicalSessionKey(agentId, targetConvId, visitorHash);
       const switchedAgentSession = Boolean(
         action === "send_message" &&
           targetThread.messages.length > 0 &&
@@ -4050,6 +4246,7 @@ export async function openclawChatRoute(
         sessionKey,
         priorMessages: targetThread.messages,
         systemContext: `${catalogDigest}${proposalInstruction}`,
+        extraEnv,
       });
 
       if (!httpResult.ok || !httpResult.replyText) {
@@ -4074,6 +4271,19 @@ export async function openclawChatRoute(
         }
       } else {
         assistantReply = httpResult.replyText;
+      }
+
+      if (assistantReply) {
+        const httpAudience = await readLiveAudience();
+        publishOpenClawEvent({
+          type: "assistant_delta",
+          conversationId: targetConvId,
+          messageId: assistantMsgId,
+          delta: assistantReply,
+          content: assistantReply,
+          timestamp: new Date().toISOString(),
+          ...httpAudience,
+        });
       }
     } else if (connection?.pairedAgentPoll && transportMode === "paired-agent") {
       // PATH B2a: Paired external agent polling `/_emdash/api/plugins/dinkus-openclaw/pair`
@@ -4376,7 +4586,7 @@ export async function openclawChatRoute(
       });
     }
 
-    const latestPostTurnConn = await readConnectionSettings(ctx);
+    const latestPostTurnConn = await readConnectionSettings(ctx, extraEnv);
     const postTurnAgentId = latestPostTurnConn?.agentId ?? agentId;
 
     const updatedThreads = await mutateThreads(ctx, [targetConvId], current => {
@@ -4411,7 +4621,7 @@ export async function openclawChatRoute(
         };
         return stillStreaming
           ? withTurnBinding
-          : bindThreadToAgentSession(withTurnBinding, postTurnAgentId);
+          : bindThreadToAgentSession(withTurnBinding, postTurnAgentId, undefined, visitorHash);
       });
       return { threads: next, result: next };
     });

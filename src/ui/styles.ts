@@ -1134,6 +1134,81 @@ textarea.oc-edit-input {
   gap: 14px;
 }
 
+.oc-sheet[data-sheet="templates"] {
+  max-width: 636px;
+}
+
+.oc-template-links-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.oc-template-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.oc-template-card {
+  border-radius: 11px;
+  background: var(--oc-bg-stage);
+  border: 1px solid var(--oc-border-strong);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.oc-template-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.oc-template-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--oc-text-main);
+  flex-wrap: wrap;
+}
+
+.oc-template-tagline {
+  font-size: 12.2px;
+  line-height: 1.48;
+  color: var(--oc-text-muted);
+}
+
+.oc-template-cats {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.oc-template-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.oc-template-builder {
+  border-radius: 11px;
+  background: var(--oc-bg-code);
+  border: 1px solid var(--oc-border-subtle);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .oc-sheet h3 {
   margin: 0;
   font-size: 15px;

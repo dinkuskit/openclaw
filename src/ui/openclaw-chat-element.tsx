@@ -9,16 +9,21 @@ import {
   onMount,
 } from "solid-js";
 import { render } from "solid-js/web";
-import type {
-  BoundEntryRef,
-  CatalogEntrySummary,
-  ChatTurnMessage,
-  ConversationThread,
-  GatewayApprovalDecision,
-  GatewayExecApproval,
-  OpenClawWorkspaceSnapshot,
-  RevisionProposal,
-  ToolCallTrace,
+import {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  FEATURED_AGENT_TEMPLATES,
+  buildAgentTemplateInstallCommands,
+  type AgentTemplateEntry,
+  type BoundEntryRef,
+  type CatalogEntrySummary,
+  type ChatTurnMessage,
+  type ConversationThread,
+  type GatewayApprovalDecision,
+  type GatewayExecApproval,
+  type OpenClawWorkspaceSnapshot,
+  type RevisionProposal,
+  type ToolCallTrace,
 } from "../protocol.js";
 import {
   applyRevisionProposal,
@@ -194,6 +199,7 @@ const SLASH_COMMANDS = [
   { cmd: "/products", hint: "Inspect all live EmDash products & pricing", fill: "Can you inspect my products collection and summarize current items?" },
   { cmd: "/pages", hint: "Audit storefront CMS pages & status", fill: "Show me all storefront pages and their draft/published status." },
   { cmd: "/propose ", hint: "Stage a revision-fenced EmDash draft card", fill: "/propose Refine the copy and excerpt for " },
+  { cmd: "/templates", hint: "Open OpenClaw Agent Templates & harness setup", fill: "__OPEN_TEMPLATES__" },
   { cmd: "/pair", hint: "Open Gateway & 1-click Agent Pairing sheet", fill: "__OPEN_PAIR__" },
 ];
 
@@ -222,8 +228,10 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
   const [leftOpen, setLeftOpen] = createSignal(true);
   const [rightOpen, setRightOpen] = createSignal(true);
   const [activeSheet, setActiveSheet] = createSignal<
-    null | "automations" | "customizations" | "pairing" | "attach"
+    null | "automations" | "customizations" | "pairing" | "attach" | "templates"
   >(null);
+  const [customTemplateRef, setCustomTemplateRef] = createSignal("blobster-smith");
+  const [copiedTemplateKey, setCopiedTemplateKey] = createSignal<string | null>(null);
 
   const [composerByConv, setComposerByConv] = createSignal<Record<string, string>>({});
   const [attachedEntryByConv, setAttachedEntryByConv] = createSignal<
@@ -705,12 +713,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     const rawDraft = usedComposerDraft ? composerText() : undefined;
     const text = (overridePrompt ?? rawDraft ?? "").trim();
     if (!text) return;
-    if (text === "/pair") {
+    if (text === "/pair" || text === "/templates") {
       if (usedComposerDraft) {
         setComposerText("", convKey);
         if (textareaRef) textareaRef.style.height = "38px";
       }
-      setActiveSheet("pairing");
+      setActiveSheet(text === "/templates" ? "templates" : "pairing");
       return;
     }
 
@@ -831,7 +839,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
   const handleToggleAuthority = async () => {
     const snap = snapshot();
-    if (!snap?.isAdmin) return;
+    if (!snap?.isAdmin || snap.playgroundLocked) return;
     const current = snap.connection?.authorityMode ?? "propose_with_approval";
     const nextMode = current === "read_only" ? "propose_with_approval" : "read_only";
     try {
@@ -848,7 +856,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
   const handleToggleCollection = async (slug: string) => {
     const snap = snapshot();
-    if (!snap?.isAdmin) return;
+    if (!snap?.isAdmin || snap.playgroundLocked) return;
     const current = snap.connection?.enabledCollections ?? snap.collections.map(c => c.slug);
     const next = current.includes(slug)
       ? current.filter(item => item !== slug)
@@ -1071,6 +1079,33 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
     setTimeout(() => setCopiedPairing(false), 1800);
   };
 
+  const featuredTemplates = createMemo<AgentTemplateEntry[]>(
+    () => snapshot()?.agentTemplates ?? FEATURED_AGENT_TEMPLATES,
+  );
+  const templateCatalogUrl = createMemo(() => snapshot()?.catalogUrl ?? BLOBSTER_CATALOG_URL);
+  const templateSubmitUrl = createMemo(() => snapshot()?.submitUrl ?? BLOBSTER_SUBMIT_URL);
+  const customTemplateCommands = createMemo(() =>
+    buildAgentTemplateInstallCommands(
+      customTemplateRef(),
+      snapshot()?.siteOrigin || (typeof window !== "undefined" ? window.location.origin : "http://localhost:4321"),
+      snapshot()?.pairingCode,
+    ),
+  );
+
+  const copyTemplateText = async (key: string, value: string) => {
+    await navigator.clipboard?.writeText(value).catch(() => {});
+    setCopiedTemplateKey(key);
+    setTimeout(() => {
+      setCopiedTemplateKey(curr => (curr === key ? null : curr));
+    }, 1800);
+  };
+
+  const useTemplateAgentId = (agentId: string) => {
+    if (snapshot()?.playgroundLocked) return;
+    setGwAgentInput(agentId);
+    setActiveSheet("pairing");
+  };
+
   const activeEditorHref = createMemo(() => {
     const bound = effectiveBoundEntry() ?? activeThread()?.boundEntry;
     if (bound) {
@@ -1147,6 +1182,23 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
               <span class="oc-count-pill">
                 {(snapshot()?.automations ?? []).filter(a => a.enabled).length}
               </span>
+            </button>
+
+            <button
+              type="button"
+              class={`oc-nav-item ${activeSheet() === "templates" ? "is-active" : ""}`}
+              onClick={() =>
+                setActiveSheet(prev => (prev === "templates" ? null : "templates"))
+              }
+            >
+              <span class="oc-nav-item-left">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                  <path d="M8 1.8L13.4 4.8V11.2L8 14.2L2.6 11.2V4.8L8 1.8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" />
+                  <path d="M2.6 4.8L8 7.8L13.4 4.8M8 7.8V14.2" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                </svg>
+                <span>Agent Templates</span>
+              </span>
+              <span class="oc-count-pill">{featuredTemplates().length}</span>
             </button>
 
             <button
@@ -1298,16 +1350,35 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           <div class="oc-topbar-group">
             <button
               type="button"
+              class={`oc-pill-link ${activeSheet() === "templates" ? "is-active" : ""}`}
+              title="Browse and install OpenClaw Agent Templates (agents-template)"
+              onClick={() =>
+                setActiveSheet(prev => (prev === "templates" ? null : "templates"))
+              }
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 1.8L13.4 4.8V11.2L8 14.2L2.6 11.2V4.8L8 1.8Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" />
+                <path d="M2.6 4.8L8 7.8L13.4 4.8M8 7.8V14.2" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+              </svg>
+              <span>Agent Templates</span>
+            </button>
+
+            <button
+              type="button"
               class="oc-status-pill"
               style={{ cursor: "pointer" }}
-              title={`Gateway WS: ${snapshot()?.gatewayBridge.state ?? "disconnected"} · SSE: ${streamState()}`}
+              title={`Gateway: ${snapshot()?.gatewayBridge.state ?? "disconnected"} · SSE: ${streamState()}`}
               onClick={() => setActiveSheet("pairing")}
             >
               <span
                 class="oc-status-dot"
                 classList={{
                   "is-warn":
-                    streamState() !== "live" ||
+                    (streamState() !== "live" &&
+                      !(
+                        snapshot()?.connection?.transportMode === "live-gateway" &&
+                        snapshot()?.gatewayBridge.state === "connected"
+                      )) ||
                     (snapshot()?.connection?.transportMode === "gateway-ws" &&
                       snapshot()?.gatewayBridge.state !== "connected"),
                 }}
@@ -1315,9 +1386,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
               <span>
                 {snapshot()?.connection?.transportMode === "gateway-ws"
                   ? `@${snapshot()?.connection?.agentId ?? "openclaw"} · GW ${snapshot()?.gatewayBridge.state === "connected" ? `v${snapshot()?.gatewayBridge.protocolVersion ?? 4}` : snapshot()?.gatewayBridge.state}`
-                  : streamState() === "live"
-                    ? `@${snapshot()?.connection?.agentId ?? "openclaw"} · SSE live`
-                    : `@${snapshot()?.connection?.agentId ?? "openclaw"} · ${streamState()}`}
+                  : snapshot()?.connection?.transportMode === "live-gateway" &&
+                      snapshot()?.gatewayBridge.state === "connected"
+                    ? `@${snapshot()?.connection?.agentId ?? "openclaw"} · ${snapshot()?.playgroundLocked ? "Playground" : "connected"}`
+                    : streamState() === "live"
+                      ? `@${snapshot()?.connection?.agentId ?? "openclaw"} · SSE live`
+                      : `@${snapshot()?.connection?.agentId ?? "openclaw"} · ${streamState()}`}
               </span>
             </button>
 
@@ -1437,10 +1511,19 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                   <button
                     type="button"
                     class="oc-starter-chip"
-                    onClick={() => setActiveSheet("pairing")}
+                    onClick={() => setActiveSheet("templates")}
                   >
-                    Pair external OpenClaw / CLI agent
+                    Agent Templates (blobster.dev)
                   </button>
+                  <Show when={!snapshot()?.playgroundLocked}>
+                    <button
+                      type="button"
+                      class="oc-starter-chip"
+                      onClick={() => setActiveSheet("pairing")}
+                    >
+                      Pair external OpenClaw / CLI agent
+                    </button>
+                  </Show>
                 </div>
               </div>
             </Show>
@@ -2059,9 +2142,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       type="button"
                       class="oc-slash-item"
                       onClick={() => {
-                        if (item.fill === "__OPEN_PAIR__") {
+                        if (item.fill === "__OPEN_PAIR__" || item.fill === "__OPEN_TEMPLATES__") {
                           setComposerText("");
-                          setActiveSheet("pairing");
+                          setActiveSheet(item.fill === "__OPEN_TEMPLATES__" ? "templates" : "pairing");
                         } else {
                           setComposerText(item.fill);
                           textareaRef?.focus();
@@ -2196,10 +2279,185 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
           </div>
         </div>
 
-        {/* MODAL SHEETS FOR PAIRING / CUSTOMIZATIONS / AUTOMATIONS / ATTACH ENTRY */}
+        {/* MODAL SHEETS FOR TEMPLATES / PAIRING / CUSTOMIZATIONS / AUTOMATIONS / ATTACH ENTRY */}
         <Show when={activeSheet()}>
           <div class="oc-sheet-backdrop" onClick={() => setActiveSheet(null)}>
-            <div class="oc-sheet" onClick={e => e.stopPropagation()}>
+            <div class="oc-sheet" data-sheet={activeSheet() ?? ""} onClick={e => e.stopPropagation()}>
+              <Show when={activeSheet() === "templates"}>
+                <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", gap: "8px" }}>
+                  <h3>Agent Templates (agents-template)</h3>
+                  <button type="button" class="oc-btn" onClick={() => setActiveSheet(null)}>
+                    Close
+                  </button>
+                </div>
+
+                <div style={{ "font-size": "12.3px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
+                  Run verified OpenClaw Agent Templates on your own gateway or local harness with{" "}
+                  <code>openclaw templates</code>, then connect or pair <code>--agent-id</code> with EmDash.
+                </div>
+
+                <div class="oc-template-links-bar">
+                  <a
+                    class="oc-pill-link"
+                    href={templateCatalogUrl()}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Browse verified Agent Templates on Blobster Factory ↗
+                  </a>
+                  <a
+                    class="oc-pill-link"
+                    href={templateSubmitUrl()}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Submit an Agent Template ↗
+                  </a>
+                </div>
+
+                <div class="oc-template-grid">
+                  <For each={featuredTemplates()}>
+                    {tpl => {
+                      const cmds = () =>
+                        buildAgentTemplateInstallCommands(
+                          tpl.packageUrl,
+                          snapshot()?.siteOrigin ||
+                            (typeof window !== "undefined" ? window.location.origin : "http://localhost:4321"),
+                          snapshot()?.pairingCode,
+                        );
+                      return (
+                        <div class="oc-template-card" data-template-id={tpl.id}>
+                          <div class="oc-template-head">
+                            <div class="oc-template-title">
+                              <span>{tpl.name}</span>
+                              <span class="oc-badge is-coral">@{tpl.id}</span>
+                            </div>
+                            <a
+                              class="oc-pill-link"
+                              href={tpl.detailUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Template Spec ↗
+                            </a>
+                          </div>
+
+                          <div class="oc-template-tagline">{tpl.tagline}</div>
+
+                          <div class="oc-template-cats">
+                            <For each={tpl.categories}>
+                              {cat => <span class="oc-badge">{cat}</span>}
+                            </For>
+                          </div>
+
+                          <div class="oc-code-copy">{tpl.installCommand}</div>
+
+                          <div class="oc-template-actions">
+                            <button
+                              type="button"
+                              class="oc-btn oc-btn-primary"
+                              onClick={() => void copyTemplateText(`add:${tpl.id}`, tpl.installCommand)}
+                            >
+                              {copiedTemplateKey() === `add:${tpl.id}`
+                                ? "✓ Copied Install"
+                                : "Copy Install Command"}
+                            </button>
+                            <button
+                              type="button"
+                              class="oc-btn"
+                              onClick={() =>
+                                void copyTemplateText(`setup:${tpl.id}`, cmds().fullSetupScript)
+                              }
+                            >
+                              {copiedTemplateKey() === `setup:${tpl.id}`
+                                ? "✓ Copied Harness Setup"
+                                : "Copy Harness Setup"}
+                            </button>
+                            <Show
+                              when={!snapshot()?.playgroundLocked}
+                              fallback={
+                                <span
+                                  class="oc-badge"
+                                  title="Gateway agentId is pre-configured in Playground mode"
+                                >
+                                  Playground locked (@{snapshot()?.connection?.agentId ?? "blobster-smith"})
+                                </span>
+                              }
+                            >
+                              <button
+                                type="button"
+                                class="oc-btn"
+                                disabled={!snapshot()?.isAdmin}
+                                onClick={() => useTemplateAgentId(tpl.id)}
+                              >
+                                Use Agent ID
+                              </button>
+                            </Show>
+                          </div>
+                        </div>
+                      );
+                    }}
+                  </For>
+                </div>
+
+                <div class="oc-template-builder">
+                  <div style={{ "font-weight": "600", "font-size": "12.5px", color: "var(--oc-text-main)" }}>
+                    Custom Template Slug, .tgz URL, or Local Directory
+                  </div>
+                  <label class="oc-field-label">
+                    <span>Enter any Blobster slug, tarball URL, or local template path</span>
+                    <input
+                      type="text"
+                      class="oc-edit-input"
+                      placeholder="e.g. my-store-agent, https://blobster.dev/t/blobster-smith.tgz, or ./templates/my-agent"
+                      value={customTemplateRef()}
+                      onInput={e => setCustomTemplateRef(e.currentTarget.value)}
+                    />
+                  </label>
+                  <div class="oc-code-copy">{customTemplateCommands().fullSetupScript}</div>
+                  <div class="oc-template-actions">
+                    <button
+                      type="button"
+                      class="oc-btn oc-btn-primary"
+                      onClick={() =>
+                        void copyTemplateText(
+                          "custom:install",
+                          customTemplateCommands().installCommand,
+                        )
+                      }
+                    >
+                      {copiedTemplateKey() === "custom:install"
+                        ? "✓ Copied Install"
+                        : "Copy openclaw templates add"}
+                    </button>
+                    <button
+                      type="button"
+                      class="oc-btn"
+                      onClick={() =>
+                        void copyTemplateText(
+                          "custom:full",
+                          customTemplateCommands().fullSetupScript,
+                        )
+                      }
+                    >
+                      {copiedTemplateKey() === "custom:full"
+                        ? "✓ Copied Full Script"
+                        : "Copy Full Harness Setup"}
+                    </button>
+                    <Show when={!snapshot()?.playgroundLocked}>
+                      <button
+                        type="button"
+                        class="oc-btn"
+                        disabled={!snapshot()?.isAdmin}
+                        onClick={() => useTemplateAgentId(customTemplateCommands().agentId)}
+                      >
+                        Use Agent ID (@{customTemplateCommands().agentId})
+                      </button>
+                    </Show>
+                  </div>
+                </div>
+              </Show>
+
               <Show when={activeSheet() === "pairing"}>
                 <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center" }}>
                   <h3>OpenClaw Gateway v4 & Agent Pairing</h3>
@@ -2207,6 +2465,23 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     Close
                   </button>
                 </div>
+
+                <Show when={snapshot()?.playgroundLocked}>
+                  <div class="oc-readonly-notice">
+                    <span>
+                      Gateway settings are pre-configured and locked in Playground mode (
+                      <code>@{snapshot()?.connection?.agentId ?? "blobster-smith"}</code>). To run
+                      custom agents on your own gateway, install an Agent Template locally.
+                    </span>
+                    <button
+                      type="button"
+                      class="oc-btn"
+                      onClick={() => setActiveSheet("templates")}
+                    >
+                      Agent Templates
+                    </button>
+                  </div>
+                </Show>
 
                 {/* LIVE @openclaw/gateway-client BRIDGE STATUS */}
                 <div class="oc-gw-status-card">
@@ -2218,7 +2493,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       class={`oc-badge ${snapshot()?.gatewayBridge.state === "connected" ? "is-green" : snapshot()?.gatewayBridge.state === "disconnected" ? "" : "is-amber"}`}
                     >
                       {snapshot()?.gatewayBridge.state === "connected"
-                        ? `● connected · protocol v${snapshot()?.gatewayBridge.protocolVersion ?? 4}`
+                        ? snapshot()?.connection?.transportMode === "live-gateway"
+                          ? "● connected · HTTP completions"
+                          : `● connected · protocol v${snapshot()?.gatewayBridge.protocolVersion ?? 4}`
                         : `● ${snapshot()?.gatewayBridge.state ?? "disconnected"}`}
                     </span>
                   </div>
@@ -2314,7 +2591,9 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                   <button
                     type="button"
                     class="oc-btn oc-btn-primary"
-                    disabled={probingGateway() || !snapshot()?.isAdmin}
+                    disabled={
+                      probingGateway() || !snapshot()?.isAdmin || Boolean(snapshot()?.playgroundLocked)
+                    }
                     onClick={() => void handleSaveManualGateway()}
                   >
                     {probingGateway() ? "Connecting…" : "Save & Connect Gateway"}
@@ -2329,7 +2608,11 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                       Test / Reconnect
                     </button>
                   </Show>
-                  <Show when={snapshot()?.paired && snapshot()?.isAdmin}>
+                  <Show
+                    when={
+                      snapshot()?.paired && snapshot()?.isAdmin && !snapshot()?.playgroundLocked
+                    }
+                  >
                     <button
                       type="button"
                       class="oc-btn"
@@ -2344,10 +2627,12 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                 <div class="oc-overview-divider" />
                 <h3>1-Step External Agent / MCP Pairing (Expiring 15m Code)</h3>
                 <Show
-                  when={snapshot()?.isAdmin}
+                  when={snapshot()?.isAdmin && !snapshot()?.playgroundLocked}
                   fallback={
                     <div style={{ "font-size": "12px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
-                      Site Administrator role is required to view or mint external agent pairing codes.
+                      {snapshot()?.playgroundLocked
+                        ? "External agent pairing codes are disabled in Playground mode."
+                        : "Site Administrator role is required to view or mint external agent pairing codes."}
                     </div>
                   }
                 >
@@ -2658,6 +2943,23 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                 </div>
               )}
             </Show>
+
+            <button
+              type="button"
+              class="oc-overview-row"
+              onClick={() => setActiveSheet("templates")}
+            >
+              <span style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                  <path d="M8 1.8L13.4 4.8V11.2L8 14.2L2.6 11.2V4.8L8 1.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                  <path d="M2.6 4.8L8 7.8L13.4 4.8M8 7.8V14.2" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" />
+                </svg>
+                <span>Agent Templates</span>
+              </span>
+              <span style={{ color: "var(--oc-text-muted)", "font-size": "11.5px" }}>
+                blobster.dev ›
+              </span>
+            </button>
 
             <button
               type="button"

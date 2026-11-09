@@ -12,6 +12,11 @@ await mkdir(extracted, { recursive: true });
 const artifact = await bundlePlugin({ dir: resolve("."), outDir: resolve(directory, "build") });
 execFileSync("tar", ["-xf", artifact.tarballPath, "-C", extracted]);
 const backend = await readFile(resolve(extracted, "backend.js"));
+if (backend.byteLength > REGISTRY_FILE_LIMIT_BYTES) {
+  throw new Error(
+    `backend.js (${backend.byteLength} bytes) exceeds Registry per-file limit (${REGISTRY_FILE_LIMIT_BYTES} bytes)`,
+  );
+}
 const manifest = JSON.parse(await readFile(resolve(extracted, "manifest.json"), "utf8"));
 if (manifest.id !== "dinkus-openclaw") {
   throw new Error(`unexpected plugin id ${manifest.id}`);
