@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="#installation-profiles">Profiles</a> &middot;
+  <a href="#agent-templates--custom-harnesses-agents-template">Agent Templates</a> &middot;
   <a href="#architecture--system-flow">Architecture</a> &middot;
   <a href="#security--authority-model">Security &amp; Authority</a> &middot;
   <a href="docs/design/dinkusclaw-character-and-pet-rig.md">DinkusClaw Spec</a> &middot;
@@ -87,7 +88,62 @@ export default defineConfig({
 
 ### 2. Sandboxed Registry Profile (`@dinkuskit/openclaw` + `@dinkuskit/openclaw/sandbox`)
 
-Capability-gated sandboxed Registry plugin (`backend.js` ~52 KiB, well under EmDash's 128 KiB Registry limit) rendering an honest declarative Block Kit fallback (`@emdash-cms/blocks/server`) with pairing, authority controls, and approval queues when the native Astro/React integration is not installed.
+Capability-gated sandboxed EmDash Registry plugin (`did:plc:ekk4pjmkh3k3ql2kfoex3qt4/dinkus-openclaw`, `backend.js` ~101 KiB with ~27 KiB headroom under EmDash's 128 KiB Registry limit) rendering an honest declarative Block Kit workspace (`@emdash-cms/blocks/server`) when the native Astro/React integration is not installed:
+
+- **Shipped in the Registry sandbox (`0.1.0`):** Declarative `/openclaw` Block Kit workspace, **Agent Templates (`blobster.dev`)** install helper, dynamic collection discovery (`schema:read`), saved-entry `OpenClaw Assistant` side-panel, 1-step CSPRNG `/pair` MCP/REST bridge (`X-OpenClaw-Token` / JSON `sessionToken`), mid-task steering, encrypted `connection` settings, and `WAITING_FOR_HUMAN` proposal queues.
+- **Native-only gaps (and what closes them):** Precompiled SolidJS `<openclaw-emdash-chat>` Antigravity UI island, unbuffered `/_emdash/api/openclaw/stream` SSE token streaming, and persistent Node `@openclaw/gateway-client` Protocol v4 WebSockets require `@dinkuskit/openclaw/native` + `@dinkuskit/openclaw/astro` until the EmDash plugin sandbox exposes streaming routes and outbound WebSocket transports (sandboxed installs pair external OpenClaw agents over HTTPS via `/pair`).
+
+---
+
+## Agent Templates & Custom Harnesses (`agents-template`)
+
+`@dinkuskit/openclaw` includes first-class support for OpenClaw **Agent Templates** (`agents-template` / `openclaw templates`) so you can run verified agents from **[Blobster Factory (`blobster.dev`)](https://blobster.dev)** or your own local templates on any OpenClaw gateway or harness:
+
+```sh
+# 1. Enable Agent Templates on a fresh OpenClaw gateway
+openclaw config set gateway.controlUi.experimental.templates true
+
+# 2. Install a verified template tarball from Blobster Factory
+template_dir="$(mktemp -d)"
+curl --fail --show-error --location https://blobster.dev/t/blobster-smith.tgz -o "$template_dir/template.tgz"
+mkdir "$template_dir/source"
+tar -xzf "$template_dir/template.tgz" -C "$template_dir/source"
+template_dir="$template_dir/source"
+# npm-style archives have a package/ root; flat archives use the extraction root.
+if [ -f "$template_dir/package/package.json" ]; then template_dir="$template_dir/package"; fi
+openclaw templates validate "$template_dir"
+openclaw templates add "$template_dir" --agent-id blobster-smith
+
+# 3. Validate and install a local custom template directory during development
+openclaw templates validate ./my-store-agent
+openclaw templates add ./my-store-agent
+
+# 4. Start the gateway; select blobster-smith in EmDash's Agent ID field
+openclaw gateway run
+```
+
+- **Connect to `@dinkuskit/openclaw`:** Open **Agent Templates** inside `<openclaw-emdash-chat>` (or the **Agent Templates (`blobster.dev`)** tab in Block Kit), click **Use Agent ID** to pre-fill `agentId` in **Gateway &amp; Pairing** (`ws://127.0.0.1:18789` or `wss://...`), or run the generated `curl` `/pair` snippet from your harness.
+- **Programmatic CLI helper:** `buildAgentTemplateInstallCommands(templateRef, siteOrigin, pairingCode?)` accepts any Blobster slug (`blobster-smith`), `.tgz` URL, or local path and returns shell-safe `enableTemplatesCommand`, `validateCommand`, `installCommand`, `harnessCommand`, and `pairCommand` strings. Archive install commands copy local archives or download URLs, then extract into a fresh temporary directory, validate the package, and add it with the selected agent ID; the directory is retained for inspection.
+- **Discover &amp; Submit:** Browse verified templates at **[https://blobster.dev](https://blobster.dev)** and submit community `agents-template` packages at **[https://blobster.dev/submit](https://blobster.dev/submit)**.
+
+### Cloudflare Workers (`workerd`) & Server-Locked EmDash Playground Mode
+
+`@dinkuskit/openclaw/native` and `@dinkuskit/openclaw/stream-endpoint` ship dedicated `workerd`-safe ESM entrypoints (zero eager Node `ws` or `node:tls` imports) and fall back cleanly to `globalThis.fetch` for OpenClaw HTTP `/v1/chat/completions` turns (`model: "openclaw/<agentId>"`).
+
+Server-configured loopback gateways use native fetch even when EmDash supplies its SSRF-protected HTTP client; redirects are refused on this path. Connections saved through the UI continue to use the host HTTP client.
+
+For public EmDash Durable Object Playgrounds (where anonymous visitors receive isolated SQLite preview instances with `role: 50`), configure server-only `OPENCLAW_PLAYGROUND_*` variables (via `process.env` or `globalThis.__openclawPlaygroundEnv`):
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENCLAW_PLAYGROUND_GATEWAY_URL` | Upstream OpenClaw HTTP(S) Gateway origin (e.g. `http://127.0.0.1:19011` or `https://...`) |
+| `OPENCLAW_PLAYGROUND_GATEWAY_TOKEN` | Server-only Gateway bearer token (never persisted to visitor SQLite or exposed to browsers) |
+| `OPENCLAW_PLAYGROUND_AGENT_ID` | Default Playground agent ID (defaults to `blobster-smith`) |
+| `OPENCLAW_PLAYGROUND_ENABLED_COLLECTIONS` | Comma-separated enabled collections (e.g. `templates,pages`) |
+| `OPENCLAW_PLAYGROUND_LOCK` | Set `"1"` to lock Gateway settings, block `/pair` &amp; SSRF mutations, and disable inline exec approvals |
+| `OPENCLAW_PLAYGROUND_CF_ACCESS_CLIENT_ID` / `_SECRET` | Optional origin-bound Cloudflare Access service-token headers for private Gateway tunnels |
+
+Anonymous Playground sessions automatically hash the `emdash_playground` cookie (or `x-openclaw-playground-visitor` header) with SHA-256 (`agent:<agentId>:pg-<visitorHash>:<convId>`) so concurrent visitors never share agent session memory.
 
 ---
 
@@ -124,4 +180,4 @@ npm install
 
 ## Status
 
-Public runnable plugin (`0.0.0`, `private: true`). MIT.
+Published on the EmDash Plugin Registry as `dinkus-openclaw@0.1.0` (`did:plc:ekk4pjmkh3k3ql2kfoex3qt4/dinkus-openclaw`, publisher `dinkuskit.com`). MIT.

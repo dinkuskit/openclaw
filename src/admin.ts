@@ -6,7 +6,20 @@ import {
   pollPairedAgentTurn,
   steerPairedAgentTurn,
 } from "./chat-engine.js";
-import type { OpenClawConnection } from "./protocol.js";
+import {
+  PLAYGROUND_LOCKED_MESSAGE,
+  extractRouteRuntimeEnv,
+  isPlaygroundLocked,
+  readPlaygroundEnvConfig,
+  resolvePlaygroundConnection,
+} from "./playground-env.js";
+import {
+  BLOBSTER_CATALOG_URL,
+  BLOBSTER_SUBMIT_URL,
+  OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
+  type OpenClawConnection,
+} from "./protocol.js";
 import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
 
 export type { OpenClawConnection };
@@ -149,77 +162,132 @@ async function discoverSiteCollections(
 
 async function loadConnectionState(
   ctx: PluginContext,
-): Promise<{ connection: OpenClawConnection | null; error?: string }> {
+  extraEnv?: Record<string, unknown>,
+): Promise<{
+  connection: OpenClawConnection | null;
+  error?: string;
+  fromPlaygroundEnv?: boolean;
+  playgroundLocked?: boolean;
+}> {
+  const playgroundCfg = readPlaygroundEnvConfig(extraEnv);
+  const resolveEnvFallback = async (): Promise<OpenClawConnection | null> => {
+    if (!playgroundCfg.gatewayUrl || !playgroundCfg.gatewayToken) {
+      return null;
+    }
+    const fallbackSlugs = playgroundCfg.enabledCollections
+      ? playgroundCfg.enabledCollections
+      : (await discoverSiteCollections(ctx)).map(c => c.slug);
+    return resolvePlaygroundConnection(fallbackSlugs, extraEnv);
+  };
+
+  if (playgroundCfg.locked && playgroundCfg.gatewayUrl && playgroundCfg.gatewayToken) {
+    const envConn = await resolveEnvFallback();
+    if (envConn) {
+      return {
+        connection: envConn,
+        fromPlaygroundEnv: true,
+        playgroundLocked: true,
+      };
+    }
+  }
+
   let raw: unknown;
+  let readError: string | undefined;
   try {
     raw = await ctx.settings.get("connection");
   } catch {
+    readError =
+      "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.";
+  }
+  if (typeof raw === "string" && raw) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
+      const hasStoredCredential =
+        (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
+        (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
+        (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
+      if (
+        typeof parsed.gatewayUrl === "string" &&
+        (parsed.gatewayUrl.startsWith("https://") ||
+          parsed.gatewayUrl.startsWith("wss://") ||
+          parsed.gatewayUrl.startsWith("ws://127.0.0.1:") ||
+          parsed.gatewayUrl.startsWith("ws://localhost:") ||
+          parsed.gatewayUrl.startsWith("ws://[::1]:") ||
+          parsed.gatewayUrl.startsWith("http://127.0.0.1:") ||
+          parsed.gatewayUrl.startsWith("http://localhost:")) &&
+        typeof parsed.agentId === "string" &&
+        parsed.agentId.length > 0 &&
+        typeof parsed.gatewayToken === "string" &&
+        hasStoredCredential
+      ) {
+        return {
+          connection: {
+            gatewayUrl: parsed.gatewayUrl,
+            agentId: parsed.agentId,
+            gatewayToken: parsed.gatewayToken,
+            ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
+              ? { bootstrapToken: parsed.bootstrapToken }
+              : {}),
+            ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
+              ? { deviceToken: parsed.deviceToken }
+              : {}),
+            ...(parsed.deviceIdentity &&
+            typeof parsed.deviceIdentity.deviceId === "string" &&
+            typeof parsed.deviceIdentity.publicKeyPem === "string" &&
+            typeof parsed.deviceIdentity.privateKeyPem === "string"
+              ? { deviceIdentity: parsed.deviceIdentity }
+              : {}),
+            authorityMode:
+              parsed.authorityMode === "propose_with_approval"
+                ? "propose_with_approval"
+                : "read_only",
+            allowGatewayExecApprovals: playgroundCfg.locked
+              ? false
+              : parsed.allowGatewayExecApprovals === true,
+            ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
+            enabledCollections: Array.isArray(parsed.enabledCollections)
+              ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
+              : ["pages", "posts"],
+          },
+          fromPlaygroundEnv: false,
+          playgroundLocked: playgroundCfg.locked,
+        };
+      }
+    } catch {
+      // Preserve stored encrypted value instead of deleting on parse errors.
+    }
+    readError =
+      "Stored OpenClaw settings could not be parsed. Re-save Gateway settings to replace them.";
+  }
+
+  const envFallback = await resolveEnvFallback();
+  if (envFallback) {
     return {
-      connection: null,
-      error:
-        "Stored OpenClaw credentials could not be read (check EMDASH_ENCRYPTION_KEY or storage health). Existing encrypted settings were preserved.",
+      connection: envFallback,
+      fromPlaygroundEnv: true,
+      playgroundLocked: playgroundCfg.locked,
     };
   }
-  if (typeof raw !== "string" || !raw) return { connection: null };
-  try {
-    const parsed = JSON.parse(raw) as Partial<OpenClawConnection>;
-    const hasStoredCredential =
-      (typeof parsed.gatewayToken === "string" && parsed.gatewayToken.length > 0) ||
-      (typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken.length > 0) ||
-      (typeof parsed.deviceToken === "string" && parsed.deviceToken.length > 0);
-    if (
-      typeof parsed.gatewayUrl === "string" &&
-      (parsed.gatewayUrl.startsWith("https://") ||
-        parsed.gatewayUrl.startsWith("wss://") ||
-        parsed.gatewayUrl.startsWith("ws://127.0.0.1:") ||
-        parsed.gatewayUrl.startsWith("ws://localhost:") ||
-        parsed.gatewayUrl.startsWith("http://127.0.0.1:") ||
-        parsed.gatewayUrl.startsWith("http://localhost:")) &&
-      typeof parsed.agentId === "string" &&
-      parsed.agentId.length > 0 &&
-      typeof parsed.gatewayToken === "string" &&
-      hasStoredCredential
-    ) {
-      return {
-        connection: {
-          gatewayUrl: parsed.gatewayUrl,
-          agentId: parsed.agentId,
-          gatewayToken: parsed.gatewayToken,
-          ...(typeof parsed.bootstrapToken === "string" && parsed.bootstrapToken
-            ? { bootstrapToken: parsed.bootstrapToken }
-            : {}),
-          ...(typeof parsed.deviceToken === "string" && parsed.deviceToken
-            ? { deviceToken: parsed.deviceToken }
-            : {}),
-          ...(parsed.deviceIdentity &&
-          typeof parsed.deviceIdentity.deviceId === "string" &&
-          typeof parsed.deviceIdentity.publicKeyPem === "string" &&
-          typeof parsed.deviceIdentity.privateKeyPem === "string"
-            ? { deviceIdentity: parsed.deviceIdentity }
-            : {}),
-          authorityMode:
-            parsed.authorityMode === "propose_with_approval"
-              ? "propose_with_approval"
-              : "read_only",
-          allowGatewayExecApprovals: parsed.allowGatewayExecApprovals === true,
-          ...(parsed.pairedAgentPoll === true ? { pairedAgentPoll: true } : {}),
-          enabledCollections: Array.isArray(parsed.enabledCollections)
-            ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
-            : ["pages", "posts"],
-        },
-      };
-    }
-  } catch {
-    // Preserve stored encrypted value instead of deleting on parse errors.
+  if (readError) {
+    return {
+      connection: null,
+      error: readError,
+      fromPlaygroundEnv: false,
+      playgroundLocked: playgroundCfg.locked,
+    };
   }
   return {
     connection: null,
-    error: "Stored OpenClaw settings could not be parsed. Re-save Gateway settings to replace them.",
+    fromPlaygroundEnv: false,
+    playgroundLocked: playgroundCfg.locked,
   };
 }
 
-async function loadConnection(ctx: PluginContext): Promise<OpenClawConnection | null> {
-  return (await loadConnectionState(ctx)).connection;
+async function loadConnection(
+  ctx: PluginContext,
+  extraEnv?: Record<string, unknown>,
+): Promise<OpenClawConnection | null> {
+  return (await loadConnectionState(ctx, extraEnv)).connection;
 }
 
 async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
@@ -266,6 +334,43 @@ export function buildAgentPairingPrompt(siteOrigin: string, pairingCode: string)
   ].join("\n");
 }
 
+function agentTemplatesBlocks(): Block[] {
+  return [
+    {
+      type: "empty",
+      size: "sm",
+      title: "Agent Templates (blobster.dev)",
+      description:
+        "Install verified OpenClaw Agent Templates (agents-template) such as @blobster-smith and @blobster-sculptor on your own harness, or submit a template at blobster.dev/submit.",
+      command_line: buildAgentTemplateInstallCommands("blobster-smith").installCommand,
+      actions: [
+        {
+          type: "link",
+          label: "Browse Blobster Factory",
+          target: { kind: "external", url: BLOBSTER_CATALOG_URL },
+          appearance: "primary",
+        },
+        {
+          type: "link",
+          label: "Submit an Agent Template",
+          target: { kind: "external", url: BLOBSTER_SUBMIT_URL },
+          appearance: "secondary",
+        },
+      ],
+    },
+    {
+      type: "code",
+      language: "bash",
+      code: [
+        `# Enable Agent Templates on a fresh gateway, then install @blobster-smith`,
+        OPENCLAW_ENABLE_TEMPLATES_CMD,
+        buildAgentTemplateInstallCommands("blobster-smith").installCommand,
+        `openclaw templates validate ./my-custom-template`,
+      ].join("\n"),
+    },
+  ];
+}
+
 export function setupPage(
   isAdmin: boolean,
   collections: Array<{ slug: string; label: string }>,
@@ -306,6 +411,7 @@ export function setupPage(
   if (!isAdmin) {
     blocks.push(
       context("Ask an Administrator of this site to connect the OpenClaw gateway on this page."),
+      ...agentTemplatesBlocks(),
     );
     return { blocks };
   }
@@ -426,10 +532,13 @@ export function setupPage(
     },
   ];
 
-  blocks.push({
-    type: "columns",
-    columns: [leftColumn, rightColumn],
-  });
+  blocks.push(
+    {
+      type: "columns",
+      columns: [leftColumn, rightColumn],
+    },
+    ...agentTemplatesBlocks(),
+  );
 
   return { blocks, ...(toast ? { toast } : {}) };
 }
@@ -476,6 +585,7 @@ export function workspacePage(
   isAdmin: boolean,
   replyText?: string,
   toast?: BlockResponse["toast"],
+  playgroundLocked = false,
 ): BlockResponse {
   const safeGatewayUrl = sanitizeAdminPublicUrl(connection.gatewayUrl);
   let gatewayHost = safeGatewayUrl;
@@ -625,57 +735,72 @@ export function workspacePage(
           { type: "divider" as const },
         ]);
 
-  const settingsBlocks: Block[] = isAdmin
+  const settingsBlocks: Block[] = playgroundLocked
     ? [
-        {
-          type: "columns",
-          columns: [
-            [
-              {
-                type: "form",
-                block_id: "openclaw-collections-form",
-                fields: [
-                  {
-                    type: "checkbox",
-                    action_id: "enabledCollections",
-                    label: "Enabled Editor Side-Panel Collections",
-                    initial_value: connection.enabledCollections,
-                    options: collections.map(col => ({
-                      label: `${col.label} (${col.slug})`,
-                      value: col.slug,
-                    })),
-                  },
-                ],
-                submit: { label: "Update enabled collections", action_id: "save_collections" },
-              },
-            ],
-            [
-              fields(
-                ["Gateway", safeGatewayUrl],
-                ["Agent ID", `@${connection.agentId}`],
-                [
-                  "Authority Mode",
-                  connection.authorityMode === "read_only"
-                    ? "Read-only"
-                    : "Propose with WAITING_FOR_HUMAN cards",
-                ],
-              ),
-              {
-                type: "actions",
-                elements: [
-                  {
-                    type: "button",
-                    label: "Disconnect gateway",
-                    action_id: "disconnect",
-                    style: "secondary",
-                  },
-                ],
-              },
-            ],
+        banner("default", "Playground Mode", PLAYGROUND_LOCKED_MESSAGE),
+        fields(
+          ["Gateway", safeGatewayUrl],
+          ["Agent ID", `@${connection.agentId}`],
+          [
+            "Authority Mode",
+            connection.authorityMode === "read_only"
+              ? "Read-only"
+              : "Propose with WAITING_FOR_HUMAN cards",
           ],
-        },
+          ["Enabled Collections", connection.enabledCollections.join(", ") || "none"],
+        ),
       ]
-    : [context("Only an Administrator can modify enabled collections or disconnect the gateway.")];
+    : isAdmin
+      ? [
+          {
+            type: "columns",
+            columns: [
+              [
+                {
+                  type: "form",
+                  block_id: "openclaw-collections-form",
+                  fields: [
+                    {
+                      type: "checkbox",
+                      action_id: "enabledCollections",
+                      label: "Enabled Editor Side-Panel Collections",
+                      initial_value: connection.enabledCollections,
+                      options: collections.map(col => ({
+                        label: `${col.label} (${col.slug})`,
+                        value: col.slug,
+                      })),
+                    },
+                  ],
+                  submit: { label: "Update enabled collections", action_id: "save_collections" },
+                },
+              ],
+              [
+                fields(
+                  ["Gateway", safeGatewayUrl],
+                  ["Agent ID", `@${connection.agentId}`],
+                  [
+                    "Authority Mode",
+                    connection.authorityMode === "read_only"
+                      ? "Read-only"
+                      : "Propose with WAITING_FOR_HUMAN cards",
+                  ],
+                ),
+                {
+                  type: "actions",
+                  elements: [
+                    {
+                      type: "button",
+                      label: "Disconnect gateway",
+                      action_id: "disconnect",
+                      style: "secondary",
+                    },
+                  ],
+                },
+              ],
+            ],
+          },
+        ]
+      : [context("Only an Administrator can modify enabled collections or disconnect the gateway.")];
 
   blocks.push({
     type: "tab",
@@ -687,6 +812,10 @@ export function workspacePage(
       {
         label: `Approval Queue (${proposals.length})`,
         blocks: approvalBlocks,
+      },
+      {
+        label: "Agent Templates (blobster.dev)",
+        blocks: agentTemplatesBlocks(),
       },
       {
         label: "Collections & Connection",
@@ -819,9 +948,11 @@ export async function openclawAdmin(
 
   const currentUserId = route.user?.id ?? "anonymous";
   const isAdmin = role >= ADMIN;
+  const extraEnv = extractRouteRuntimeEnv(route) ?? extractRouteRuntimeEnv(ctx);
+  const playgroundLocked = isPlaygroundLocked(extraEnv);
   const collections = await discoverSiteCollections(ctx);
   const siteOrigin = resolveSiteOrigin(route);
-  const pairingCode = isAdmin ? await loadOrCreatePairingCode(ctx) : "";
+  const pairingCode = isAdmin && !playgroundLocked ? await loadOrCreatePairingCode(ctx) : "";
   const event = parseInteraction(route.input);
   if (!event) {
     return {
@@ -832,6 +963,36 @@ export async function openclawAdmin(
     };
   }
 
+  if (
+    playgroundLocked &&
+    ((event.type === "block_action" &&
+      (event.action_id === "rotate_pairing_code" || event.action_id === "disconnect")) ||
+      (event.type === "form_submit" &&
+        (event.action_id === "save_connection" ||
+          event.action_id === "save_settings" ||
+          event.action_id === "save_collections")))
+  ) {
+    const lockedConnState = await loadConnectionState(ctx, extraEnv);
+    if (lockedConnState.connection) {
+      const proposals = await loadProposals(ctx);
+      const activeTurn = await loadActiveTurn(ctx, currentUserId);
+      return workspacePage(
+        lockedConnState.connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        PLAYGROUND_LOCKED_MESSAGE,
+        { type: "info", message: PLAYGROUND_LOCKED_MESSAGE },
+        true,
+      );
+    }
+    return setupPage(isAdmin, collections, siteOrigin, "", PLAYGROUND_LOCKED_MESSAGE, {
+      type: "info",
+      message: PLAYGROUND_LOCKED_MESSAGE,
+    });
+  }
+
   if (event.type === "block_action" && event.action_id === "rotate_pairing_code" && isAdmin) {
     const rotated = await rotatePairingCode(ctx);
     return setupPage(true, collections, siteOrigin, rotated, undefined, {
@@ -840,7 +1001,10 @@ export async function openclawAdmin(
     });
   }
 
-  if (event.type === "form_submit" && event.action_id === "save_connection") {
+  if (
+    event.type === "form_submit" &&
+    (event.action_id === "save_connection" || event.action_id === "save_settings")
+  ) {
     if (!isAdmin) {
       return setupPage(
         false,
@@ -931,7 +1095,7 @@ export async function openclawAdmin(
     );
   }
 
-  const connState = await loadConnectionState(ctx);
+  const connState = await loadConnectionState(ctx, extraEnv);
   const connection = connState.connection;
   if (!connection) {
     if (event.type === "block_action" && event.action_id === "check_pairing") {
@@ -1128,7 +1292,16 @@ export async function openclawAdmin(
     );
   }
 
-  return workspacePage(connection, collections, proposals, activeTurn, isAdmin);
+  return workspacePage(
+    connection,
+    collections,
+    proposals,
+    activeTurn,
+    isAdmin,
+    undefined,
+    undefined,
+    playgroundLocked,
+  );
 }
 
 /**
@@ -1146,7 +1319,8 @@ export async function openclawEditorPanel(
     };
   }
 
-  const connection = await loadConnection(ctx);
+  const extraEnv = extractRouteRuntimeEnv(route) ?? extractRouteRuntimeEnv(ctx);
+  const connection = await loadConnection(ctx, extraEnv);
   if (!connection) {
     return {
       blocks: [
@@ -1278,6 +1452,8 @@ export async function openclawPairRoute(
     typeof route.input === "object" && route.input !== null
       ? (route.input as Record<string, unknown>)
       : {};
+  const extraEnv = extractRouteRuntimeEnv(route) ?? extractRouteRuntimeEnv(ctx);
+  const playgroundLocked = isPlaygroundLocked(extraEnv);
   const siteOrigin = resolveSiteOrigin(route);
   const endpointUrl = `${siteOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`;
   const collections = await discoverSiteCollections(ctx);
@@ -1353,6 +1529,16 @@ export async function openclawPairRoute(
       };
     }
     if (input.method === "tools/call") {
+      if (playgroundLocked) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32001,
+            message: `PLAYGROUND_LOCKED: ${PLAYGROUND_LOCKED_MESSAGE}`,
+          },
+        };
+      }
       const params =
         typeof input.params === "object" && input.params !== null
           ? (input.params as Record<string, unknown>)
@@ -1362,7 +1548,8 @@ export async function openclawPairRoute(
         typeof params.arguments === "object" && params.arguments !== null
           ? (params.arguments as Record<string, unknown>)
           : {};
-      const connection = await loadConnection(ctx);
+      const connState = await loadConnectionState(ctx, extraEnv);
+      const connection = connState.fromPlaygroundEnv ? null : connState.connection;
       const suppliedToken =
         extractSessionTokenHeader(route) ??
         cleanText(params.sessionToken, 300) ??
@@ -1485,7 +1672,16 @@ export async function openclawPairRoute(
   // 2. Agent REST actions (poll_turn / complete_turn / propose) using minted sessionToken
   const action = cleanText(input.action, 40);
   if (action) {
-    const connection = await loadConnection(ctx);
+    if (playgroundLocked) {
+      return {
+        ok: false,
+        error: "PLAYGROUND_LOCKED",
+        playgroundLocked: true,
+        message: PLAYGROUND_LOCKED_MESSAGE,
+      };
+    }
+    const connState = await loadConnectionState(ctx, extraEnv);
+    const connection = connState.fromPlaygroundEnv ? null : connState.connection;
     const token =
       extractSessionTokenHeader(route) ??
       cleanText(input.sessionToken, 300) ??
@@ -1561,6 +1757,14 @@ export async function openclawPairRoute(
   }
 
   // 3. 1-Step Pairing via admin-minted one-time pairingCode (never mints on unauthenticated requests)
+  if (playgroundLocked) {
+    return {
+      ok: false,
+      error: "PLAYGROUND_LOCKED",
+      playgroundLocked: true,
+      message: PLAYGROUND_LOCKED_MESSAGE,
+    };
+  }
   const pairingCode = cleanText(input.pairingCode, 120);
   const storedCode = ctx.kv ? await ctx.kv.get("pairing_code") : null;
   const expiresAt = ctx.kv ? await ctx.kv.get("pairing_code_expires_at") : null;

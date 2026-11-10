@@ -1,7 +1,4 @@
-import { installNodeGatewayBridge } from "./gateway-bridge.js";
 import { subscribeOpenClawEvents } from "./sse-bus.js";
-
-installNodeGatewayBridge();
 
 export const prerender = false;
 
