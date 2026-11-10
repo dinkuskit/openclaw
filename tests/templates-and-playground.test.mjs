@@ -594,12 +594,17 @@ test("generated archive install commands extract local packages and stop after d
   const callsPath = path.join(root, "calls.jsonl");
   fs.writeFileSync(path.join(bin, "curl"), `#!${process.execPath}
 const fs = require('node:fs');
+if (process.argv.includes('POST')) {
+  fs.appendFileSync(process.env.PAIR_CALLS, 'paired\\n');
+  process.exit(0);
+}
 if (process.env.FAIL_DOWNLOAD) process.exit(22);
 fs.copyFileSync(process.env.FIXTURE_ARCHIVE, process.argv[process.argv.indexOf('-o') + 1]);
 `);
   fs.writeFileSync(path.join(bin, "openclaw"), `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
+if (args[0] === 'templates' && process.env.FAIL_TEMPLATE_STAGE === args[1]) process.exit(12);
 if (args[0] === 'templates') {
   if (!fs.existsSync(require('node:path').join(args[2], 'package.json'))) process.exit(2);
 }
@@ -631,6 +636,24 @@ fs.appendFileSync(process.env.CALLS_PATH, JSON.stringify(args) + '\\n');
     const before = fs.readFileSync(callsPath, "utf8");
     assert.throws(() => execFileSync("sh", ["-c", commands.installCommand], { env: { ...env, FAIL_DOWNLOAD: "1" }, stdio: "pipe" }));
     assert.equal(fs.readFileSync(callsPath, "utf8"), before);
+    const pairCalls = path.join(root, `pair-calls-${nested}`);
+    const corruptArchive = path.join(root, `corrupt-${nested}.tgz`);
+    fs.writeFileSync(corruptArchive, "not a tar archive");
+    for (const failure of [
+      { FAIL_DOWNLOAD: "1" },
+      { FIXTURE_ARCHIVE: corruptArchive },
+      { FAIL_TEMPLATE_STAGE: "validate" },
+      { FAIL_TEMPLATE_STAGE: "add" },
+    ]) {
+      assert.throws(() => execFileSync("sh", ["-c", commands.fullSetupScript], {
+        env: { ...env, PAIR_CALLS: pairCalls, ...failure }, stdio: "pipe",
+      }), "full setup must fail before pairing after an installation failure");
+      assert.equal(fs.existsSync(pairCalls), false, "failed setup must not submit pairing");
+    }
+    execFileSync("sh", ["-c", commands.fullSetupScript], {
+      env: { ...env, PAIR_CALLS: pairCalls }, stdio: "pipe",
+    });
+    assert.equal(fs.readFileSync(pairCalls, "utf8"), "paired\n");
   }
 });
 
@@ -671,4 +694,67 @@ test("server-owned loopback uses native fetch with redirects refused while saved
     globalThis.fetch = originalFetch;
     clearPlaygroundEnv();
   }
+});
+
+test("Cloudflare Access credentials require a valid matching server-configured origin", async () => {
+  const cases = [
+    { configuredUrl: undefined, savedUrl: "https://untrusted.example.test", expectCredentials: false },
+    { configuredUrl: "not a URL", savedUrl: "https://untrusted.example.test", expectCredentials: false },
+    { configuredUrl: "https://gateway.example.test", savedUrl: "https://untrusted.example.test", expectCredentials: false },
+    { configuredUrl: "https://gateway.example.test", savedUrl: "https://gateway.example.test", expectCredentials: true },
+  ];
+  clearPlaygroundEnv();
+  try {
+    for (const { configuredUrl, savedUrl, expectCredentials } of cases) {
+      globalThis.__openclawPlaygroundEnv = {
+        OPENCLAW_PLAYGROUND_GATEWAY_URL: configuredUrl,
+        OPENCLAW_PLAYGROUND_GATEWAY_TOKEN: "synthetic_server_token",
+        OPENCLAW_PLAYGROUND_CF_ACCESS_CLIENT_ID: "synthetic_access_id",
+        OPENCLAW_PLAYGROUND_CF_ACCESS_CLIENT_SECRET: "synthetic_access_secret",
+      };
+      const calls = [];
+      const savedSettings = new Map([["connection", { revision: "1", value: JSON.stringify({
+        gatewayUrl: savedUrl, gatewayToken: "synthetic_saved_token", agentId: "openclaw",
+        authorityMode: "read_only", enabledCollections: ["pages"],
+      }) }]]);
+      await createWorkerdPlugin().routes.chat.handler(createPlaygroundRouteCtx({
+        sharedSettings: savedSettings,
+        includeCtxHttp: true,
+        ctxHttpFetch: async (url, init) => {
+          calls.push({ url, headers: init.headers });
+          return Response.json({ choices: [{ message: { content: "Fixture reply" } }] });
+        },
+        input: { action: "send_message", prompt: "Hello" },
+      }));
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].headers["CF-Access-Client-Id"], expectCredentials ? "synthetic_access_id" : undefined);
+      assert.equal(calls[0].headers["CF-Access-Client-Secret"], expectCredentials ? "synthetic_access_secret" : undefined);
+    }
+  } finally {
+    clearPlaygroundEnv();
+  }
+});
+
+test("pairing command preserves shell metacharacters as a literal URL", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-pair-quote-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(bin);
+  const marker = path.join(root, "expanded");
+  const argsFile = path.join(root, "curl-args.json");
+  fs.writeFileSync(path.join(bin, "mark"), `#!${process.execPath}
+require('node:fs').writeFileSync(process.env.EXPANSION_MARKER, 'expanded');
+`);
+  fs.writeFileSync(path.join(bin, "curl"), `#!${process.execPath}
+require('node:fs').writeFileSync(process.env.CURL_ARGS, JSON.stringify(process.argv.slice(2)));
+`);
+  for (const name of ["mark", "curl"]) fs.chmodSync(path.join(bin, name), 0o755);
+  const origin = "https://$(mark).example";
+  const commands = buildAgentTemplateInstallCommands("blobster-smith", origin, "oc_pair_fixture");
+  execFileSync("sh", ["-c", commands.pairCommand], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, EXPANSION_MARKER: marker, CURL_ARGS: argsFile },
+  });
+  assert.equal(fs.existsSync(marker), false, "pairing URL must never execute shell substitutions");
+  const args = JSON.parse(fs.readFileSync(argsFile, "utf8"));
+  assert.ok(args.includes(`${origin}/_emdash/api/plugins/dinkus-openclaw/pair`));
 });

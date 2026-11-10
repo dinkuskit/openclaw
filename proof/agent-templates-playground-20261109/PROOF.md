@@ -127,3 +127,32 @@ this repair. Backend: 106,323 bytes, 24,749 bytes headroom;
 SHA-256: `0d077eab07136b71109f6bc09788ed6400062428d186ce35eedffdba12c65287`.
 `git diff --check` passed. The repair diff was also checked for other bare helper
 references; remaining references are imports, exports, or function calls.
+
+## Credential and setup failure-path repairs
+
+The review of `5a51545816232b7c0803a94ae049d756821b5f73` identified three
+additional `required_fix` findings. All three reproduced in local tests against
+that source before repair:
+
+- Configured Cloudflare Access credentials were attached to a saved endpoint
+  when the server Gateway URL was absent or invalid. Both headers now require
+  a valid server-configured Gateway URL and an exact origin match. Request-level
+  fixtures cover missing, malformed, mismatched and matching URLs.
+- A pairing origin containing shell command-substitution syntax executed a
+  command when the generated pairing snippet ran. The complete pairing URL now
+  uses the shell argument quoting helper. A real-shell test uses a harmless
+  marker command, verifies the marker is never executed, and checks that the
+  stubbed HTTP client receives the literal URL.
+- A failed template installation did not prevent the full setup script from
+  submitting its pairing request. Enable, validation and installation stages
+  now stop the script on failure inside a subshell. Real-shell fixtures verify
+  that download, extraction, validation and add failures never reach the
+  stubbed pairing request; the success case pairs once.
+
+The shell tests replace HTTP and OpenClaw executables with local fixtures.
+They perform no real pairing, account change, or Gateway deployment.
+
+`./bin/verify-openclaw quick` passed all 23 tests, typecheck and both builds.
+Backend: 106,367 bytes with 24,705 bytes headroom; SHA-256:
+`9035037594e8dee3686c6a9f6c56de657d2b71bb1311e045c7ccf99e7f3951a0`.
+`git diff --check` passed.

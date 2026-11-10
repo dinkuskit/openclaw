@@ -334,14 +334,17 @@ export function buildAgentTemplateInstallCommands(
     typeof pairingCode === "string" && /^oc_pair_[a-z0-9_]+$/i.test(pairingCode.trim())
       ? pairingCode.trim()
       : "<PAIRING_CODE>";
-  const pairCommand = `curl -sS -X POST "${cleanOrigin}/_emdash/api/plugins/dinkus-openclaw/pair" -H "content-type: application/json" -d '{"pairingCode":"${cleanPairingCode}","agentId":"${agentId}","authorityMode":"propose_with_approval"}'`;
+  const pairUrl = shellSafeArg(`${cleanOrigin}/_emdash/api/plugins/dinkus-openclaw/pair`);
+  const pairCommand = `curl -sS -X POST ${pairUrl} -H "content-type: application/json" -d '{"pairingCode":"${cleanPairingCode}","agentId":"${agentId}","authorityMode":"propose_with_approval"}'`;
 
   const fullSetupScript = [
-    `# 1. Enable Agent Templates on a fresh OpenClaw gateway\n${enableTemplatesCommand}`,
-    ...(!isArchive ? [`# 2. Validate local agents-template bundle\n${validateCommand}`] : []),
-    `# 3. Install Agent Template into your OpenClaw harness\n${installCommand}`,
+    "(",
+    `# 1. Enable Agent Templates on a fresh OpenClaw gateway\n${enableTemplatesCommand} || exit $?`,
+    ...(!isArchive ? [`# 2. Validate local agents-template bundle\n${validateCommand} || exit $?`] : []),
+    `# 3. Install Agent Template into your OpenClaw harness\n${installCommand} || exit $?`,
     `# 4. Start the Gateway in a separate terminal before pairing agent ${agentId}:\n# ${harnessCommand}`,
     `# 5. Pair @${agentId} with @dinkuskit/openclaw (${cleanOrigin})\n${pairCommand}`,
+    ")",
   ].join("\n\n");
 
   return {

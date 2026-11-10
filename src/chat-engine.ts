@@ -1429,7 +1429,8 @@ async function tryExternalHttpGatewayTurn(
   if (
     playgroundCfg.cfAccessClientId &&
     playgroundCfg.cfAccessClientSecret &&
-    (!playgroundCfg.gatewayUrl || isSameGatewayOrigin(endpoint, playgroundCfg.gatewayUrl))
+    playgroundCfg.gatewayUrl &&
+    isSameGatewayOrigin(endpoint, playgroundCfg.gatewayUrl)
   ) {
     headers["CF-Access-Client-Id"] = playgroundCfg.cfAccessClientId;
     headers["CF-Access-Client-Secret"] = playgroundCfg.cfAccessClientSecret;
