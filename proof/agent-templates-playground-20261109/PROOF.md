@@ -17,7 +17,7 @@
 
 2. **Cloudflare Workers (`workerd`) & Server-Locked EmDash Playground Mode**:
    - Split Node-only `@openclaw/gateway-client` (`ws`, `node:tls`, `node:crypto`) into `dist/gateway-bridge.mjs` loaded lazily only on true Node runtimes, emitted pure Web-standard `dist/native.workerd.mjs` (`exports["./native"].workerd`) and `dist/stream-endpoint.mjs` with zero `node:*` or `ws` imports.
-   - Added `globalThis.fetch` fallback in `tryExternalHttpGatewayTurn` when `ctx.http` is absent on native in-process EmDash plugins, passing `model: "openclaw/<agentId>"`, `x-openclaw-agent-id`, `x-openclaw-scopes: "operator.write"`, `x-openclaw-session-key`, `user: sessionKey`, and optional origin-bound `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.
+   - Added `globalThis.fetch` fallback in `tryExternalHttpGatewayTurn` when `ctx.http` is absent on native in-process EmDash plugins, and bypassed EmDash's `ctx.http.fetch` non-public IP blocker for loopback (`127.0.0.1` / `localhost` / `[::1]`) and server-trusted `OPENCLAW_PLAYGROUND_GATEWAY_URL` targets while keeping `ctx.http.fetch` first for non-loopback user-configured URLs; passes `model: "openclaw/<agentId>"`, `x-openclaw-agent-id`, `x-openclaw-scopes: "operator.write"`, `x-openclaw-session-key`, `user: sessionKey`, and optional origin-bound `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.
    - Implemented server-locked `OPENCLAW_PLAYGROUND_*` env mode (`process.env` and `globalThis.__openclawPlaygroundEnv`) returning connected `propose_with_approval` state (`allowGatewayExecApprovals: false`, `gatewayBridge: { available: true, state: "connected" }`) without writing secrets to visitor SQLite or exposing tokens to browsers, blocking settings/SSRF/`/pair`/exec-approval mutations under `OPENCLAW_PLAYGROUND_LOCK=1`, and hashing `emdash_playground` cookie / `x-openclaw-playground-visitor` header via WebCrypto SHA-256 (`agent:<agentId>:pg-<visitorHash>:<convId>`).
 
 ---
@@ -26,7 +26,7 @@
 
 | Metric | Baseline (`4b32339`) | Candidate | Limit | Headroom |
 | --- | ---: | ---: | ---: | ---: |
-| Packaged `backend.js` | `94,376 B` | `103,372 B` | `131,072 B` | `27,700 B` |
+| Packaged `backend.js` | `94,376 B` | `103,652 B` | `131,072 B` | `27,420 B` |
 | Unit & Integration Tests | `16 / 16` | `19 / 19` | — | Pass |
 
 Commands verified:
@@ -36,7 +36,7 @@ Commands verified:
 # tsc --noEmit -> pass
 # emdash-plugin validate && emdash-plugin build -> pass
 # node scripts/build-native.mjs -> native_harness_build=pass
-# node scripts/check-registry-bundle.mjs -> registry_bundle=pass backend_bytes=103372 headroom_bytes=27700
+# node scripts/check-registry-bundle.mjs -> registry_bundle=pass backend_bytes=103652 headroom_bytes=27420
 # node --test tests/*.test.mjs -> 19/19 pass
 ```
 

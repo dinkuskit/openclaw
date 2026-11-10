@@ -1341,12 +1341,22 @@ interface HttpGatewayTurnOptions {
   priorMessages: ChatTurnMessage[];
   systemContext: string;
   extraEnv?: Record<string, unknown>;
+  fromPlaygroundEnv?: boolean;
 }
 
 interface HttpGatewayTurnResult {
   ok: boolean;
   replyText?: string;
   errorMessage?: string;
+}
+
+function isLoopbackHttpEndpoint(rawUrl: string): boolean {
+  try {
+    const host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeHttpGatewayErrorMessage(raw: string): string {
@@ -1386,11 +1396,19 @@ async function tryExternalHttpGatewayTurn(
   const endpoint = base.endsWith("/v1/chat/completions")
     ? base
     : `${base}/v1/chat/completions`;
-  const httpFetch = ctx?.http?.fetch
-    ? ctx.http.fetch.bind(ctx.http)
-    : typeof globalThis.fetch === "function"
-      ? globalThis.fetch.bind(globalThis)
-      : null;
+  const playgroundCfg = readPlaygroundEnvConfig(options.extraEnv);
+  const isTrustedPlaygroundOrigin = Boolean(
+    options.fromPlaygroundEnv ||
+      (playgroundCfg.gatewayUrl && isSameGatewayOrigin(endpoint, playgroundCfg.gatewayUrl)),
+  );
+  // EmDash's host `ctx.http.fetch` wrapper rejects loopback targets (`127.0.0.1` / `localhost` / `[::1]`)
+  // as non-public IPs. Use `globalThis.fetch` directly for loopback gateways and server-configured
+  // `OPENCLAW_PLAYGROUND_GATEWAY_URL`, while keeping `ctx.http.fetch` first for non-loopback user URLs.
+  const bypassHostHttpGuard = isLoopbackHttpEndpoint(endpoint) || isTrustedPlaygroundOrigin;
+  const globalFetch =
+    typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+  const ctxFetch = ctx?.http?.fetch ? ctx.http.fetch.bind(ctx.http) : null;
+  const httpFetch = bypassHostHttpGuard ? (globalFetch ?? ctxFetch) : (ctxFetch ?? globalFetch);
   if (!httpFetch) {
     return {
       ok: false,
@@ -1398,7 +1416,6 @@ async function tryExternalHttpGatewayTurn(
         "HTTP client capability (`ctx.http` / `globalThis.fetch`) is unavailable in this runtime.",
     };
   }
-  const playgroundCfg = readPlaygroundEnvConfig(options.extraEnv);
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${connection.gatewayToken}`,
@@ -4247,6 +4264,7 @@ export async function openclawChatRoute(
         priorMessages: targetThread.messages,
         systemContext: `${catalogDigest}${proposalInstruction}`,
         extraEnv,
+        fromPlaygroundEnv: Boolean(connState.fromPlaygroundEnv),
       });
 
       if (!httpResult.ok || !httpResult.replyText) {

@@ -470,15 +470,24 @@ test("OPENCLAW_PLAYGROUND_* env mode, globalThis.fetch + CF-Access headers, lock
     );
     assert.notEqual(reqA.body.user, reqB.body.user);
 
-    // 5. Also verify process.env fallback when globalThis.__openclawPlaygroundEnv is unset
+    // 5. Also verify process.env fallback + loopback 127.0.0.1 bypasses EmDash ctx.http non-public IP blocker!
     delete globalThis.__openclawPlaygroundEnv;
     process.env.OPENCLAW_PLAYGROUND_GATEWAY_URL = "http://127.0.0.1:19011";
     process.env.OPENCLAW_PLAYGROUND_GATEWAY_TOKEN = "oc_local_dev_tok";
+    let hostHttpCalled = 0;
+    const blockingHostHttpFetch = async targetUrl => {
+      hostHttpCalled += 1;
+      throw new Error(
+        `Plugin "dinkus-openclaw": blocked fetch to "${new URL(String(targetUrl)).hostname}": URLs targeting non-public IP addresses are not allowed`,
+      );
+    };
     const localSnap = await chat(
       createPlaygroundRouteCtx({
         role: 50,
         sharedSettings: new Map(),
         sharedKv: new Map(),
+        includeCtxHttp: true,
+        ctxHttpFetch: blockingHostHttpFetch,
         input: { action: "get_workspace" },
       }),
     );
@@ -486,6 +495,69 @@ test("OPENCLAW_PLAYGROUND_* env mode, globalThis.fetch + CF-Access headers, lock
     assert.equal(localSnap.connection.gatewayUrl, "http://127.0.0.1:19011");
     assert.equal(localSnap.connection.agentId, "blobster-smith");
     assert.equal(localSnap.playgroundLocked, false);
+
+    const loopbackTurn = await chat(
+      createPlaygroundRouteCtx({
+        role: 50,
+        headers: { cookie: "emdash_playground=local_loopback_visitor" },
+        sharedSettings: new Map(),
+        sharedKv: new Map(),
+        includeCtxHttp: true,
+        ctxHttpFetch: blockingHostHttpFetch,
+        input: {
+          action: "send_message",
+          prompt: "Test local loopback gateway turn when ctx.http blocks 127.0.0.1",
+        },
+      }),
+    );
+    assert.equal(hostHttpCalled, 0, "Loopback / Playground turns must call globalThis.fetch instead of ctx.http.fetch");
+    assert.equal(outboundCalls.length, 3);
+    assert.equal(outboundCalls[2].url, "http://127.0.0.1:19011/v1/chat/completions");
+    const loopbackThread = loopbackTurn.threads.find(
+      t => t.conversationId === loopbackTurn.activeConversationId,
+    );
+    assert.equal(loopbackThread.messages.at(-1).status, "completed");
+    assert.match(loopbackThread.messages.at(-1).content, /Forged a crisp update/);
+
+    // 6. User-configured loopback URL (without Playground env) ALSO bypasses ctx.http non-public IP blocker
+    clearPlaygroundEnv();
+    const manualLoopbackSettings = new Map();
+    const manualLoopbackKv = new Map();
+    await chat(
+      createPlaygroundRouteCtx({
+        role: 50,
+        sharedSettings: manualLoopbackSettings,
+        sharedKv: manualLoopbackKv,
+        includeCtxHttp: true,
+        ctxHttpFetch: blockingHostHttpFetch,
+        input: {
+          action: "configure_connection",
+          gatewayUrl: "http://127.0.0.1:19012",
+          agentId: "blobster-smith",
+          gatewayToken: "oc_manual_loopback_tok",
+          authorityMode: "propose_with_approval",
+        },
+      }),
+    );
+    const manualLoopbackTurn = await chat(
+      createPlaygroundRouteCtx({
+        role: 50,
+        sharedSettings: manualLoopbackSettings,
+        sharedKv: manualLoopbackKv,
+        includeCtxHttp: true,
+        ctxHttpFetch: blockingHostHttpFetch,
+        input: { action: "send_message", prompt: "Ping manual loopback gateway" },
+      }),
+    );
+    assert.equal(hostHttpCalled, 0);
+    assert.equal(outboundCalls.length, 4);
+    assert.equal(outboundCalls[3].url, "http://127.0.0.1:19012/v1/chat/completions");
+    assert.equal(
+      manualLoopbackTurn.threads
+        .find(t => t.conversationId === manualLoopbackTurn.activeConversationId)
+        .messages.at(-1).status,
+      "completed",
+    );
   } finally {
     globalThis.fetch = origFetch;
     clearPlaygroundEnv();
