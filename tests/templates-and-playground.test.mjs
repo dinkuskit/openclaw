@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { validateBlockResponse } from "@emdash-cms/blocks/server";
 import pluginSandbox from "../dist/plugin.mjs";
 import {
@@ -130,13 +133,13 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
   assert.equal(smith.detailUrl, "https://blobster.dev/templates/blobster-smith");
   assert.equal(
     smith.installCommand,
-    "openclaw templates add https://blobster.dev/t/blobster-smith.tgz",
+    buildAgentTemplateInstallCommands("blobster-smith").installCommand,
   );
   assert.equal(sculptor.name, "Blobster Sculptor · Avatar & Identity Rig");
   assert.equal(sculptor.packageUrl, "https://blobster.dev/t/blobster-sculptor.tgz");
   assert.equal(
     sculptor.installCommand,
-    "openclaw templates add https://blobster.dev/t/blobster-sculptor.tgz",
+    buildAgentTemplateInstallCommands("blobster-sculptor").installCommand,
   );
 
   // 1. Helper supports slug, .tgz URL, and local path + shell escaping
@@ -149,10 +152,11 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
   assert.equal(fromSlug.agentId, "blobster-smith");
   assert.equal(
     fromSlug.installCommand,
-    "openclaw templates add https://blobster.dev/t/blobster-smith.tgz",
+    buildAgentTemplateInstallCommands("blobster-smith").installCommand,
   );
   assert.match(fromSlug.enableTemplatesCommand, /gateway\.controlUi\.experimental\.templates true/);
-  assert.match(fromSlug.harnessCommand, /--agent-id blobster-smith/);
+  assert.equal(fromSlug.harnessCommand, "openclaw gateway run");
+  assert.match(fromSlug.installCommand, /--agent-id blobster-smith/);
   assert.match(fromSlug.pairCommand, /"agentId":"blobster-smith"/);
   assert.match(fromSlug.pairCommand, /"pairingCode":"oc_pair_abc123"/);
 
@@ -162,10 +166,8 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
   );
   assert.equal(fromUrl.sourceKind, "tarball-url");
   assert.equal(fromUrl.agentId, "custom-curator");
-  assert.equal(
-    fromUrl.installCommand,
-    "openclaw templates add https://example.com/releases/custom-curator-1.2.0.tgz",
-  );
+  assert.match(fromUrl.installCommand, /curl --fail --show-error --location https:\/\/example.com\/releases\/custom-curator-1.2.0.tgz/);
+  assert.match(fromUrl.installCommand, /openclaw templates add "\$openclaw_template_dir" --agent-id custom-curator/);
   assert.match(fromUrl.pairCommand, /<PAIRING_CODE>/);
 
   const fromLocal = buildAgentTemplateInstallCommands(
@@ -178,7 +180,7 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
     fromLocal.validateCommand,
     `openclaw templates validate './agents/my local'\\''agent'`,
   );
-  assert.equal(fromLocal.installCommand, `openclaw templates add './agents/my local'\\''agent'`);
+  assert.equal(fromLocal.installCommand, `openclaw templates add './agents/my local'\\''agent' --agent-id my-local-agent`);
 
   // 2. Snapshot exposes featured templates & catalog URLs
   clearPlaygroundEnv();
@@ -201,7 +203,7 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
   );
   assert.doesNotThrow(() => validateBlockResponse(setupRes));
   const setupJson = JSON.stringify(setupRes);
-  assert.match(setupJson, /openclaw templates add https:\/\/blobster\.dev\/t\/blobster-smith\.tgz/);
+  assert.match(setupJson, /curl --fail --show-error --location https:\/\/blobster\.dev\/t\/blobster-smith\.tgz/);
   assert.match(setupJson, /https:\/\/blobster\.dev\/submit/);
 
   sharedSettings.set("connection", {
@@ -223,7 +225,7 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
   assert.match(connectedJson, /Agent Templates \(blobster\.dev\)/);
   assert.match(
     connectedJson,
-    /openclaw templates add https:\/\/blobster\.dev\/t\/blobster-smith\.tgz/,
+    /curl --fail --show-error --location https:\/\/blobster\.dev\/t\/blobster-smith\.tgz/,
   );
 
   // 4. Precompiled `<openclaw-emdash-chat>` bundle contains Agent Templates UI controls & links
@@ -519,7 +521,7 @@ test("OPENCLAW_PLAYGROUND_* env mode, globalThis.fetch + CF-Access headers, lock
     assert.equal(loopbackThread.messages.at(-1).status, "completed");
     assert.match(loopbackThread.messages.at(-1).content, /Forged a crisp update/);
 
-    // 6. User-configured loopback URL (without Playground env) ALSO bypasses ctx.http non-public IP blocker
+    // 6. User-configured loopback URLs retain the host non-public IP protection.
     clearPlaygroundEnv();
     const manualLoopbackSettings = new Map();
     const manualLoopbackKv = new Map();
@@ -549,17 +551,102 @@ test("OPENCLAW_PLAYGROUND_* env mode, globalThis.fetch + CF-Access headers, lock
         input: { action: "send_message", prompt: "Ping manual loopback gateway" },
       }),
     );
-    assert.equal(hostHttpCalled, 0);
-    assert.equal(outboundCalls.length, 4);
-    assert.equal(outboundCalls[3].url, "http://127.0.0.1:19012/v1/chat/completions");
-    assert.equal(
-      manualLoopbackTurn.threads
-        .find(t => t.conversationId === manualLoopbackTurn.activeConversationId)
-        .messages.at(-1).status,
-      "completed",
-    );
+    assert.equal(hostHttpCalled, 1);
+    assert.equal(outboundCalls.length, 3);
+    const manualReply = manualLoopbackTurn.threads
+      .find(t => t.conversationId === manualLoopbackTurn.activeConversationId)
+      .messages.at(-1);
+    assert.equal(manualReply.status, "failed");
+    assert.match(manualReply.content, /non-public IP addresses are not allowed/);
   } finally {
     globalThis.fetch = origFetch;
+    clearPlaygroundEnv();
+  }
+});
+
+test("generated archive install commands extract local packages and stop after download failure", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-template-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(bin);
+  const callsPath = path.join(root, "calls.jsonl");
+  fs.writeFileSync(path.join(bin, "curl"), `#!${process.execPath}
+const fs = require('node:fs');
+if (process.env.FAIL_DOWNLOAD) process.exit(22);
+fs.copyFileSync(process.env.FIXTURE_ARCHIVE, process.argv[process.argv.indexOf('-o') + 1]);
+`);
+  fs.writeFileSync(path.join(bin, "openclaw"), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args[0] === 'templates') {
+  if (!fs.existsSync(require('node:path').join(args[2], 'package.json'))) process.exit(2);
+}
+fs.appendFileSync(process.env.CALLS_PATH, JSON.stringify(args) + '\\n');
+`);
+  for (const name of ["curl", "openclaw"]) fs.chmodSync(path.join(bin, name), 0o755);
+  for (const nested of [false, true]) {
+    const fixture = path.join(root, `fixture-${nested}`);
+    const pkg = nested ? path.join(fixture, "package") : fixture;
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "fixture", openclaw: { template: "CLAW.md" } }));
+    fs.writeFileSync(path.join(pkg, "CLAW.md"), "---\nschemaVersion: 1\n---\nFixture");
+    const archive = path.join(root, `fixture-${nested}.tgz`);
+    execFileSync("tar", ["-czf", archive, "-C", fixture, "."]);
+    const commands = buildAgentTemplateInstallCommands("https://example.test/my%20agent.tgz?edition=o'clock&x=1");
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_ARCHIVE: archive, CALLS_PATH: callsPath, TMPDIR: root };
+    execFileSync("sh", ["-c", commands.installCommand], { env });
+    const calls = fs.readFileSync(callsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(calls.at(-2).slice(0, 2), ["templates", "validate"]);
+    assert.deepEqual(calls.at(-1).slice(0, 2), ["templates", "add"]);
+    assert.equal(calls.at(-1)[2], calls.at(-2)[2]);
+    assert.deepEqual(calls.at(-1).slice(3), ["--agent-id", "my-20agent"]);
+    const localArchiveCommands = buildAgentTemplateInstallCommands(archive);
+    execFileSync("sh", ["-c", localArchiveCommands.installCommand], { env });
+    const localCalls = fs.readFileSync(callsPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.deepEqual(localCalls.at(-2).slice(0, 2), ["templates", "validate"]);
+    assert.deepEqual(localCalls.at(-1).slice(0, 2), ["templates", "add"]);
+    assert.notEqual(localCalls.at(-1)[2], archive);
+    const before = fs.readFileSync(callsPath, "utf8");
+    assert.throws(() => execFileSync("sh", ["-c", commands.installCommand], { env: { ...env, FAIL_DOWNLOAD: "1" }, stdio: "pipe" }));
+    assert.equal(fs.readFileSync(callsPath, "utf8"), before);
+  }
+});
+
+test("server-owned loopback uses native fetch with redirects refused while saved connections retain host SSRF checks", async () => {
+  clearPlaygroundEnv();
+  const originalFetch = globalThis.fetch;
+  const nativeCalls = [];
+  let hostCalls = 0;
+  globalThis.fetch = async (url, init) => {
+    nativeCalls.push({ url, init });
+    return Response.json({ choices: [{ message: { content: "Local reply" } }] });
+  };
+  const blockedHttp = async () => { hostCalls++; throw new Error("Host SSRF blocked loopback"); };
+  try {
+    globalThis.__openclawPlaygroundEnv = {
+      OPENCLAW_PLAYGROUND_GATEWAY_URL: "http://127.0.0.1:19011",
+      OPENCLAW_PLAYGROUND_GATEWAY_TOKEN: "synthetic_server_token",
+      OPENCLAW_PLAYGROUND_LOCK: "1",
+    };
+    const chat = createWorkerdPlugin().routes.chat.handler;
+    await chat(createPlaygroundRouteCtx({ includeCtxHttp: true, ctxHttpFetch: blockedHttp, input: { action: "send_message", prompt: "Hello" } }));
+    assert.equal(hostCalls, 0);
+    assert.equal(nativeCalls.length, 1);
+    assert.equal(nativeCalls[0].url, "http://127.0.0.1:19011/v1/chat/completions");
+    assert.equal(nativeCalls[0].init.redirect, "error");
+
+    // A persisted connection, even at the same server-configured origin, must
+    // retain EmDash's HTTP checks when it is not the server-owned connection.
+    globalThis.__openclawPlaygroundEnv.OPENCLAW_PLAYGROUND_LOCK = "0";
+    const settings = new Map([["connection", { revision: "1", value: JSON.stringify({
+      gatewayUrl: "http://127.0.0.1:19011", gatewayToken: "synthetic_saved_token",
+      agentId: "openclaw", authorityMode: "read_only", enabledCollections: ["pages"],
+    }) }]]);
+    await chat(createPlaygroundRouteCtx({ sharedSettings: settings, includeCtxHttp: true, ctxHttpFetch: blockedHttp, input: { action: "send_message", prompt: "Hello" } }));
+    assert.equal(hostCalls, 1);
+    assert.equal(nativeCalls.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
     clearPlaygroundEnv();
   }
 });

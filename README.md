@@ -104,24 +104,33 @@ Capability-gated sandboxed EmDash Registry plugin (`did:plc:ekk4pjmkh3k3ql2kfoex
 openclaw config set gateway.controlUi.experimental.templates true
 
 # 2. Install a verified template tarball from Blobster Factory
-openclaw templates add https://blobster.dev/t/blobster-smith.tgz
-openclaw templates add https://blobster.dev/t/blobster-sculptor.tgz
+template_dir="$(mktemp -d)"
+curl --fail --show-error --location https://blobster.dev/t/blobster-smith.tgz -o "$template_dir/template.tgz"
+mkdir "$template_dir/source"
+tar -xzf "$template_dir/template.tgz" -C "$template_dir/source"
+template_dir="$template_dir/source"
+# npm-style archives have a package/ root; flat archives use the extraction root.
+if [ -f "$template_dir/package/package.json" ]; then template_dir="$template_dir/package"; fi
+openclaw templates validate "$template_dir"
+openclaw templates add "$template_dir" --agent-id blobster-smith
 
 # 3. Validate and install a local custom template directory during development
 openclaw templates validate ./my-store-agent
 openclaw templates add ./my-store-agent
 
-# 4. Run your OpenClaw gateway targeting the installed template's --agent-id
-openclaw gateway run --agent-id blobster-smith
+# 4. Start the gateway; select blobster-smith in EmDash's Agent ID field
+openclaw gateway run
 ```
 
 - **Connect to `@dinkuskit/openclaw`:** Open **Agent Templates** inside `<openclaw-emdash-chat>` (or the **Agent Templates (`blobster.dev`)** tab in Block Kit), click **Use Agent ID** to pre-fill `agentId` in **Gateway &amp; Pairing** (`ws://127.0.0.1:18789` or `wss://...`), or run the generated `curl` `/pair` snippet from your harness.
-- **Programmatic CLI helper:** `buildAgentTemplateInstallCommands(templateRef, siteOrigin, pairingCode?)` accepts any Blobster slug (`blobster-smith`), `.tgz` URL, or local path and returns shell-safe `enableTemplatesCommand`, `validateCommand`, `installCommand`, `harnessCommand`, and `pairCommand` strings.
+- **Programmatic CLI helper:** `buildAgentTemplateInstallCommands(templateRef, siteOrigin, pairingCode?)` accepts any Blobster slug (`blobster-smith`), `.tgz` URL, or local path and returns shell-safe `enableTemplatesCommand`, `validateCommand`, `installCommand`, `harnessCommand`, and `pairCommand` strings. Archive install commands copy local archives or download URLs, then extract into a fresh temporary directory, validate the package, and add it with the selected agent ID; the directory is retained for inspection.
 - **Discover &amp; Submit:** Browse verified templates at **[https://blobster.dev](https://blobster.dev)** and submit community `agents-template` packages at **[https://blobster.dev/submit](https://blobster.dev/submit)**.
 
 ### Cloudflare Workers (`workerd`) & Server-Locked EmDash Playground Mode
 
 `@dinkuskit/openclaw/native` and `@dinkuskit/openclaw/stream-endpoint` ship dedicated `workerd`-safe ESM entrypoints (zero eager Node `ws` or `node:tls` imports) and fall back cleanly to `globalThis.fetch` for OpenClaw HTTP `/v1/chat/completions` turns (`model: "openclaw/<agentId>"`).
+
+Server-configured loopback gateways use native fetch even when EmDash supplies its SSRF-protected HTTP client; redirects are refused on this path. Connections saved through the UI continue to use the host HTTP client.
 
 For public EmDash Durable Object Playgrounds (where anonymous visitors receive isolated SQLite preview instances with `role: 50`), configure server-only `OPENCLAW_PLAYGROUND_*` variables (via `process.env` or `globalThis.__openclawPlaygroundEnv`):
 

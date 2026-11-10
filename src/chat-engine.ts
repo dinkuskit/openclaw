@@ -1337,11 +1337,11 @@ function parseGatewayAgentProposals(
 
 interface HttpGatewayTurnOptions {
   userRole: number;
+  fromPlaygroundEnv?: boolean;
   sessionKey: string;
   priorMessages: ChatTurnMessage[];
   systemContext: string;
   extraEnv?: Record<string, unknown>;
-  fromPlaygroundEnv?: boolean;
 }
 
 interface HttpGatewayTurnResult {
@@ -1397,18 +1397,21 @@ async function tryExternalHttpGatewayTurn(
     ? base
     : `${base}/v1/chat/completions`;
   const playgroundCfg = readPlaygroundEnvConfig(options.extraEnv);
-  const isTrustedPlaygroundOrigin = Boolean(
-    options.fromPlaygroundEnv ||
-      (playgroundCfg.gatewayUrl && isSameGatewayOrigin(endpoint, playgroundCfg.gatewayUrl)),
-  );
-  // EmDash's host `ctx.http.fetch` wrapper rejects loopback targets (`127.0.0.1` / `localhost` / `[::1]`)
-  // as non-public IPs. Use `globalThis.fetch` directly for loopback gateways and server-configured
-  // `OPENCLAW_PLAYGROUND_GATEWAY_URL`, while keeping `ctx.http.fetch` first for non-loopback user URLs.
-  const bypassHostHttpGuard = isLoopbackHttpEndpoint(endpoint) || isTrustedPlaygroundOrigin;
-  const globalFetch =
-    typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
-  const ctxFetch = ctx?.http?.fetch ? ctx.http.fetch.bind(ctx.http) : null;
-  const httpFetch = bypassHostHttpGuard ? (globalFetch ?? ctxFetch) : (ctxFetch ?? globalFetch);
+  const trustedLoopback =
+    options.fromPlaygroundEnv === true &&
+    playgroundCfg.gatewayUrl === connection.gatewayUrl &&
+    playgroundCfg.gatewayToken === connection.gatewayToken &&
+    isLoopbackHttpEndpoint(endpoint);
+  // EmDash intentionally rejects loopback in ctx.http. Only a server-owned
+  // Playground connection may use the native transport to reach it.
+  const httpFetch =
+    trustedLoopback && typeof globalThis.fetch === "function"
+      ? globalThis.fetch.bind(globalThis)
+      : ctx?.http?.fetch
+        ? ctx.http.fetch.bind(ctx.http)
+        : typeof globalThis.fetch === "function"
+          ? globalThis.fetch.bind(globalThis)
+          : null;
   if (!httpFetch) {
     return {
       ok: false,
@@ -1449,6 +1452,7 @@ async function tryExternalHttpGatewayTurn(
   try {
     const response = await httpFetch(endpoint, {
       method: "POST",
+      ...(trustedLoopback ? { redirect: "error" as const } : {}),
       headers,
       body: JSON.stringify({
         model: `openclaw/${connection.agentId}`,
@@ -4260,11 +4264,11 @@ export async function openclawChatRoute(
       // PATH B1: Administrator-authenticated OpenClaw HTTP(S) `/v1/chat/completions` endpoint
       const httpResult = await tryExternalHttpGatewayTurn(ctx, connection, prompt, {
         userRole: role,
+        fromPlaygroundEnv: connState.fromPlaygroundEnv,
         sessionKey,
         priorMessages: targetThread.messages,
         systemContext: `${catalogDigest}${proposalInstruction}`,
         extraEnv,
-        fromPlaygroundEnv: Boolean(connState.fromPlaygroundEnv),
       });
 
       if (!httpResult.ok || !httpResult.replyText) {

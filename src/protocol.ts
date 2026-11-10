@@ -215,7 +215,7 @@ export const FEATURED_AGENT_TEMPLATES: AgentTemplateEntry[] = [
     categories: ["forging", "agents-template", "cms"],
     packageUrl: "https://blobster.dev/t/blobster-smith.tgz",
     detailUrl: "https://blobster.dev/templates/blobster-smith",
-    installCommand: "openclaw templates add https://blobster.dev/t/blobster-smith.tgz",
+    installCommand: buildAgentTemplateInstallCommands("blobster-smith").installCommand,
   },
   {
     id: "blobster-sculptor",
@@ -225,7 +225,7 @@ export const FEATURED_AGENT_TEMPLATES: AgentTemplateEntry[] = [
     categories: ["identity", "avatar-rig", "design"],
     packageUrl: "https://blobster.dev/t/blobster-sculptor.tgz",
     detailUrl: "https://blobster.dev/templates/blobster-sculptor",
-    installCommand: "openclaw templates add https://blobster.dev/t/blobster-sculptor.tgz",
+    installCommand: buildAgentTemplateInstallCommands("blobster-sculptor").installCommand,
   },
 ];
 
@@ -309,9 +309,27 @@ export function buildAgentTemplateInstallCommands(
   }
 
   const enableTemplatesCommand = OPENCLAW_ENABLE_TEMPLATES_CMD;
-  const validateCommand = `openclaw templates validate ${shellSafeArg(validateTarget)}`;
-  const installCommand = `openclaw templates add ${shellSafeArg(packageTarget)}`;
-  const harnessCommand = `openclaw gateway run --agent-id ${agentId}`;
+  const isArchive = sourceKind !== "local-path" || /\.(?:tgz|tar\.gz)$/i.test(packageTarget);
+  const addSource = isArchive ? '"$openclaw_template_dir"' : shellSafeArg(packageTarget);
+  const addCommand = `openclaw templates add ${addSource} --agent-id ${agentId}`;
+  // The CLI accepts extracted package directories, not archives. Keep each
+  // extraction in a fresh directory and support npm-style and flat archives.
+  const prepareArchive = [
+    'openclaw_template_dir="$(mktemp -d)"',
+    sourceKind === "local-path"
+      ? `cp -- ${shellSafeArg(packageTarget)} "$openclaw_template_dir/template.tgz"`
+      : `curl --fail --show-error --location ${shellSafeArg(packageTarget)} -o "$openclaw_template_dir/template.tgz"`,
+    'mkdir "$openclaw_template_dir/source"',
+    'tar -xzf "$openclaw_template_dir/template.tgz" -C "$openclaw_template_dir/source"',
+    'openclaw_template_dir="$openclaw_template_dir/source"',
+    'if [ -f "$openclaw_template_dir/package/package.json" ]; then openclaw_template_dir="$openclaw_template_dir/package"; fi',
+    'openclaw templates validate "$openclaw_template_dir"',
+  ].join(" &&\n");
+  const validateCommand = isArchive
+    ? prepareArchive
+    : `openclaw templates validate ${shellSafeArg(validateTarget)}`;
+  const installCommand = isArchive ? `${prepareArchive} &&\n${addCommand}` : addCommand;
+  const harnessCommand = "openclaw gateway run";
   const cleanPairingCode =
     typeof pairingCode === "string" && /^oc_pair_[a-z0-9_]+$/i.test(pairingCode.trim())
       ? pairingCode.trim()
@@ -320,11 +338,9 @@ export function buildAgentTemplateInstallCommands(
 
   const fullSetupScript = [
     `# 1. Enable Agent Templates on a fresh OpenClaw gateway\n${enableTemplatesCommand}`,
-    sourceKind === "local-path"
-      ? `# 2. Validate local agents-template bundle\n${validateCommand}`
-      : `# 2. Optional: validate a local template directory before packaging\n# ${validateCommand}`,
+    ...(!isArchive ? [`# 2. Validate local agents-template bundle\n${validateCommand}`] : []),
     `# 3. Install Agent Template into your OpenClaw harness\n${installCommand}`,
-    `# 4. Run or target --agent-id ${agentId} on your OpenClaw Gateway\n${harnessCommand}`,
+    `# 4. Start the Gateway in a separate terminal before pairing agent ${agentId}:\n# ${harnessCommand}`,
     `# 5. Pair @${agentId} with @dinkuskit/openclaw (${cleanOrigin})\n${pairCommand}`,
   ].join("\n\n");
 

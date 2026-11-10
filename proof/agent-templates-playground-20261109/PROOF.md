@@ -17,7 +17,7 @@
 
 2. **Cloudflare Workers (`workerd`) & Server-Locked EmDash Playground Mode**:
    - Split Node-only `@openclaw/gateway-client` (`ws`, `node:tls`, `node:crypto`) into `dist/gateway-bridge.mjs` loaded lazily only on true Node runtimes, emitted pure Web-standard `dist/native.workerd.mjs` (`exports["./native"].workerd`) and `dist/stream-endpoint.mjs` with zero `node:*` or `ws` imports.
-   - Added `globalThis.fetch` fallback in `tryExternalHttpGatewayTurn` when `ctx.http` is absent on native in-process EmDash plugins, and bypassed EmDash's `ctx.http.fetch` non-public IP blocker for loopback (`127.0.0.1` / `localhost` / `[::1]`) and server-trusted `OPENCLAW_PLAYGROUND_GATEWAY_URL` targets while keeping `ctx.http.fetch` first for non-loopback user-configured URLs; passes `model: "openclaw/<agentId>"`, `x-openclaw-agent-id`, `x-openclaw-scopes: "operator.write"`, `x-openclaw-session-key`, `user: sessionKey`, and optional origin-bound `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.
+   - Added `globalThis.fetch` fallback in `tryExternalHttpGatewayTurn` when `ctx.http` is absent on native in-process EmDash plugins, and uses native fetch for loopback (`127.0.0.1` / `localhost` / `[::1]`) only when the connection comes from exact server-trusted `OPENCLAW_PLAYGROUND_GATEWAY_URL` configuration, while retaining `ctx.http.fetch` for user-configured URLs; passes `model: "openclaw/<agentId>"`, `x-openclaw-agent-id`, `x-openclaw-scopes: "operator.write"`, `x-openclaw-session-key`, `user: sessionKey`, and optional origin-bound `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.
    - Implemented server-locked `OPENCLAW_PLAYGROUND_*` env mode (`process.env` and `globalThis.__openclawPlaygroundEnv`) returning connected `propose_with_approval` state (`allowGatewayExecApprovals: false`, `gatewayBridge: { available: true, state: "connected" }`) without writing secrets to visitor SQLite or exposing tokens to browsers, blocking settings/SSRF/`/pair`/exec-approval mutations under `OPENCLAW_PLAYGROUND_LOCK=1`, and hashing `emdash_playground` cookie / `x-openclaw-playground-visitor` header via WebCrypto SHA-256 (`agent:<agentId>:pg-<visitorHash>:<convId>`).
 
 ---
@@ -43,3 +43,66 @@ Commands verified:
 ## Gates
 
 - **Merge / Registry Publication**: `WAITING_FOR_HUMAN` (do not self-merge or publish to npm / EmDash Registry without explicit owner approval).
+
+## Autoreview repair verification
+
+The review of `d61dbf69dfd641458dc335f80a0ceb6bff6a67fa` against
+`686a3a8f898f2993456612d4f36a3269ab37687f` identified three confirmed dependency
+contract mismatches, each classified `required_fix` and addressed here:
+
+1. OpenClaw accepts an extracted package directory or `CLAW.md`, rather than a
+   tarball URL. Featured, custom, and Block Kit commands now copy/download archives
+   into a fresh temporary directory, extract into a separate source directory,
+   validate, and add the local package. Flat and `package/` archive roots are
+   supported. Local `.tgz` / `.tar.gz` inputs use the same extraction path.
+   Source: [OpenClaw template source contract](https://docs.openclaw.ai/cli/templates).
+2. `gateway run` does not accept `--agent-id`. Generated setup uses
+   `templates add --agent-id` to select the agent and `openclaw gateway run` to
+   start the Gateway. Source:
+   [OpenClaw v2026.11.1 gateway options](https://github.com/openclaw/openclaw/blob/v2026.11.1/src/cli/gateway-cli/run-command.ts).
+3. EmDash 1.4.0 supplies `ctx.http` for this plugin's declared capabilities and
+   validates targets even in its unrestricted client, rejecting loopback.
+   A connection resolved from server-only Playground configuration may now use
+   native fetch for its exact configured loopback URL and token; that request
+   refuses redirects. Persisted connections retain the host client. Sources:
+   [EmDash 1.4.0 plugin context](https://github.com/emdash-cms/emdash/blob/emdash%401.4.0/packages/core/src/plugins/context.ts)
+   and [SSRF validation](https://github.com/emdash-cms/emdash/blob/emdash%401.4.0/packages/core/src/security/ssrf.ts).
+
+Regression proof in `tests/templates-and-playground.test.mjs` executes generated
+shell installation commands using real `sh`, `tar`, local fixture archives and
+stubbed download/CLI executables. It verifies flat and npm-style archive roots,
+local archive inputs, shell metacharacters, selected agent IDs, and no installation
+after download failure. The transport test supplies `ctx.http` and proves that
+only the server-owned loopback connection uses native fetch with `redirect: error`;
+a stored connection at the same origin still goes through the rejecting host client.
+These are local fixtures and mocked HTTP calls, not deployed Gateway or browser proof.
+
+A public request for the Blobster Smith archive returned HTTP 403 during this
+verification. Its current contents and availability are therefore unverified;
+archive-root support is proved with fixtures. No account change, deployment,
+publication, or production Gateway request was performed.
+
+Final validation: `./bin/verify-openclaw full` and the required pre-commit
+`./bin/verify-openclaw quick` both passed typecheck, Registry/native builds,
+and all 21 tests. `git diff --check` passed. The backend is 106,239 bytes
+with 24,833 bytes headroom against the 131,072-byte cap. See the reviewer
+closeout for the final source SHA. All pre-existing proof above
+records the original candidate; this section records the repairs.
+
+
+## Combined candidate
+
+The integrated candidate preserves remote commit
+`1b658a7949cc7759ede2afbe12e7b4b2edf381d8` as an ancestor and applies the
+repairs prepared in `647375ac9f9b948eb5537031dc56db217970052b`. Its additional
+process-environment and manual-loopback regression cases are retained. The
+manual-loopback case now requires the host HTTP rejection, matching the narrow
+server-owned exception rather than allowing visitor-saved URLs to bypass it.
+The shared loopback URL classifier is retained; the exact configured URL,
+credential match, server-source flag and redirect refusal remain required.
+
+Integrated validation: `./bin/verify-openclaw full` passed all 21 tests,
+typecheck, Registry validation/build and native builds. The integrated backend
+is 106,325 bytes with 24,747 bytes headroom against 131,072 bytes.
+`git diff --check` and the required pre-commit `./bin/verify-openclaw quick`
+also passed (21/21 tests). The reviewer closeout records the exact source head.

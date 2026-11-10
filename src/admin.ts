@@ -17,6 +17,7 @@ import {
   BLOBSTER_CATALOG_URL,
   BLOBSTER_SUBMIT_URL,
   OPENCLAW_ENABLE_TEMPLATES_CMD,
+  buildAgentTemplateInstallCommands,
   type OpenClawConnection,
 } from "./protocol.js";
 import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
@@ -341,7 +342,7 @@ function agentTemplatesBlocks(): Block[] {
       title: "Agent Templates (blobster.dev)",
       description:
         "Install verified OpenClaw Agent Templates (agents-template) such as @blobster-smith and @blobster-sculptor on your own harness, or submit a template at blobster.dev/submit.",
-      command_line: "openclaw templates add https://blobster.dev/t/blobster-smith.tgz",
+      command_line: buildAgentTemplateInstallCommands("blobster-smith").installCommand,
       actions: [
         {
           type: "link",
@@ -363,7 +364,8 @@ function agentTemplatesBlocks(): Block[] {
       code: [
         `# Enable Agent Templates on a fresh gateway, then install @blobster-smith`,
         OPENCLAW_ENABLE_TEMPLATES_CMD,
-        `openclaw templates add https://blobster.dev/t/blobster-smith.tgz`,
+  buildAgentTemplateInstallCommands,
+        buildAgentTemplateInstallCommands("blobster-smith").installCommand,
         `openclaw templates validate ./my-custom-template`,
       ].join("\n"),
     },

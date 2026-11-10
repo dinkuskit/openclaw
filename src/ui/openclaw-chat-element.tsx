@@ -2293,7 +2293,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
 
                 <div style={{ "font-size": "12.3px", color: "var(--oc-text-muted)", "line-height": "1.5" }}>
                   Run verified OpenClaw Agent Templates on your own gateway or local harness with{" "}
-                  <code>openclaw templates</code>, then connect or pair <code>--agent-id</code> with EmDash.
+                  <code>openclaw templates</code>, then connect or pair the installed agent ID with EmDash.
                 </div>
 
                 <div class="oc-template-links-bar">
@@ -2428,7 +2428,7 @@ function OpenClawHarnessApp(props: { getHostProps: () => OpenClawChatElementProp
                     >
                       {copiedTemplateKey() === "custom:install"
                         ? "✓ Copied Install"
-                        : "Copy openclaw templates add"}
+                        : "Copy install commands"}
                     </button>
                     <button
                       type="button"
