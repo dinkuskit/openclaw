@@ -364,7 +364,6 @@ function agentTemplatesBlocks(): Block[] {
       code: [
         `# Enable Agent Templates on a fresh gateway, then install @blobster-smith`,
         OPENCLAW_ENABLE_TEMPLATES_CMD,
-  buildAgentTemplateInstallCommands,
         buildAgentTemplateInstallCommands("blobster-smith").installCommand,
         `openclaw templates validate ./my-custom-template`,
       ].join("\n"),

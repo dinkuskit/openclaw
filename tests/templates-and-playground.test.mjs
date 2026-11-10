@@ -228,6 +228,28 @@ test("Agent Templates metadata, CLI helper commands, Block Kit sections, and Sol
     /curl --fail --show-error --location https:\/\/blobster\.dev\/t\/blobster-smith\.tgz/,
   );
 
+  // Inspect the rendered blocks, not just JSON substrings: a function object in
+  // the code array is stringified into JavaScript and still passes schema checks.
+  for (const [label, response] of [["setup", setupRes], ["connected", connectedRes]]) {
+    const templateScripts = [];
+    const visit = value => {
+      if (!value || typeof value !== "object") return;
+      if (value.type === "code" && value.language === "bash" &&
+          typeof value.code === "string" && value.code.includes("blobster-smith")) {
+        templateScripts.push(value.code);
+      }
+      for (const child of Object.values(value)) visit(child);
+    };
+    visit(response);
+    assert.equal(templateScripts.length, 1, `${label} should contain one template Bash block`);
+    const [script] = templateScripts;
+    assert.doesNotMatch(script, /function\s|buildAgentTemplateInstallCommands|const\s/);
+    assert.match(script, /openclaw config set gateway\.controlUi\.experimental\.templates true/);
+    assert.match(script, /openclaw templates add "\$openclaw_template_dir" --agent-id blobster-smith/);
+    assert.doesNotThrow(() => execFileSync("sh", ["-n"], { input: script, stdio: ["pipe", "pipe", "pipe"] }),
+      `${label} template block must be valid shell syntax`);
+  }
+
   // 4. Precompiled `<openclaw-emdash-chat>` bundle contains Agent Templates UI controls & links
   const uiBundle = fs.readFileSync(new URL("../dist/admin.mjs", import.meta.url), "utf8");
   assert.match(uiBundle, /Browse verified Agent Templates on Blobster Factory/);

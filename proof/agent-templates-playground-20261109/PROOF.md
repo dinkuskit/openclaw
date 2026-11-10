@@ -106,3 +106,24 @@ typecheck, Registry validation/build and native builds. The integrated backend
 is 106,325 bytes with 24,747 bytes headroom against 131,072 bytes.
 `git diff --check` and the required pre-commit `./bin/verify-openclaw quick`
 also passed (21/21 tests). The reviewer closeout records the exact source head.
+
+
+## Rendered Block Kit command regression
+
+The next review identified a function reference accidentally included in the
+Agent Templates Bash code array. Joining that array rendered JavaScript function
+source into both the setup and connected workspace pages. The reference was
+removed; the intended command string remains.
+
+The regression extends the existing Agent Templates test to walk the actual
+nested Block Kit responses from both pages, require exactly one template Bash
+block, reject embedded JavaScript source, assert the intended enable/install
+commands, and parse each script with `sh -n` without executing it. It failed
+against the prior built source and passes with the fix. This is rendered response
+and shell-syntax proof; it does not claim browser or live Gateway execution.
+
+`./bin/verify-openclaw quick` passed all 21 tests, typecheck and both builds after
+this repair. Backend: 106,323 bytes, 24,749 bytes headroom;
+SHA-256: `0d077eab07136b71109f6bc09788ed6400062428d186ce35eedffdba12c65287`.
+`git diff --check` passed. The repair diff was also checked for other bare helper
+references; remaining references are imports, exports, or function calls.
