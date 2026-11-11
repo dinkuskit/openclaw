@@ -2110,30 +2110,66 @@ test("playground visitors sharing one EmDash user never receive each other's str
   bobAbort.abort();
 });
 
-test("a visitor's fifth live stream closes their oldest one instead of being refused", async () => {
+test("one playground visitor holds at most four live streams; aborting frees a slot", async () => {
+  const cookie = "emdash_playground=01JCCCCCCCCCCCCCCCCCCCCCCC";
   const open = abort =>
     streamGet({
       request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
         signal: abort.signal,
-        headers: { cookie: "emdash_playground=01JCCCCCCCCCCCCCCCCCCCCCCC" },
+        headers: { cookie },
       }),
       url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
       locals: { user: { id: "playground-admin", role: 50 } },
     });
-  const aborts = [1, 2, 3, 4, 5].map(() => new AbortController());
-  const readers = [];
-  for (const abort of aborts) {
-    const res = await open(abort);
-    assert.equal(res.status, 200);
-    const reader = res.body.getReader();
-    await reader.read(); // connected frame
-    readers.push(reader);
-  }
-  // The first stream was closed to make room for the fifth.
-  assert.equal((await readers[0].read()).done, true);
-  for (const abort of aborts) abort.abort();
+  const aborts = [1, 2, 3, 4].map(() => new AbortController());
+  for (const abort of aborts) assert.equal((await open(abort)).status, 200);
+  const extra = await open(new AbortController());
+  assert.equal(extra.status, 429);
+  assert.equal(extra.headers.get("retry-after"), "15");
+  aborts[0].abort();
+  const again = new AbortController();
+  assert.equal((await open(again)).status, 200);
+  for (const abort of [...aborts.slice(1), again]) abort.abort();
+  // Every slot is free again.
+  const after = [1, 2, 3, 4].map(() => new AbortController());
+  for (const abort of after) assert.equal((await open(abort)).status, 200);
+  for (const abort of after) abort.abort();
 
   const gone = new AbortController();
   gone.abort();
   assert.equal((await open(gone)).status, 499);
+});
+
+test("the stream client waits out a 429 and then connects", async () => {
+  const origFetch = globalThis.fetch;
+  const calls = [];
+  const statuses = [];
+  globalThis.fetch = async () => {
+    calls.push(Date.now());
+    if (calls.length === 1) {
+      return new Response("{}", { status: 429, headers: { "retry-after": "0.2" } });
+    }
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"connected"}\n\n'));
+      },
+    });
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    const stop = connectOpenClawEventStream({
+      endpoint: "http://localhost:4321/_emdash/api/openclaw/stream",
+      onEvent() {},
+      onStatus(s) {
+        statuses.push(s);
+      },
+    });
+    await new Promise(r => setTimeout(r, 400));
+    stop();
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1] - calls[0] >= 180, "retry waits for Retry-After");
+    assert.deepEqual(statuses.slice(0, 2), ["buffered", "live"]);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

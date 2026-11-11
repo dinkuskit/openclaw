@@ -15,17 +15,12 @@ interface EmDashAuthLocals {
 
 const EDITOR_ROLE = 40;
 
-/**
- * Live streams kept per playground visitor (or per user) in one isolate.
- * Opening one more closes that audience's oldest stream instead of refusing,
- * so a new tab or a quick reconnect always works and a stream whose client
- * vanished without a clean abort cannot hold a slot forever.
- */
+/** Open live streams allowed per playground visitor (or per user) in one isolate. */
 export const MAX_STREAMS_PER_AUDIENCE = 4;
 const OPEN_STREAMS_SYMBOL = Symbol.for("dinkuskit.openclaw.openStreams");
 
-function openStreams(): Map<string, Array<() => void>> {
-  const g = globalThis as Record<symbol, Map<string, Array<() => void>> | undefined>;
+function openStreams(): Map<string, number> {
+  const g = globalThis as Record<symbol, Map<string, number> | undefined>;
   return (g[OPEN_STREAMS_SYMBOL] ??= new Map());
 }
 
@@ -59,28 +54,35 @@ export async function GET(context: {
   // their playground session. Undefined on ordinary sites.
   const subscriberScope = await resolvePlaygroundVisitorHash({ request: context.request });
 
-  // The client may have gone while the scope was resolved.
+  // The client may have gone while the scope was resolved; no slot for it.
   if (context.request.signal.aborted) {
     return new Response(null, { status: 499 });
   }
 
-  // Each stream holds a bus listener and a heartbeat timer, so one visitor
-  // (or user) keeps at most MAX_STREAMS_PER_AUDIENCE; the oldest is closed.
+  // Each stream holds a bus listener and a heartbeat timer, so cap how many
+  // one visitor (or user) can hold open at once.
   const audienceKey = subscriberScope ? `pg:${subscriberScope}` : `user:${user.id ?? "anonymous"}`;
   const streams = openStreams();
-  const encoder = new TextEncoder();
-  let cleanup: (() => void) | undefined;
-  let closeStream: (() => void) | undefined;
+  if ((streams.get(audienceKey) ?? 0) >= MAX_STREAMS_PER_AUDIENCE) {
+    return Response.json(
+      {
+        success: false,
+        error: { code: "TOO_MANY_STREAMS", message: "Too many open OpenClaw streams. Close a tab; this one retries shortly." },
+      },
+      { status: 429, headers: { "Retry-After": "15" } },
+    );
+  }
+  streams.set(audienceKey, (streams.get(audienceKey) ?? 0) + 1);
   let released = false;
   const releaseSlot = () => {
     if (released) return;
     released = true;
-    const list = streams.get(audienceKey);
-    if (!list) return;
-    const idx = closeStream ? list.indexOf(closeStream) : -1;
-    if (idx >= 0) list.splice(idx, 1);
-    if (list.length === 0) streams.delete(audienceKey);
+    const left = (streams.get(audienceKey) ?? 1) - 1;
+    if (left > 0) streams.set(audienceKey, left);
+    else streams.delete(audienceKey);
   };
+  const encoder = new TextEncoder();
+  let cleanup: (() => void) | undefined;
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -143,6 +145,7 @@ export async function GET(context: {
         try {
           controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
         } catch {
+          // The stream is gone: free its listener and slot too.
           cleanup?.();
         }
       }, 15_000);
@@ -153,22 +156,6 @@ export async function GET(context: {
         unsubscribe();
         releaseSlot();
       };
-      closeStream = () => {
-        cleanup?.();
-        try {
-          controller.close();
-        } catch {
-          // already closed
-        }
-      };
-      const list = streams.get(audienceKey) ?? [];
-      list.push(closeStream);
-      streams.set(audienceKey, list);
-      while (list.length > MAX_STREAMS_PER_AUDIENCE) {
-        const oldest = list[0]!;
-        oldest();
-        if (list[0] === oldest) list.shift();
-      }
 
       context.request.signal.addEventListener("abort", () => {
         cleanup?.();

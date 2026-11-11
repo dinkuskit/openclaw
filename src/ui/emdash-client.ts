@@ -486,6 +486,15 @@ export function connectOpenClawEventStream(options: {
       });
 
       const contentType = res.headers.get("content-type") ?? "";
+      if (res.status === 429) {
+        // Too many open streams for this visitor: stay buffered and try again
+        // after the server's Retry-After, without a reconnect storm.
+        options.onStatus("buffered");
+        const retryAfter = Number(res.headers.get("retry-after"));
+        const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 15_000;
+        if (!stopped) retryTimer = setTimeout(() => void start(attempt + 1), delay);
+        return;
+      }
       if (!res.ok || !res.body || !contentType.includes("text/event-stream")) {
         options.onStatus("buffered");
         return;
