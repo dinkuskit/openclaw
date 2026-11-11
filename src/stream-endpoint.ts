@@ -15,6 +15,15 @@ interface EmDashAuthLocals {
 
 const EDITOR_ROLE = 40;
 
+/** Open live streams allowed per playground visitor (or per user) in one isolate. */
+export const MAX_STREAMS_PER_AUDIENCE = 4;
+const OPEN_STREAMS_SYMBOL = Symbol.for("dinkuskit.openclaw.openStreams");
+
+function openStreams(): Map<string, number> {
+  const g = globalThis as Record<symbol, Map<string, number> | undefined>;
+  return (g[OPEN_STREAMS_SYMBOL] ??= new Map());
+}
+
 export async function GET(context: {
   request: Request;
   url: URL;
@@ -44,6 +53,29 @@ export async function GET(context: {
   // Playground visitors all share one EmDash user, so they are told apart by
   // their playground session. Undefined on ordinary sites.
   const subscriberScope = await resolvePlaygroundVisitorHash({ request: context.request });
+
+  // Each stream holds a bus listener and a heartbeat timer, so cap how many
+  // one visitor (or user) can hold open at once.
+  const audienceKey = subscriberScope ? `pg:${subscriberScope}` : `user:${user.id ?? "anonymous"}`;
+  const streams = openStreams();
+  if ((streams.get(audienceKey) ?? 0) >= MAX_STREAMS_PER_AUDIENCE) {
+    return Response.json(
+      {
+        success: false,
+        error: { code: "TOO_MANY_STREAMS", message: "Too many open OpenClaw streams. Close a tab and retry." },
+      },
+      { status: 429, headers: { "Retry-After": "15" } },
+    );
+  }
+  streams.set(audienceKey, (streams.get(audienceKey) ?? 0) + 1);
+  let released = false;
+  const releaseSlot = () => {
+    if (released) return;
+    released = true;
+    const left = (streams.get(audienceKey) ?? 1) - 1;
+    if (left > 0) streams.set(audienceKey, left);
+    else streams.delete(audienceKey);
+  };
   const encoder = new TextEncoder();
   let cleanup: (() => void) | undefined;
 
@@ -116,6 +148,7 @@ export async function GET(context: {
       cleanup = () => {
         clearInterval(heartbeat);
         unsubscribe();
+        releaseSlot();
       };
 
       context.request.signal.addEventListener("abort", () => {

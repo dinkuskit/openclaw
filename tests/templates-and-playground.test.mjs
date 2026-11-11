@@ -678,7 +678,7 @@ test("server-owned loopback uses native fetch with redirects refused while saved
     assert.equal(hostCalls, 0);
     assert.equal(nativeCalls.length, 1);
     assert.equal(nativeCalls[0].url, "http://127.0.0.1:19011/v1/chat/completions");
-    assert.equal(nativeCalls[0].init.redirect, "error");
+    assert.equal(nativeCalls[0].init.redirect, "manual");
 
     // A persisted connection, even at the same server-configured origin, must
     // retain EmDash's HTTP checks when it is not the server-owned connection.

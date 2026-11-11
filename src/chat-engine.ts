@@ -1457,7 +1457,9 @@ async function tryExternalHttpGatewayTurn(
   try {
     const response = await httpFetch(endpoint, {
       method: "POST",
-      ...(trustedLoopback ? { redirect: "error" as const } : {}),
+      // workerd rejects redirect: "error"; "manual" returns the 3xx unfollowed,
+      // and it is refused below like any other non-2xx answer.
+      ...(trustedLoopback ? { redirect: "manual" as const } : {}),
       headers,
       body: JSON.stringify({
         model: `openclaw/${connection.agentId}`,
@@ -1475,6 +1477,12 @@ async function tryExternalHttpGatewayTurn(
         ],
       }),
     });
+    if (trustedLoopback && (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400))) {
+      return {
+        ok: false,
+        errorMessage: "HTTP Gateway answered with a redirect, which the server-owned gateway connection refuses.",
+      };
+    }
     if (!response.ok) {
       return {
         ok: false,

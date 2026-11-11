@@ -2109,3 +2109,23 @@ test("playground visitors sharing one EmDash user never receive each other's str
   aliceAbort.abort();
   bobAbort.abort();
 });
+
+test("one playground visitor cannot hold more than four live streams open", async () => {
+  const open = abort =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie: "emdash_playground=01JCCCCCCCCCCCCCCCCCCCCCCC" },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  const aborts = [1, 2, 3, 4].map(() => new AbortController());
+  for (const abort of aborts) assert.equal((await open(abort)).status, 200);
+  const extra = new AbortController();
+  assert.equal((await open(extra)).status, 429);
+  aborts[0].abort();
+  const again = new AbortController();
+  assert.equal((await open(again)).status, 200);
+  for (const abort of [...aborts.slice(1), again]) abort.abort();
+});
