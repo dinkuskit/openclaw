@@ -2173,3 +2173,16 @@ test("the stream client waits out a 429 and then connects", async () => {
     globalThis.fetch = origFetch;
   }
 });
+
+test("a heartbeat drops a stream nobody is reading", async () => {
+  const { heartbeatTick } = await import("../dist/stream-endpoint.mjs");
+  let controller;
+  const stream = new ReadableStream({ start(c) { controller = c; } });
+  assert.equal(heartbeatTick(controller), true); // queue was empty
+  assert.equal(heartbeatTick(controller), false); // previous frame still unread
+  const reader = stream.getReader();
+  await reader.read();
+  assert.equal(heartbeatTick(controller), true); // drained again
+  controller.close();
+  assert.equal(heartbeatTick(controller), false);
+});

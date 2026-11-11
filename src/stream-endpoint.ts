@@ -24,6 +24,26 @@ function openStreams(): Map<string, number> {
   return (g[OPEN_STREAMS_SYMBOL] ??= new Map());
 }
 
+/**
+ * One heartbeat. Returns false when the stream should be dropped: the write
+ * failed, or earlier frames are still unread (`desiredSize <= 0`), which means
+ * nobody is draining it. A client the host never reported gone is caught here
+ * within one interval instead of holding a slot forever; a live client simply
+ * reconnects.
+ */
+export function heartbeatTick(
+  controller: Pick<ReadableStreamDefaultController<Uint8Array>, "enqueue" | "desiredSize">,
+  encoder: TextEncoder = new TextEncoder(),
+): boolean {
+  if ((controller.desiredSize ?? 0) <= 0) return false;
+  try {
+    controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function GET(context: {
   request: Request;
   url: URL;
@@ -142,11 +162,13 @@ export async function GET(context: {
       });
 
       const heartbeat = setInterval(() => {
-        try {
-          controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
-        } catch {
-          // The stream is gone: free its listener and slot too.
+        if (!heartbeatTick(controller, encoder)) {
           cleanup?.();
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
         }
       }, 15_000);
       (heartbeat as unknown as { unref?: () => void }).unref?.();
