@@ -1,6 +1,7 @@
 import type { PluginDescriptor, ResolvedPlugin } from "emdash";
 import type { PluginContext, SandboxedRouteContext } from "emdash/plugin";
 import { openclawAdmin, openclawEditorPanel, openclawPairRoute } from "./admin.js";
+import { resolveAudienceScope } from "./playground-env.js";
 import { runWithOpenClawAudienceScope } from "./sse-bus.js";
 import {
   BLOBSTER_CATALOG_URL,
@@ -71,7 +72,7 @@ function adaptNativeHandler<T>(
   // Every route publishes under the playground visitor's scope (undefined on
   // ordinary sites), so the stream endpoint can tell visitors apart.
   return async (routeCtx: unknown): Promise<T> => {
-    const scope = await resolvePlaygroundVisitorHash(routeCtx);
+    const scope = await resolveAudienceScope(routeCtx);
     return runWithOpenClawAudienceScope(scope, () =>
       fn(routeCtx as SandboxedRouteContext, routeCtx as PluginContext),
     );

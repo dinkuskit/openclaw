@@ -7,6 +7,7 @@ import {
   isSameGatewayOrigin,
   readPlaygroundEnvConfig,
   resolvePlaygroundConnection,
+  resolveAudienceScope,
   resolvePlaygroundVisitorHash,
 } from "./playground-env.js";
 import {
@@ -2657,7 +2658,7 @@ export async function openclawChatRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
 ): Promise<Record<string, unknown>> {
-  const audienceScope = await resolvePlaygroundVisitorHash(route);
+  const audienceScope = await resolveAudienceScope(route);
   return runWithOpenClawAudienceScope(audienceScope, () => handleOpenclawChatRoute(route, ctx));
 }
 

@@ -5,6 +5,17 @@ import { createPlugin, openclawNativePlugin } from "../dist/native.mjs";
 import { openclawBridge } from "../dist/astro.mjs";
 import { GET as streamGet } from "../dist/stream-endpoint.mjs";
 import pluginSandbox from "../dist/plugin.mjs";
+
+// Stream scoping only applies on hosts configured as an OpenClaw playground.
+async function asPlaygroundHost(fn) {
+  const saved = globalThis.__openclawPlaygroundEnv;
+  globalThis.__openclawPlaygroundEnv = { ...(saved ?? {}), OPENCLAW_PLAYGROUND_LOCK: "1" };
+  try {
+    return await fn();
+  } finally {
+    globalThis.__openclawPlaygroundEnv = saved;
+  }
+}
 import {
   applyRevisionProposal,
   connectOpenClawEventStream,
@@ -2061,7 +2072,7 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
   assert.equal(switchedConv.draftsByConv.conv_other, "Draft in second thread");
 });
 
-test("playground visitors sharing one EmDash user never receive each other's stream events", async () => {
+test("playground visitors sharing one EmDash user never receive each other's stream events", () => asPlaygroundHost(async () => {
   const resolved = createPlugin();
   const chat = resolved.routes.chat.handler;
   const streamFor = async (cookie, abort) =>
@@ -2108,9 +2119,9 @@ test("playground visitors sharing one EmDash user never receive each other's str
 
   aliceAbort.abort();
   bobAbort.abort();
-});
+}));
 
-test("one playground visitor holds at most four live streams; aborting frees a slot", async () => {
+test("one playground visitor holds at most four live streams; aborting frees a slot", () => asPlaygroundHost(async () => {
   const cookie = "emdash_playground=01JCCCCCCCCCCCCCCCCCCCCCCC";
   const open = abort =>
     streamGet({
@@ -2138,7 +2149,7 @@ test("one playground visitor holds at most four live streams; aborting frees a s
   const gone = new AbortController();
   gone.abort();
   assert.equal((await open(gone)).status, 499);
-});
+}));
 
 test("the stream client waits out a 429 and then connects", async () => {
   const origFetch = globalThis.fetch;
@@ -2188,7 +2199,7 @@ test("a heartbeat drops a stream nobody is reading", async () => {
   assert.equal(heartbeatTick(controller), false); // closed: enqueue throws
 });
 
-test("undrained and over-age streams give their slot back", async () => {
+test("undrained and over-age streams give their slot back", () => asPlaygroundHost(async () => {
   const { STREAM_TIMING } = await import("../dist/stream-endpoint.mjs");
   const saved = { ...STREAM_TIMING };
   const open = (cookie, abort) =>
@@ -2219,9 +2230,35 @@ test("undrained and over-age streams give their slot back", async () => {
     const old = new AbortController();
     const reader = (await open("emdash_playground=01JEEEEEEEEEEEEEEEEEEEEEEE", old)).body.getReader();
     await reader.read(); // connected
-    await assert.rejects(reader.read(), /lifetime/);
+    assert.equal((await reader.read()).done, true);
     old.abort();
   } finally {
     Object.assign(STREAM_TIMING, saved);
   }
+}));
+
+test("on an ordinary site a stray playground cookie does not split an editor's stream", async () => {
+  const chat = createPlugin().routes.chat.handler;
+  const abort = new AbortController();
+  const reader = (
+    await streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie: "emdash_playground=01JFFFFFFFFFFFFFFFFFFFFFFF" },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "u_editor", role: 50 } },
+    })
+  ).body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await reader.read()).value), /"type":"connected"/);
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_editor",
+      role: 50,
+      input: { action: "send_message", conversationId: "conv_default", prompt: "Shared note" },
+    }),
+  );
+  assert.match(decoder.decode((await reader.read()).value), /"conversationId"/);
+  abort.abort();
 });

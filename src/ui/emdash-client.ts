@@ -490,8 +490,10 @@ export function connectOpenClawEventStream(options: {
         // Too many open streams for this visitor: stay buffered and try again
         // after the server's Retry-After, without a reconnect storm.
         options.onStatus("buffered");
+        void res.body?.cancel().catch(() => {});
         const retryAfter = Number(res.headers.get("retry-after"));
-        const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 15_000;
+        const base = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 15_000;
+        const delay = base + Math.floor(Math.random() * Math.min(5_000, base / 2));
         if (!stopped) retryTimer = setTimeout(() => void start(attempt + 1), delay);
         return;
       }

@@ -1,4 +1,4 @@
-import { resolvePlaygroundVisitorHash } from "./playground-env.js";
+import { resolveAudienceScope } from "./playground-env.js";
 import { subscribeOpenClawEvents } from "./sse-bus.js";
 
 export const prerender = false;
@@ -82,7 +82,7 @@ export async function GET(context: {
   const filterConversationId = context.url.searchParams.get("conversationId") ?? undefined;
   // Playground visitors all share one EmDash user, so they are told apart by
   // their playground session. Undefined on ordinary sites.
-  const subscriberScope = await resolvePlaygroundVisitorHash({ request: context.request });
+  const subscriberScope = await resolveAudienceScope({ request: context.request });
 
   // The client may have gone while the scope was resolved; no slot for it.
   if (context.request.signal.aborted) {
@@ -173,6 +173,9 @@ export async function GET(context: {
 
       // Dropping a stream errors it rather than closing it, so frames still
       // queued for a reader that is gone are discarded, not kept in memory.
+      // An undrained stream is errored so its queued frames are released; a
+      // stream at the end of its lifetime is closed cleanly so a live client
+      // still gets every queued frame before it reconnects.
       const drop = (reason: string) => {
         cleanup?.();
         try {
@@ -185,7 +188,14 @@ export async function GET(context: {
         if (!heartbeatTick(controller, encoder)) drop("stream not drained");
       }, STREAM_TIMING.heartbeatMs);
       (heartbeat as unknown as { unref?: () => void }).unref?.();
-      const lifetime = setTimeout(() => drop("stream lifetime reached"), STREAM_TIMING.maxLifetimeMs);
+      const lifetime = setTimeout(() => {
+        cleanup?.();
+        try {
+          controller.close();
+        } catch {
+          // already closed
+        }
+      }, STREAM_TIMING.maxLifetimeMs);
       (lifetime as unknown as { unref?: () => void }).unref?.();
 
       cleanup = () => {
