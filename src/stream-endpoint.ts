@@ -17,6 +17,16 @@ const EDITOR_ROLE = 40;
 
 /** Open live streams allowed per playground visitor (or per user) in one isolate. */
 export const MAX_STREAMS_PER_AUDIENCE = 4;
+
+/**
+ * Stream timing. `maxLifetimeMs` ends every stream after a while (the client
+ * reconnects and refreshes), so a connection whose death the host never
+ * reports holds its slot for at most that long. Mutable for tests.
+ */
+export const STREAM_TIMING = {
+  heartbeatMs: 15_000,
+  maxLifetimeMs: 10 * 60_000,
+};
 const OPEN_STREAMS_SYMBOL = Symbol.for("dinkuskit.openclaw.openStreams");
 
 function openStreams(): Map<string, number> {
@@ -161,20 +171,26 @@ export async function GET(context: {
         send(event);
       });
 
-      const heartbeat = setInterval(() => {
-        if (!heartbeatTick(controller, encoder)) {
-          cleanup?.();
-          try {
-            controller.close();
-          } catch {
-            // already closed
-          }
+      // Dropping a stream errors it rather than closing it, so frames still
+      // queued for a reader that is gone are discarded, not kept in memory.
+      const drop = (reason: string) => {
+        cleanup?.();
+        try {
+          controller.error(new Error(reason));
+        } catch {
+          // already closed
         }
-      }, 15_000);
+      };
+      const heartbeat = setInterval(() => {
+        if (!heartbeatTick(controller, encoder)) drop("stream not drained");
+      }, STREAM_TIMING.heartbeatMs);
       (heartbeat as unknown as { unref?: () => void }).unref?.();
+      const lifetime = setTimeout(() => drop("stream lifetime reached"), STREAM_TIMING.maxLifetimeMs);
+      (lifetime as unknown as { unref?: () => void }).unref?.();
 
       cleanup = () => {
         clearInterval(heartbeat);
+        clearTimeout(lifetime);
         unsubscribe();
         releaseSlot();
       };

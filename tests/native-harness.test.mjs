@@ -2183,6 +2183,45 @@ test("a heartbeat drops a stream nobody is reading", async () => {
   const reader = stream.getReader();
   await reader.read();
   assert.equal(heartbeatTick(controller), true); // drained again
+  await reader.read();
   controller.close();
-  assert.equal(heartbeatTick(controller), false);
+  assert.equal(heartbeatTick(controller), false); // closed: enqueue throws
+});
+
+test("undrained and over-age streams give their slot back", async () => {
+  const { STREAM_TIMING } = await import("../dist/stream-endpoint.mjs");
+  const saved = { ...STREAM_TIMING };
+  const open = (cookie, abort) =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  try {
+    // Never read: dropped by the heartbeat.
+    STREAM_TIMING.heartbeatMs = 20;
+    STREAM_TIMING.maxLifetimeMs = 60_000;
+    const zombie = "emdash_playground=01JDDDDDDDDDDDDDDDDDDDDDDD";
+    const zAborts = [1, 2, 3, 4].map(() => new AbortController());
+    for (const a of zAborts) assert.equal((await open(zombie, a)).status, 200);
+    assert.equal((await open(zombie, new AbortController())).status, 429);
+    await new Promise(r => setTimeout(r, 80));
+    const z = new AbortController();
+    assert.equal((await open(zombie, z)).status, 200);
+    for (const a of [...zAborts, z]) a.abort();
+
+    // Read but kept past the lifetime: ended, so the client reconnects.
+    STREAM_TIMING.heartbeatMs = 60_000;
+    STREAM_TIMING.maxLifetimeMs = 50;
+    const old = new AbortController();
+    const reader = (await open("emdash_playground=01JEEEEEEEEEEEEEEEEEEEEEEE", old)).body.getReader();
+    await reader.read(); // connected
+    await assert.rejects(reader.read(), /lifetime/);
+    old.abort();
+  } finally {
+    Object.assign(STREAM_TIMING, saved);
+  }
 });

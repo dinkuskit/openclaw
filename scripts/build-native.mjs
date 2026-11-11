@@ -177,6 +177,9 @@ await writeFile(
   [
     "export declare const prerender: false;",
     "export declare function GET(context: { request: Request; url: URL; locals: Record<string, unknown> }): Promise<Response>;",
+    "export declare const MAX_STREAMS_PER_AUDIENCE: number;",
+    "export declare const STREAM_TIMING: { heartbeatMs: number; maxLifetimeMs: number };",
+    "export declare function heartbeatTick(controller: Pick<ReadableStreamDefaultController<Uint8Array>, \"enqueue\" | \"desiredSize\">, encoder?: TextEncoder): boolean;",
     "",
   ].join("\n"),
 );
