@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "build": "emdash-plugin validate && emdash-plugin build && node scripts/build-native.mjs && node scripts/check-registry-bundle.mjs",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "verify:quick": "bin/verify-openclaw quick",
