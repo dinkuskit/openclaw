@@ -288,6 +288,17 @@ function normalizeOpenClawAgentSegment(agentId: string | undefined | null): stri
   return normalized || "openclaw";
 }
 
+/**
+ * Playground visitor scope carried in a session key
+ * (`agent:<agent>:pg-<visitorHash>:<conversation>`). Gateway socket callbacks
+ * run in whatever async context opened the socket, so events published from
+ * them must name their scope explicitly rather than inherit it.
+ */
+export function scopeOfSessionKey(sessionKey: string | undefined | null): string | null {
+  const match = /^agent:[^:]+:pg-([0-9a-f]+):/i.exec(sessionKey ?? "");
+  return match?.[1] ?? null;
+}
+
 function parseSessionKeyAgentSegment(sessionKey: string | undefined | null): string | undefined {
   const raw = (sessionKey ?? "").trim();
   if (!raw) return undefined;
@@ -748,7 +759,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           timestamp: new Date().toISOString(),
           ownerUserId: collector?.ownerUserId ?? binding?.ownerUserId,
           visibility: collector?.visibility ?? binding?.visibility ?? "personal",
-        });
+        }, scopeOfSessionKey(sessionKey));
       }
     }
   }
@@ -1171,7 +1182,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         approval: resolving,
         timestamp: new Date().toISOString(),
         ...approvalAudience,
-      });
+      }, scopeOfSessionKey(existing.sessionKey));
     }
 
     let rpcResult: unknown;
@@ -1208,7 +1219,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             approval: reverted,
             timestamp: new Date().toISOString(),
             ...approvalAudience,
-          });
+          }, scopeOfSessionKey(existing.sessionKey));
         }
         return {
           ok: false,
@@ -1279,7 +1290,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       approval: resolved,
       timestamp: new Date().toISOString(),
       ...approvalAudience,
-    });
+    }, scopeOfSessionKey(resolved.sessionKey));
 
     if (
       applied === false ||
@@ -1302,7 +1313,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
       type: "gateway_status",
       gatewayBridge: this.#status,
       timestamp: new Date().toISOString(),
-    });
+    }, null);
   }
 
   #handleGatewayEvent(evt: EventFrame): void {
@@ -1352,7 +1363,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           phase: payload.phase,
           timestamp: new Date().toISOString(),
           ...audience,
-        });
+        }, scopeOfSessionKey(sessionKey));
         return;
       }
 
@@ -1370,7 +1381,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             replace,
             timestamp: new Date().toISOString(),
             ...audience,
-          });
+          }, scopeOfSessionKey(sessionKey));
         }
         return;
       }
@@ -1393,7 +1404,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
             replace: true,
             timestamp: new Date().toISOString(),
             ...audience,
-          });
+          }, scopeOfSessionKey(sessionKey));
         }
 
         collector.resolve({
@@ -1461,7 +1472,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
           timestamp: new Date().toISOString(),
           ownerUserId: collector.ownerUserId,
           visibility: collector.visibility ?? "personal",
-        });
+        }, scopeOfSessionKey(collector.sessionKey));
       }
       return;
     }
@@ -1607,7 +1618,7 @@ class NodeOpenClawGatewayBridge implements HostGatewayBridge {
         collector || binding
           ? (collector?.visibility ?? binding?.visibility ?? "personal")
           : undefined,
-    });
+    }, scopeOfSessionKey(approval.sessionKey));
   }
 }
 

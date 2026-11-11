@@ -5,6 +5,17 @@ import { createPlugin, openclawNativePlugin } from "../dist/native.mjs";
 import { openclawBridge } from "../dist/astro.mjs";
 import { GET as streamGet } from "../dist/stream-endpoint.mjs";
 import pluginSandbox from "../dist/plugin.mjs";
+
+// Stream scoping only applies on hosts configured as an OpenClaw playground.
+async function asPlaygroundHost(fn) {
+  const saved = globalThis.__openclawPlaygroundEnv;
+  globalThis.__openclawPlaygroundEnv = { ...(saved ?? {}), OPENCLAW_PLAYGROUND_LOCK: "1" };
+  try {
+    return await fn();
+  } finally {
+    globalThis.__openclawPlaygroundEnv = saved;
+  }
+}
 import {
   applyRevisionProposal,
   connectOpenClawEventStream,
@@ -55,13 +66,17 @@ function createNativeRouteCtx({
   sharedSettings = new Map(),
   sharedKv = new Map(),
   httpFetch = async () => Response.json({ ok: true }),
+  headers = undefined,
 } = {}) {
   let revCounter = 1;
   return {
     input,
     user: { id: userId, email: `${userId}@example.test`, name: userId, role },
     ui: { surface: "admin-page", locale: "en", direction: "ltr" },
-    request: { url: "http://localhost:4321/_emdash/api/plugins/dinkus-openclaw/chat" },
+    request: {
+      url: "http://localhost:4321/_emdash/api/plugins/dinkus-openclaw/chat",
+      ...(headers ? { headers } : {}),
+    },
     site: { url: "http://localhost:4321", name: "Atelier Store", locale: "en" },
     schema: {
       listCollections: async () => collections,
@@ -2055,4 +2070,195 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
   assert.equal(switchedConv.restoreKey, convId);
   assert.equal(switchedConv.draftsByConv[convId], "Unsent prompt in original thread");
   assert.equal(switchedConv.draftsByConv.conv_other, "Draft in second thread");
+});
+
+test("playground visitors sharing one EmDash user never receive each other's stream events", () => asPlaygroundHost(async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const streamFor = async (cookie, abort) =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  const aliceCookie = "emdash_playground=01JAAAAAAAAAAAAAAAAAAAAAAA";
+  const bobCookie = "emdash_playground=01JBBBBBBBBBBBBBBBBBBBBBBB";
+  const aliceAbort = new AbortController();
+  const bobAbort = new AbortController();
+  const aliceReader = (await streamFor(aliceCookie, aliceAbort)).body.getReader();
+  const bobReader = (await streamFor(bobCookie, bobAbort)).body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await aliceReader.read()).value), /"type":"connected"/);
+  assert.match(decoder.decode((await bobReader.read()).value), /"type":"connected"/);
+
+  // Each visitor has its own sandbox storage, like separate playground DOs.
+  await chat(
+    createNativeRouteCtx({
+      userId: "playground-admin",
+      role: 50,
+      headers: new Headers({ cookie: aliceCookie }),
+      input: {
+        action: "send_message",
+        conversationId: "conv_default",
+        prompt: "Alice's private playground prompt",
+      },
+    }),
+  );
+  const aliceEvent = await aliceReader.read();
+  assert.match(decoder.decode(aliceEvent.value), /"conversationId"/);
+
+  const bobRead = bobReader.read();
+  const outcome = await Promise.race([
+    bobRead.then(r => ({ leaked: decoder.decode(r.value ?? new Uint8Array()) })),
+    new Promise(resolve => setTimeout(() => resolve({ leaked: null }), 200)),
+  ]);
+  assert.equal(outcome.leaked, null, `Bob received Alice's event: ${outcome.leaked}`);
+
+  aliceAbort.abort();
+  bobAbort.abort();
+}));
+
+test("one playground visitor holds at most four live streams; aborting frees a slot", () => asPlaygroundHost(async () => {
+  const cookie = "emdash_playground=01JCCCCCCCCCCCCCCCCCCCCCCC";
+  const open = abort =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  const aborts = [1, 2, 3, 4].map(() => new AbortController());
+  for (const abort of aborts) assert.equal((await open(abort)).status, 200);
+  const extra = await open(new AbortController());
+  assert.equal(extra.status, 429);
+  assert.equal(extra.headers.get("retry-after"), "15");
+  aborts[0].abort();
+  const again = new AbortController();
+  assert.equal((await open(again)).status, 200);
+  for (const abort of [...aborts.slice(1), again]) abort.abort();
+  // Every slot is free again.
+  const after = [1, 2, 3, 4].map(() => new AbortController());
+  for (const abort of after) assert.equal((await open(abort)).status, 200);
+  for (const abort of after) abort.abort();
+
+  const gone = new AbortController();
+  gone.abort();
+  assert.equal((await open(gone)).status, 499);
+}));
+
+test("the stream client waits out a 429 and then connects", async () => {
+  const origFetch = globalThis.fetch;
+  const calls = [];
+  const statuses = [];
+  globalThis.fetch = async () => {
+    calls.push(Date.now());
+    if (calls.length === 1) {
+      return new Response("{}", { status: 429, headers: { "retry-after": "0.2" } });
+    }
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"connected"}\n\n'));
+      },
+    });
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    const stop = connectOpenClawEventStream({
+      endpoint: "http://localhost:4321/_emdash/api/openclaw/stream",
+      onEvent() {},
+      onStatus(s) {
+        statuses.push(s);
+      },
+    });
+    await new Promise(r => setTimeout(r, 400));
+    stop();
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1] - calls[0] >= 180, "retry waits for Retry-After");
+    assert.deepEqual(statuses.slice(0, 2), ["buffered", "live"]);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("a heartbeat drops a stream nobody is reading", async () => {
+  const { heartbeatTick } = await import("../dist/stream-endpoint.mjs");
+  let controller;
+  const stream = new ReadableStream({ start(c) { controller = c; } });
+  assert.equal(heartbeatTick(controller), true); // queue was empty
+  assert.equal(heartbeatTick(controller), false); // previous frame still unread
+  const reader = stream.getReader();
+  await reader.read();
+  assert.equal(heartbeatTick(controller), true); // drained again
+  await reader.read();
+  controller.close();
+  assert.equal(heartbeatTick(controller), false); // closed: enqueue throws
+});
+
+test("undrained and over-age streams give their slot back", () => asPlaygroundHost(async () => {
+  const { STREAM_TIMING } = await import("../dist/stream-endpoint.mjs");
+  const saved = { ...STREAM_TIMING };
+  const open = (cookie, abort) =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  try {
+    // Never read: dropped by the heartbeat.
+    STREAM_TIMING.heartbeatMs = 20;
+    STREAM_TIMING.maxLifetimeMs = 60_000;
+    const zombie = "emdash_playground=01JDDDDDDDDDDDDDDDDDDDDDDD";
+    const zAborts = [1, 2, 3, 4].map(() => new AbortController());
+    for (const a of zAborts) assert.equal((await open(zombie, a)).status, 200);
+    assert.equal((await open(zombie, new AbortController())).status, 429);
+    await new Promise(r => setTimeout(r, 80));
+    const z = new AbortController();
+    assert.equal((await open(zombie, z)).status, 200);
+    for (const a of [...zAborts, z]) a.abort();
+
+    // Read but kept past the lifetime: ended, so the client reconnects.
+    STREAM_TIMING.heartbeatMs = 60_000;
+    STREAM_TIMING.maxLifetimeMs = 50;
+    const old = new AbortController();
+    const reader = (await open("emdash_playground=01JEEEEEEEEEEEEEEEEEEEEEEE", old)).body.getReader();
+    await reader.read(); // connected
+    assert.equal((await reader.read()).done, true);
+    old.abort();
+  } finally {
+    Object.assign(STREAM_TIMING, saved);
+  }
+}));
+
+test("on an ordinary site a stray playground cookie does not split an editor's stream", async () => {
+  const chat = createPlugin().routes.chat.handler;
+  const abort = new AbortController();
+  const reader = (
+    await streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie: "emdash_playground=01JFFFFFFFFFFFFFFFFFFFFFFF" },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "u_editor", role: 50 } },
+    })
+  ).body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await reader.read()).value), /"type":"connected"/);
+  await chat(
+    createNativeRouteCtx({
+      userId: "u_editor",
+      role: 50,
+      input: { action: "send_message", conversationId: "conv_default", prompt: "Shared note" },
+    }),
+  );
+  assert.match(decoder.decode((await reader.read()).value), /"conversationId"/);
+  abort.abort();
 });

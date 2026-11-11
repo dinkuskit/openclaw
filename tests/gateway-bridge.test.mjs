@@ -1847,3 +1847,10 @@ test("Bootstrap-token URL pairing authenticates via auth.bootstrapToken, upgrade
     await new Promise(resolve => wss.close(resolve));
   }
 });
+
+test("gateway socket events name the playground visitor scope from their session key", async () => {
+  const { scopeOfSessionKey } = await import("../dist/gateway-bridge.mjs");
+  assert.equal(scopeOfSessionKey("agent:blobster-smith:pg-0a1b2c3d4e5f:conv_default"), "0a1b2c3d4e5f");
+  assert.equal(scopeOfSessionKey("agent:blobster-smith:emdash:conv_default"), null);
+  assert.equal(scopeOfSessionKey(undefined), null);
+});

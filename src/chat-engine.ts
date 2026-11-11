@@ -7,6 +7,7 @@ import {
   isSameGatewayOrigin,
   readPlaygroundEnvConfig,
   resolvePlaygroundConnection,
+  resolveAudienceScope,
   resolvePlaygroundVisitorHash,
 } from "./playground-env.js";
 import {
@@ -33,7 +34,11 @@ import {
   type SiteCollectionSummary,
   type ToolCallTrace,
 } from "./protocol.js";
-import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
+import {
+  publishOpenClawEvent,
+  runWithOpenClawAudienceScope,
+  withOpenClawStorageLock,
+} from "./sse-bus.js";
 
 export {
   BLOBSTER_CATALOG_URL,
@@ -1453,7 +1458,9 @@ async function tryExternalHttpGatewayTurn(
   try {
     const response = await httpFetch(endpoint, {
       method: "POST",
-      ...(trustedLoopback ? { redirect: "error" as const } : {}),
+      // workerd rejects redirect: "error"; "manual" returns the 3xx unfollowed,
+      // and it is refused below like any other non-2xx answer.
+      ...(trustedLoopback ? { redirect: "manual" as const } : {}),
       headers,
       body: JSON.stringify({
         model: `openclaw/${connection.agentId}`,
@@ -1471,6 +1478,12 @@ async function tryExternalHttpGatewayTurn(
         ],
       }),
     });
+    if (trustedLoopback && (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400))) {
+      return {
+        ok: false,
+        errorMessage: "HTTP Gateway answered with a redirect, which the server-owned gateway connection refuses.",
+      };
+    }
     if (!response.ok) {
       return {
         ok: false,
@@ -2642,6 +2655,14 @@ export async function completePairedAgentTurn(
 }
 
 export async function openclawChatRoute(
+  route: SandboxedRouteContext,
+  ctx: PluginContext,
+): Promise<Record<string, unknown>> {
+  const audienceScope = await resolveAudienceScope(route);
+  return runWithOpenClawAudienceScope(audienceScope, () => handleOpenclawChatRoute(route, ctx));
+}
+
+async function handleOpenclawChatRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
 ): Promise<Record<string, unknown>> {

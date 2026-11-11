@@ -221,6 +221,18 @@ export async function hashPlaygroundVisitorId(rawVisitor: string): Promise<strin
   return hex.slice(0, 12);
 }
 
+/**
+ * Stream audience scope for a request: the visitor hash, but only on a host
+ * configured as an OpenClaw playground. On ordinary sites a stray playground
+ * cookie or header must not split editors' event streams.
+ */
+export async function resolveAudienceScope(route: unknown): Promise<string | undefined> {
+  const env = extractRouteRuntimeEnv(route);
+  const cfg = readPlaygroundEnvConfig(env);
+  if (!cfg.gatewayUrl && !cfg.locked) return undefined;
+  return resolvePlaygroundVisitorHash(route);
+}
+
 export async function resolvePlaygroundVisitorHash(route: unknown): Promise<string | undefined> {
   const raw = extractPlaygroundVisitorRaw(route);
   if (!raw) return undefined;

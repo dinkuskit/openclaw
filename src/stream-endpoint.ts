@@ -1,3 +1,4 @@
+import { resolveAudienceScope } from "./playground-env.js";
 import { subscribeOpenClawEvents } from "./sse-bus.js";
 
 export const prerender = false;
@@ -13,6 +14,45 @@ interface EmDashAuthLocals {
 }
 
 const EDITOR_ROLE = 40;
+
+/** Open live streams allowed per playground visitor (or per user) in one isolate. */
+export const MAX_STREAMS_PER_AUDIENCE = 4;
+
+/**
+ * Stream timing. `maxLifetimeMs` ends every stream after a while (the client
+ * reconnects and refreshes), so a connection whose death the host never
+ * reports holds its slot for at most that long. Mutable for tests.
+ */
+export const STREAM_TIMING = {
+  heartbeatMs: 15_000,
+  maxLifetimeMs: 10 * 60_000,
+};
+const OPEN_STREAMS_SYMBOL = Symbol.for("dinkuskit.openclaw.openStreams");
+
+function openStreams(): Map<string, number> {
+  const g = globalThis as Record<symbol, Map<string, number> | undefined>;
+  return (g[OPEN_STREAMS_SYMBOL] ??= new Map());
+}
+
+/**
+ * One heartbeat. Returns false when the stream should be dropped: the write
+ * failed, or earlier frames are still unread (`desiredSize <= 0`), which means
+ * nobody is draining it. A client the host never reported gone is caught here
+ * within one interval instead of holding a slot forever; a live client simply
+ * reconnects.
+ */
+export function heartbeatTick(
+  controller: Pick<ReadableStreamDefaultController<Uint8Array>, "enqueue" | "desiredSize">,
+  encoder: TextEncoder = new TextEncoder(),
+): boolean {
+  if ((controller.desiredSize ?? 0) <= 0) return false;
+  try {
+    controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export async function GET(context: {
   request: Request;
@@ -40,6 +80,37 @@ export async function GET(context: {
   }
 
   const filterConversationId = context.url.searchParams.get("conversationId") ?? undefined;
+  // Playground visitors all share one EmDash user, so they are told apart by
+  // their playground session. Undefined on ordinary sites.
+  const subscriberScope = await resolveAudienceScope({ request: context.request });
+
+  // The client may have gone while the scope was resolved; no slot for it.
+  if (context.request.signal.aborted) {
+    return new Response(null, { status: 499 });
+  }
+
+  // Each stream holds a bus listener and a heartbeat timer, so cap how many
+  // one visitor (or user) can hold open at once.
+  const audienceKey = subscriberScope ? `pg:${subscriberScope}` : `user:${user.id ?? "anonymous"}`;
+  const streams = openStreams();
+  if ((streams.get(audienceKey) ?? 0) >= MAX_STREAMS_PER_AUDIENCE) {
+    return Response.json(
+      {
+        success: false,
+        error: { code: "TOO_MANY_STREAMS", message: "Too many open OpenClaw streams. Close a tab; this one retries shortly." },
+      },
+      { status: 429, headers: { "Retry-After": "15" } },
+    );
+  }
+  streams.set(audienceKey, (streams.get(audienceKey) ?? 0) + 1);
+  let released = false;
+  const releaseSlot = () => {
+    if (released) return;
+    released = true;
+    const left = (streams.get(audienceKey) ?? 1) - 1;
+    if (left > 0) streams.set(audienceKey, left);
+    else streams.delete(audienceKey);
+  };
   const encoder = new TextEncoder();
   let cleanup: (() => void) | undefined;
 
@@ -61,7 +132,12 @@ export async function GET(context: {
         timestamp: new Date().toISOString(),
       });
 
-      const unsubscribe = subscribeOpenClawEvents(event => {
+      const unsubscribe = subscribeOpenClawEvents((event, audienceScope) => {
+        if (event.type !== "gateway_status" && audienceScope !== subscriberScope) {
+          // Another playground visitor's event, or an unscoped event reaching a
+          // playground visitor: fail closed.
+          return;
+        }
         if (event.type !== "gateway_status") {
           if (event.visibility === "shared") {
             // Explicitly shared thread or site-wide connection update
@@ -95,18 +171,38 @@ export async function GET(context: {
         send(event);
       });
 
-      const heartbeat = setInterval(() => {
+      // Dropping a stream errors it rather than closing it, so frames still
+      // queued for a reader that is gone are discarded, not kept in memory.
+      // An undrained stream is errored so its queued frames are released; a
+      // stream at the end of its lifetime is closed cleanly so a live client
+      // still gets every queued frame before it reconnects.
+      const drop = (reason: string) => {
+        cleanup?.();
         try {
-          controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
+          controller.error(new Error(reason));
         } catch {
-          clearInterval(heartbeat);
+          // already closed
         }
-      }, 15_000);
+      };
+      const heartbeat = setInterval(() => {
+        if (!heartbeatTick(controller, encoder)) drop("stream not drained");
+      }, STREAM_TIMING.heartbeatMs);
       (heartbeat as unknown as { unref?: () => void }).unref?.();
+      const lifetime = setTimeout(() => {
+        cleanup?.();
+        try {
+          controller.close();
+        } catch {
+          // already closed
+        }
+      }, STREAM_TIMING.maxLifetimeMs);
+      (lifetime as unknown as { unref?: () => void }).unref?.();
 
       cleanup = () => {
         clearInterval(heartbeat);
+        clearTimeout(lifetime);
         unsubscribe();
+        releaseSlot();
       };
 
       context.request.signal.addEventListener("abort", () => {
