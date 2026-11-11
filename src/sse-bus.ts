@@ -17,6 +17,7 @@ interface BusState {
   listeners: Set<Listener>;
   locks: Map<string, Promise<void>>;
   scope?: ScopeStorage | null;
+  warnedNoScope?: boolean;
 }
 
 function createScopeStorage(): ScopeStorage | null {
@@ -46,9 +47,18 @@ function getScopeStorage(): ScopeStorage | null {
 export function runWithOpenClawAudienceScope<R>(scope: string | undefined, fn: () => R): R {
   if (!scope) return fn();
   const storage = getScopeStorage();
-  // No AsyncLocalStorage: events stay unscoped, and scoped subscribers
-  // drop unscoped events, so this fails closed (no cross-visitor delivery).
-  return storage ? storage.run(scope, fn) : fn();
+  if (storage) return storage.run(scope, fn);
+  // No AsyncLocalStorage: events stay unscoped, and scoped subscribers drop
+  // unscoped events, so this fails closed (no cross-visitor delivery), but
+  // live streaming is off for playground visitors. Say so once.
+  const state = getBusState();
+  if (!state.warnedNoScope) {
+    state.warnedNoScope = true;
+    console.warn(
+      "[openclaw] AsyncLocalStorage is unavailable (enable nodejs_compat); playground chat streaming is disabled to keep visitors apart.",
+    );
+  }
+  return fn();
 }
 
 function getBusState(): BusState {
@@ -88,12 +98,20 @@ export async function withOpenClawStorageLock<T>(
   }
 }
 
-export function publishOpenClawEvent(event: OpenClawStreamEvent): void {
+/**
+ * `audienceScope`: pass a visitor scope, or null for "no scope", to override
+ * the scope inherited from runWithOpenClawAudienceScope. Publishers whose
+ * callbacks outlive the request that started them (gateway sockets) must pass
+ * it explicitly.
+ */
+export function publishOpenClawEvent(
+  event: OpenClawStreamEvent,
+  audienceScope: string | null = getScopeStorage()?.getStore() ?? null,
+): void {
   const { listeners } = getBusState();
-  const audienceScope = getScopeStorage()?.getStore();
   for (const listener of listeners) {
     try {
-      listener(event, audienceScope);
+      listener(event, audienceScope ?? undefined);
     } catch {
       // Listener errors never break publisher turns.
     }
