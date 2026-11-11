@@ -64,7 +64,7 @@ Connect custom [OpenClaw](https://github.com/openclaw) agents and gateways to [E
 
 Trusted in-process EmDash React Admin + SolidJS Web Component harness (`<openclaw-emdash-chat>`) with an Antigravity 2.0 &times; OpenClaw Control-UI workspace, live host-side SSE streaming, and a persistent Node `@openclaw/gateway-client@2026.11.1` Protocol v4 WebSocket bridge.
 
-The native profile is not on npm yet. Install it from GitHub pinned to a commit; npm runs `prepare` (`npm run build`) on install, so `dist/` is built for you (Node 24):
+The native profile is not on npm yet. Install it from GitHub pinned to a commit; npm runs `prepare` (`npm run build`) on install, so `dist/` is built for you (Node 24 with devDependencies; installs run with `--ignore-scripts` get no `dist/` and fail to resolve `./native`):
 
 ```sh
 npm install "github:dinkuskit/openclaw#<commit-sha>"

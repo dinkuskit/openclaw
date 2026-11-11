@@ -1,12 +1,54 @@
 import type { OpenClawStreamEvent } from "./protocol.js";
 
-type Listener = (event: OpenClawStreamEvent) => void;
+/**
+ * `audienceScope` is the playground visitor scope the event was published
+ * under (see runWithOpenClawAudienceScope), or undefined outside a playground.
+ */
+type Listener = (event: OpenClawStreamEvent, audienceScope?: string) => void;
+
+interface ScopeStorage {
+  run<R>(store: string, fn: () => R): R;
+  getStore(): string | undefined;
+}
 
 const BUS_SYMBOL = Symbol.for("dinkuskit.openclaw.sseBus");
 
 interface BusState {
   listeners: Set<Listener>;
   locks: Map<string, Promise<void>>;
+  scope?: ScopeStorage | null;
+}
+
+function createScopeStorage(): ScopeStorage | null {
+  try {
+    const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+    const mod = proc?.getBuiltinModule?.("node:async_hooks") as
+      | { AsyncLocalStorage?: new () => ScopeStorage }
+      | undefined;
+    return mod?.AsyncLocalStorage ? new mod.AsyncLocalStorage() : null;
+  } catch {
+    return null;
+  }
+}
+
+function getScopeStorage(): ScopeStorage | null {
+  const state = getBusState();
+  if (state.scope === undefined) state.scope = createScopeStorage();
+  return state.scope;
+}
+
+/**
+ * Runs `fn` so every event it publishes (including from awaited work) is
+ * tagged with `scope`. Playground hosts give every anonymous visitor the same
+ * EmDash user, so the stream endpoint uses this scope to keep one visitor's
+ * events away from another's. Without a scope this is a plain call.
+ */
+export function runWithOpenClawAudienceScope<R>(scope: string | undefined, fn: () => R): R {
+  if (!scope) return fn();
+  const storage = getScopeStorage();
+  // No AsyncLocalStorage: events stay unscoped, and scoped subscribers
+  // drop unscoped events, so this fails closed (no cross-visitor delivery).
+  return storage ? storage.run(scope, fn) : fn();
 }
 
 function getBusState(): BusState {
@@ -48,9 +90,10 @@ export async function withOpenClawStorageLock<T>(
 
 export function publishOpenClawEvent(event: OpenClawStreamEvent): void {
   const { listeners } = getBusState();
+  const audienceScope = getScopeStorage()?.getStore();
   for (const listener of listeners) {
     try {
-      listener(event);
+      listener(event, audienceScope);
     } catch {
       // Listener errors never break publisher turns.
     }

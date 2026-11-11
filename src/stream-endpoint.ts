@@ -1,3 +1,4 @@
+import { resolvePlaygroundVisitorHash } from "./playground-env.js";
 import { subscribeOpenClawEvents } from "./sse-bus.js";
 
 export const prerender = false;
@@ -40,6 +41,9 @@ export async function GET(context: {
   }
 
   const filterConversationId = context.url.searchParams.get("conversationId") ?? undefined;
+  // Playground visitors all share one EmDash user, so they are told apart by
+  // their playground session. Undefined on ordinary sites.
+  const subscriberScope = await resolvePlaygroundVisitorHash({ request: context.request });
   const encoder = new TextEncoder();
   let cleanup: (() => void) | undefined;
 
@@ -61,7 +65,12 @@ export async function GET(context: {
         timestamp: new Date().toISOString(),
       });
 
-      const unsubscribe = subscribeOpenClawEvents(event => {
+      const unsubscribe = subscribeOpenClawEvents((event, audienceScope) => {
+        if (event.type !== "gateway_status" && audienceScope !== subscriberScope) {
+          // Another playground visitor's event, or an unscoped event reaching a
+          // playground visitor: fail closed.
+          return;
+        }
         if (event.type !== "gateway_status") {
           if (event.visibility === "shared") {
             // Explicitly shared thread or site-wide connection update

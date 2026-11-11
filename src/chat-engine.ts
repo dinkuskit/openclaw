@@ -33,7 +33,11 @@ import {
   type SiteCollectionSummary,
   type ToolCallTrace,
 } from "./protocol.js";
-import { publishOpenClawEvent, withOpenClawStorageLock } from "./sse-bus.js";
+import {
+  publishOpenClawEvent,
+  runWithOpenClawAudienceScope,
+  withOpenClawStorageLock,
+} from "./sse-bus.js";
 
 export {
   BLOBSTER_CATALOG_URL,
@@ -2642,6 +2646,14 @@ export async function completePairedAgentTurn(
 }
 
 export async function openclawChatRoute(
+  route: SandboxedRouteContext,
+  ctx: PluginContext,
+): Promise<Record<string, unknown>> {
+  const audienceScope = await resolvePlaygroundVisitorHash(route);
+  return runWithOpenClawAudienceScope(audienceScope, () => handleOpenclawChatRoute(route, ctx));
+}
+
+async function handleOpenclawChatRoute(
   route: SandboxedRouteContext,
   ctx: PluginContext,
 ): Promise<Record<string, unknown>> {

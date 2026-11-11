@@ -55,13 +55,17 @@ function createNativeRouteCtx({
   sharedSettings = new Map(),
   sharedKv = new Map(),
   httpFetch = async () => Response.json({ ok: true }),
+  headers = undefined,
 } = {}) {
   let revCounter = 1;
   return {
     input,
     user: { id: userId, email: `${userId}@example.test`, name: userId, role },
     ui: { surface: "admin-page", locale: "en", direction: "ltr" },
-    request: { url: "http://localhost:4321/_emdash/api/plugins/dinkus-openclaw/chat" },
+    request: {
+      url: "http://localhost:4321/_emdash/api/plugins/dinkus-openclaw/chat",
+      ...(headers ? { headers } : {}),
+    },
     site: { url: "http://localhost:4321", name: "Atelier Store", locale: "en" },
     schema: {
       listCollections: async () => collections,
@@ -2055,4 +2059,53 @@ test("1-step /pair forwards native chat turns, steers, proposals, and stop guard
   assert.equal(switchedConv.restoreKey, convId);
   assert.equal(switchedConv.draftsByConv[convId], "Unsent prompt in original thread");
   assert.equal(switchedConv.draftsByConv.conv_other, "Draft in second thread");
+});
+
+test("playground visitors sharing one EmDash user never receive each other's stream events", async () => {
+  const resolved = createPlugin();
+  const chat = resolved.routes.chat.handler;
+  const streamFor = async (cookie, abort) =>
+    streamGet({
+      request: new Request("http://localhost:4321/_emdash/api/openclaw/stream", {
+        signal: abort.signal,
+        headers: { cookie },
+      }),
+      url: new URL("http://localhost:4321/_emdash/api/openclaw/stream"),
+      locals: { user: { id: "playground-admin", role: 50 } },
+    });
+  const aliceCookie = "emdash_playground=01JAAAAAAAAAAAAAAAAAAAAAAA";
+  const bobCookie = "emdash_playground=01JBBBBBBBBBBBBBBBBBBBBBBB";
+  const aliceAbort = new AbortController();
+  const bobAbort = new AbortController();
+  const aliceReader = (await streamFor(aliceCookie, aliceAbort)).body.getReader();
+  const bobReader = (await streamFor(bobCookie, bobAbort)).body.getReader();
+  const decoder = new TextDecoder();
+  assert.match(decoder.decode((await aliceReader.read()).value), /"type":"connected"/);
+  assert.match(decoder.decode((await bobReader.read()).value), /"type":"connected"/);
+
+  // Each visitor has its own sandbox storage, like separate playground DOs.
+  await chat(
+    createNativeRouteCtx({
+      userId: "playground-admin",
+      role: 50,
+      headers: new Headers({ cookie: aliceCookie }),
+      input: {
+        action: "send_message",
+        conversationId: "conv_default",
+        prompt: "Alice's private playground prompt",
+      },
+    }),
+  );
+  const aliceEvent = await aliceReader.read();
+  assert.match(decoder.decode(aliceEvent.value), /"conversationId"/);
+
+  const bobRead = bobReader.read();
+  const outcome = await Promise.race([
+    bobRead.then(r => ({ leaked: decoder.decode(r.value ?? new Uint8Array()) })),
+    new Promise(resolve => setTimeout(() => resolve({ leaked: null }), 200)),
+  ]);
+  assert.equal(outcome.leaked, null, `Bob received Alice's event: ${outcome.leaked}`);
+
+  aliceAbort.abort();
+  bobAbort.abort();
 });
